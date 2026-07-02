@@ -1,0 +1,33 @@
+# Build artifacts
+build*/
+*.pyc
+__pycache__/
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project-specific
+fix_setup.py
+patch.py
+*.log
+
+# Large binaries (users download separately)
+ffmpeg/
+models/*.onnx
+!models/README.md
+
+# Codewhale
+.deepseek/
+
+# Old builds (don't commit)
+Autocomper Modified/
+
+# Sensitive
+*.db
+*.sqlite3
