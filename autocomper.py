@@ -1033,7 +1033,10 @@ class VideoProcessorApp:
             self.settings_button,
             self.use_clip_padding_checkbox,
             self.padding_before_entry,
-            self.padding_after_entry
+            self.padding_after_entry,
+            self.verify_checkbox,
+            self.review_checkbox,
+            self.skip_auto_checkbox
         ]
         
         self.enable_while_processing = [
