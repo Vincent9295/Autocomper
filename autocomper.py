@@ -109,6 +109,13 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
     if not dict_list:
         return dict_list
 
+    # 预加载 ONNX 模型一次（所有窗口共享，省去每窗口 3-5s 的加载时间）
+    import onnxruntime as ort
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    verify_session = ort.InferenceSession(selected_model, sess_options,
+                                           providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+
     checked = 0
     new_found = 0
 
@@ -155,7 +162,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 scan_result, _ = get_timestamps(
                     tmp_audio.name, precision=precision, block_size=block_size,
                     threshold=0.30, focus_idx=58, model=selected_model,
-                    logger=logger
+                    logger=logger, ort_session=verify_session
                 )
                 for ts in scan_result['timestamps']:
                     ts['start'] += ws

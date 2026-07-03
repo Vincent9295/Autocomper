@@ -102,7 +102,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
     if n == 0:
         return False
 
-    audio_codec = ['-c:a', 'aac', '-b:a', '128k']
+    audio_codec = ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
     video_codec = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
                    '-rc-lookahead', '0', '-sar', '1:1']
     mem_opts = ['-threads', '2']
@@ -110,9 +110,11 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
     if n == 1:
         s, e = timestamps[0]
         cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
+            '-accurate_seek',
             '-ss', str(s), '-to', str(e),
             '-i', input_file,
             '-avoid_negative_ts', 'make_zero',
+            '-vsync', 'cfr', '-shortest',
         ] + video_codec + audio_codec
         if normalize:
             cmd.extend(['-af', 'loudnorm'])
@@ -196,7 +198,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False):
             '-map', '[outv]', '-map', '[outa]',
             '-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
             '-rc-lookahead', '0', '-sar', '1:1',
-            '-c:a', 'aac', '-b:a', '128k']
+            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+            '-vsync', 'cfr', '-shortest']
     if normalize:
         cmd.extend(['-af', 'loudnorm'])
     cmd.append(output_file)
@@ -295,7 +298,7 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
     if n == 0:
         return False
 
-    audio_codec = ['-c:a', 'libmp3lame', '-b:a', '192k']
+    audio_codec = ['-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100']
 
     if n == 1:
         s, e = timestamps[0]

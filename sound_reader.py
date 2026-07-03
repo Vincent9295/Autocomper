@@ -133,7 +133,7 @@ timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]'
 
 
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
-                   model="bdetectionmodel_05_01_23", logger=None):
+                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -142,7 +142,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         raise Exception("Block size must be a positive number!")
 
     file_hash = hash_file(file)
-    if (file_hash, precision, block_size, threshold, model) in timestamps_dict:
+    if ort_session is None and (file_hash, precision, block_size, threshold, model) in timestamps_dict:
         previous_data = timestamps_dict[(file_hash, precision, block_size, threshold, model)]
         previous_data['filename'] = file
         if logger:
@@ -153,10 +153,11 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                 pass
         return previous_data, True
 
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    ort_session = ort.InferenceSession(model, sess_options,
-                                       providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    if ort_session is None:
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        ort_session = ort.InferenceSession(model, sess_options,
+                                           providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
     offset = 0
     blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size)
