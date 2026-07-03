@@ -2,7 +2,7 @@
 
 > Forked from [wz-bff/AutoComper](https://github.com/wz-bff/AutoComper) — a GUI frontend for AI-powered sound detection video clipping.
 
-This enhanced version adds **clip review, re-verification, editing, batch processing, and native FFmpeg pipeline** — dramatically improving both speed and usability.
+This enhanced version adds **clip review, re-verification, editing, batch processing, and native FFmpeg pipeline** —  improving both speed and usability.
 
 ---
 
@@ -101,3 +101,4 @@ This program requires an ONNX sound detection model. Place it at `models/bdetect
 - [moviepy](https://github.com/Zulko/moviepy) (audio mode fallback)
 - [onnxruntime](https://onnxruntime.ai/) for inference
 - [sv-ttk](https://github.com/rdbende/Sun-Valley-ttk-theme) for modern UI theme
+- [Boletus Edulis](https://www.youtube.com/@BoletusEdulis79) for helping me to test the autocomper <--- GOATED Person
