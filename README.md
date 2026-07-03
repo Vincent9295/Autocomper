@@ -15,7 +15,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Skip Detection** | Load existing `timestamps.txt` to skip AI detection entirely. Auto-use mode suppresses the confirmation dialog. |
 | **Review Dialog** | After detection, preview and check/uncheck every clip before compiling. Right-click for audio/video preview. |
 | **Edit Times** | Double-click any row in the review dialog to manually adjust start/end times (HH:MM:SS or seconds). |
-| **Re-verify Clips** | Two modes: **additive** (low-threshold scan near each clip to find missed sounds) and **confirmatory** (high-threshold re-check to discard false positives). |
+| **Re-verify Clips** | Two modes: **additive** (low-threshold scan near each clip to find missed sounds) |
 | **Add Folder** | Recursively scan a folder for video/audio files — no need to pick files one by one. |
 | **Save Selected** | Review dialog exports checked clips to `{original}_selected.txt` for future re-use. |
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat (no MoviePy dependency for audio). |
