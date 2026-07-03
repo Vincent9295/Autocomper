@@ -99,20 +99,18 @@ def _parse_timestamps_txt(txt_path):
 
 
 
-def _verify_and_expand(dict_list, selected_model, window=5.0, threshold=0.50,
-                       precision=100, block_size=600, logger=None,
-                       mode='additive'):
-    """片段验证：additive 模式追加新片段，confirmatory 模式剔除高阈值未通过的片段。
+def _verify_and_expand(dict_list, selected_model, window=5.0,
+                       precision=100, block_size=600, logger=None):
+    """在每个原片段周围用更低的阈值重扫描，补充漏掉的声音片段。
 
-    additive  (默认): 在每个原片段周围低阈值扫描，补充漏掉的声音。
-    confirmatory:     对每个原片段做高阈值确认——未被确认的标记为 discard=True。
+    新发现的片段标记 source='new'，原始片段标记 source='original'。
+    审核对话框中可凭此快速定位需要检查的新增片段。
     """
     if not dict_list:
         return dict_list
 
     checked = 0
     new_found = 0
-    discarded = 0
 
     for entry in dict_list:
         filename = entry['filename']
@@ -120,6 +118,11 @@ def _verify_and_expand(dict_list, selected_model, window=5.0, threshold=0.50,
         if not original_ts:
             continue
 
+        # 标记所有原始片段
+        for ts in original_ts:
+            ts.setdefault('source', 'original')
+
+        # 合并重叠的扫描窗口
         scan_windows = []
         for ts in original_ts:
             ws = max(0, ts['start'] - window)
@@ -129,112 +132,60 @@ def _verify_and_expand(dict_list, selected_model, window=5.0, threshold=0.50,
             else:
                 scan_windows.append((ws, we))
 
-        if mode == 'confirmatory':
-            # 每个原片段独立验证，记录是否通过
-            confirmed = []
-            for ts in original_ts:
-                ws = max(0, ts['start'] - window)
-                we = ts['end'] + window
+        # 用 FFmpeg 提取每段短音频 → 低阈值重跑 ONNX
+        merged_timestamps = list(original_ts)
+        for ws, we in scan_windows:
+            checked += 1
+            try:
+                tmp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                tmp_audio.close()
+                extract_cmd = [
+                    os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
+                    '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', str(ws), '-t', str(we - ws),
+                    '-i', filename,
+                    '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
+                    tmp_audio.name
+                ]
+                _opts = {}
+                if sys.platform == 'win32':
+                    _opts['creationflags'] = 0x08000000
+                subprocess.run(extract_cmd, capture_output=True, timeout=30, **_opts)
+
+                scan_result, _ = get_timestamps(
+                    tmp_audio.name, precision=precision, block_size=block_size,
+                    threshold=0.30, focus_idx=58, model=selected_model,
+                    logger=logger
+                )
+                for ts in scan_result['timestamps']:
+                    ts['start'] += ws
+                    ts['end'] += ws
+                    ts['source'] = 'new'
+                    merged_timestamps.append(ts)
+                    new_found += 1
+            except Exception as e:
+                print(f"{Fore.YELLOW}  Verify scan failed for [{ws}-{we}]: {e}")
+            finally:
                 try:
-                    tmp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-                    tmp_audio.close()
-                    extract_cmd = [
-                        os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
-                        '-y', '-hide_banner', '-loglevel', 'error',
-                        '-ss', str(ws), '-t', str(we - ws),
-                        '-i', filename,
-                        '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
-                        tmp_audio.name
-                    ]
-                    _opts = {}
-                    if sys.platform == 'win32':
-                        _opts['creationflags'] = 0x08000000
-                    subprocess.run(extract_cmd, capture_output=True, timeout=30, **_opts)
+                    os.remove(tmp_audio.name)
+                except Exception:
+                    pass
 
-                    scan_result, _ = get_timestamps(
-                        tmp_audio.name, precision=precision, block_size=block_size,
-                        threshold=threshold, focus_idx=58, model=selected_model,
-                        logger=logger
-                    )
-                    checked += 1
-
-                    # 检查原始片段是否在高阈值扫描中被再次检测到
-                    any_overlap = any(
-                        abs(ts['start'] - (rts['start'] + ws)) < 1.0
-                        for rts in scan_result['timestamps']
-                    )
-                    ts_copy = dict(ts)
-                    ts_copy['confirmed'] = any_overlap
-                    if not any_overlap:
-                        ts_copy['discard'] = True
-                        discarded += 1
-                    confirmed.append(ts_copy)
-                except Exception as e:
-                    print(f"{Fore.YELLOW}  Confirm scan failed for [{ws}-{we}]: {e}")
-                    confirmed.append(dict(ts, confirmed=False))
-                finally:
-                    try:
-                        os.remove(tmp_audio.name)
-                    except Exception:
-                        pass
-            entry['timestamps'] = confirmed
-
-        else:  # additive mode (original behavior)
-            merged_timestamps = list(original_ts)
-            for ws, we in scan_windows:
-                checked += 1
-                try:
-                    tmp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-                    tmp_audio.close()
-                    extract_cmd = [
-                        os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
-                        '-y', '-hide_banner', '-loglevel', 'error',
-                        '-ss', str(ws), '-t', str(we - ws),
-                        '-i', filename,
-                        '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
-                        tmp_audio.name
-                    ]
-                    _opts = {}
-                    if sys.platform == 'win32':
-                        _opts['creationflags'] = 0x08000000
-                    subprocess.run(extract_cmd, capture_output=True, timeout=30, **_opts)
-
-                    scan_result, _ = get_timestamps(
-                        tmp_audio.name, precision=precision, block_size=block_size,
-                        threshold=threshold, focus_idx=58, model=selected_model,
-                        logger=logger
-                    )
-                    for ts in scan_result['timestamps']:
-                        ts['start'] += ws
-                        ts['end'] += ws
-                        merged_timestamps.append(ts)
-                        new_found += 1
-                except Exception as e:
-                    print(f"{Fore.YELLOW}  Verify scan failed for [{ws}-{we}]: {e}")
-                finally:
-                    try:
-                        os.remove(tmp_audio.name)
-                    except Exception:
-                        pass
-
-            if merged_timestamps:
-                merged_timestamps.sort(key=lambda x: x['start'])
-                deduped = [merged_timestamps[0]]
-                for ts in merged_timestamps[1:]:
-                    if ts['start'] <= deduped[-1]['end'] + 2.0:
-                        deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
-                        deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
-                    else:
-                        deduped.append(ts)
-                entry['timestamps'] = deduped
+        # 合并相邻/重叠片段（2s 内视为同一声事件）
+        if merged_timestamps:
+            merged_timestamps.sort(key=lambda x: x['start'])
+            deduped = [merged_timestamps[0]]
+            for ts in merged_timestamps[1:]:
+                if ts['start'] <= deduped[-1]['end'] + 2.0:
+                    deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
+                    deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
+                else:
+                    deduped.append(ts)
+            entry['timestamps'] = deduped
 
     if checked > 0:
-        if mode == 'confirmatory':
-            print(f"{Fore.CYAN}Verification (confirmatory): checked {checked} clip(s), "
-                  f"{discarded} not confirmed (marked discard).")
-        else:
-            print(f"{Fore.CYAN}Verification (additive): scanned {checked} window(s), "
-                  f"found {new_found} additional segment(s).")
+        print(f"{Fore.CYAN}Verification: scanned {checked} window(s), "
+              f"found {new_found} additional segment(s).")
 
     return dict_list
 
@@ -243,7 +194,7 @@ class ReviewDialog:
     """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消。"""
 
     def __init__(self, parent, dict_list, padding, output_path,
-                 use_verify=False, verify_mode='additive', txt_path=None):
+                 use_verify=False, txt_path=None):
         self.parent = parent
         self.dict_list = dict_list
         self.padding = padding or (0, 0)
@@ -260,8 +211,7 @@ class ReviewDialog:
                     'filename': fn,
                     'start': ts['start'], 'end': ts['end'],
                     'pred': ts.get('pred', 0),
-                    'confirmed': ts.get('confirmed', True),
-                    'discard': ts.get('discard', False),
+                    'source': ts.get('source', 'original'),
                 })
 
         self.win = tk.Toplevel(parent)
@@ -285,10 +235,10 @@ class ReviewDialog:
         info_frame = ttk.Frame(self.win)
         info_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
         total = len(self.flat)
-        dc = sum(1 for f in self.flat if f['discard'])
+        new_count = sum(1 for f in self.flat if f.get('source') == 'new')
         t = f"Total: {total} segments"
-        if use_verify and verify_mode == 'confirmatory':
-            t += f"  |  Not confirmed: {dc}"
+        if use_verify and new_count > 0:
+            t += f"  |  New: {new_count}"
         ttk.Label(info_frame, text=t).pack(side=tk.LEFT)
         ttk.Label(info_frame,
                   text="Right-click for preview  |  Click row to toggle",
@@ -317,13 +267,13 @@ class ReviewDialog:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         for i, f in enumerate(self.flat):
-            cv = tk.BooleanVar(value=not f['discard'])
+            cv = tk.BooleanVar(value=True)
             self.checks.append(cv)
             s_str = self._fmt(f['start'])
             e_str = self._fmt(f['end'])
             bn = os.path.basename(f['filename'])
-            st = 'Not confirmed' if f['discard'] else 'Confirmed'
-            tag = 'unchecked' if f['discard'] else 'checked'
+            st = 'New' if f.get('source') == 'new' else 'Original'
+            tag = 'checked'
             self.tree.insert('', tk.END, iid=str(i),
                              values=('\u2611' if cv.get() else '\u2610',
                                      f"{s_str} - {e_str}", bn,
@@ -898,10 +848,8 @@ class VideoProcessorApp:
         self.checkbox_frame_five.pack(anchor=tk.W)
         self.use_verify = tk.BooleanVar()
         self.verify_window_var = tk.DoubleVar(value=5.0)
-        self.verify_threshold_var = tk.DoubleVar(value=0.50)
-        self.verify_mode_var = tk.StringVar(value='additive')
         self.verify_checkbox = ttk.Checkbutton(
-            self.checkbox_frame_five, text="Re-verify clips (low threshold scan near each segment)",
+            self.checkbox_frame_five, text="Re-verify clips (scan near segments for missed clips)",
             variable=self.use_verify)
         self.verify_checkbox.pack(anchor=tk.W)
 
@@ -1007,6 +955,12 @@ class VideoProcessorApp:
         padding_tooltip = CustomHovertip(
             self.use_clip_padding_checkbox, 'Add extra time before and after each individual clip. Values are in seconds.\nIf using this option, Iit\'s recommended to enable \'Merge Nearby Clips\' to avoid duplicate clips.'
         )
+        verify_tooltip = CustomHovertip(
+            self.verify_checkbox, 'After AI detection, scan near each clip with a lower threshold to find clips the AI may have missed.')
+        review_tooltip = CustomHovertip(
+            self.review_checkbox, 'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.')
+        skip_auto_tooltip = CustomHovertip(
+            self.skip_auto_checkbox, 'When a timestamps.txt file already exists, automatically use it without showing the confirmation dialog.')
 
         settings_tooltip = CustomHovertip(self.settings_button, "Settings")
 
@@ -1858,18 +1812,15 @@ class VideoProcessorApp:
 
                     print(f"Compiling and writing to {output_video_path.split('/')[-1]}...")
                     if self.use_verify.get():
-                        mode = self.verify_mode_var.get()
-                        print(f"{Fore.CYAN}Running verification scan ({mode}, threshold={self.verify_threshold_var.get()})...")
+                        print(f"{Fore.CYAN}Running verification scan...")
                         dict_list = _verify_and_expand(
                             dict_list, selected_model,
                             window=self.verify_window_var.get(),
-                            threshold=self.verify_threshold_var.get(),
-                            mode=mode, logger=self.final_bar)
+                            logger=self.final_bar)
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
                                           use_verify=self.use_verify.get(),
-                                          verify_mode=self.verify_mode_var.get(),
                                           txt_path=self.output_text_path.get())
                         if dlg.result is None:
                             print(f"{Fore.YELLOW}Review cancelled.")
@@ -1978,19 +1929,16 @@ class VideoProcessorApp:
 
                 # --- re-verify and/or review before final compile ---
                 if self.use_verify.get():
-                    mode = self.verify_mode_var.get()
-                    print(f"{Fore.CYAN}Running verification scan ({mode}, threshold={self.verify_threshold_var.get()})...")
+                    print(f"{Fore.CYAN}Running verification scan...")
                     dict_list = _verify_and_expand(
                         dict_list, selected_model,
                         window=self.verify_window_var.get(),
-                        threshold=self.verify_threshold_var.get(),
-                        mode=mode, logger=self.final_bar)
+                        logger=self.final_bar)
                 if self.use_review.get():
                     _txt_path = txt_path if 'txt_path' in dir() else self.output_text_path.get()
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
                                       use_verify=self.use_verify.get(),
-                                      verify_mode=self.verify_mode_var.get(),
                                       txt_path=_txt_path)
                     if dlg.result is None:
                         print(f"{Fore.YELLOW}Review cancelled.")
