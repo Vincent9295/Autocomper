@@ -1625,6 +1625,14 @@ class VideoProcessorApp:
     def handle_url_downloads(self):
         keep_downloaded_vids = self.keep_downloaded_vids.get()
         download_path = self.download_video_path.get()
+
+        # 防御：如果配置的下载目录不存在，回退到 TEMP_DIR
+        if download_path and download_path != "No location selected!":
+            if not os.path.isdir(download_path):
+                print(f"{Fore.YELLOW}Configured download directory missing: {download_path}")
+                print(f"{Fore.YELLOW}Falling back to temporary directory.")
+                download_path = TEMP_DIR
+
         if not keep_downloaded_vids:
             download_path = TEMP_DIR
 
@@ -1891,6 +1899,12 @@ class VideoProcessorApp:
                     try:
                         if self.output_text_path.get() != "No file selected!":
                             txt_path = self.output_text_path.get()
+                            # 防御：如果保存路径的目录不存在（比如从别的 PC 继承的配置），回退
+                            txt_dir = os.path.dirname(txt_path) or '.'
+                            if not os.path.isdir(txt_dir):
+                                print(f"{Fore.YELLOW}Configured output directory missing: {txt_dir}")
+                                print(f"{Fore.YELLOW}Falling back to output video location.")
+                                txt_path = os.path.join(os.path.dirname(output_video_path), "timestamps.txt")
                         elif os.path.isdir(output_video_path):
                             txt_path = os.path.join(
                                 output_video_path, "timestamps.txt")
