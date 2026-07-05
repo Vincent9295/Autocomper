@@ -102,15 +102,15 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
     if n == 0:
         return False
 
-    audio_codec = ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
     video_codec = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
                    '-rc-lookahead', '0', '-sar', '1:1']
+    audio_codec_tmp = ['-c:a', 'flac']      # FLAC 无编码延迟，时长精确
+    audio_codec_out = ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
     mem_opts = ['-threads', '2']
 
     if n == 1:
         s, e = timestamps[0]
         dur = e - s
-        # AAC 编码器有 ~23ms 的 priming 帧，用 atrim 精确切除
         af = f'atrim=0:{dur}'
         if normalize:
             af += ',loudnorm'
@@ -121,7 +121,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
             '-af', af,
             '-avoid_negative_ts', 'make_zero',
             '-vsync', 'cfr', '-shortest',
-        ] + video_codec + audio_codec
+        ] + video_codec + audio_codec_tmp
         if res:
             w, h = res
             cmd.extend(['-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
