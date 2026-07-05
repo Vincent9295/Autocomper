@@ -109,15 +109,19 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
 
     if n == 1:
         s, e = timestamps[0]
+        dur = e - s
+        # AAC 编码器有 ~23ms 的 priming 帧，用 atrim 精确切除
+        af = f'atrim=0:{dur}'
+        if normalize:
+            af += ',loudnorm'
         cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
             '-accurate_seek',
             '-ss', str(s), '-to', str(e),
             '-i', input_file,
+            '-af', af,
             '-avoid_negative_ts', 'make_zero',
             '-vsync', 'cfr', '-shortest',
         ] + video_codec + audio_codec
-        if normalize:
-            cmd.extend(['-af', 'loudnorm'])
         if res:
             w, h = res
             cmd.extend(['-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'

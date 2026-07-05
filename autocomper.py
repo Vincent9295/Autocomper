@@ -100,7 +100,8 @@ def _parse_timestamps_txt(txt_path):
 
 
 def _verify_and_expand(dict_list, selected_model, window=5.0,
-                       precision=100, block_size=600, logger=None):
+                       precision=100, block_size=600, logger=None,
+                       focus_idx=58):
     """在每个原片段周围用更低的阈值重扫描，补充漏掉的声音片段。
 
     新发现的片段标记 source='new'，原始片段标记 source='original'。
@@ -159,12 +160,25 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     _opts['creationflags'] = 0x08000000
                 subprocess.run(extract_cmd, capture_output=True, timeout=30, **_opts)
 
-                scan_result, _ = get_timestamps(
-                    tmp_audio.name, precision=precision, block_size=block_size,
-                    threshold=0.30, focus_idx=58, model=selected_model,
-                    logger=logger, ort_session=verify_session
-                )
-                for ts in scan_result['timestamps']:
+                if focus_idx == "both":
+                    # Both 模式：跑两次 re-verify 然后合并
+                    r1, _ = get_timestamps(
+                        tmp_audio.name, precision=precision, block_size=block_size,
+                        threshold=0.30, focus_idx=58, model=selected_model,
+                        logger=logger, ort_session=verify_session)
+                    r2, _ = get_timestamps(
+                        tmp_audio.name, precision=precision, block_size=block_size,
+                        threshold=0.30, focus_idx=60, model=selected_model,
+                        logger=logger, ort_session=verify_session)
+                    scan_ts = r1['timestamps'] + r2['timestamps']
+                else:
+                    scan_result, _ = get_timestamps(
+                        tmp_audio.name, precision=precision, block_size=block_size,
+                        threshold=0.30, focus_idx=focus_idx, model=selected_model,
+                        logger=logger, ort_session=verify_session)
+                    scan_ts = scan_result['timestamps']
+
+                for ts in scan_ts:
                     ts['start'] += ws
                     ts['end'] += ws
                     ts['source'] = 'new'
@@ -726,6 +740,16 @@ class VideoProcessorApp:
         self.model_dropdown.current(0)  # default dropdown option
 
         self.model_dropdown.pack()
+
+        # Focus Index dropdown
+        ttk.Label(self.text_options_frame, text="Focus Index:",
+                  font=(None, 10, "bold")).pack(pady=(10, 1))
+        self.focus_idx_var = tk.StringVar(value="Burps (58)")
+        self.focus_idx_dropdown = ttk.Combobox(
+            self.text_options_frame,
+            values=["Burps (58)", "Farts (60)", "Both (58+60)"],
+            textvariable=self.focus_idx_var, state="readonly", width=15)
+        self.focus_idx_dropdown.pack()
 
         # Precision Entry
         ttk.Label(self.text_options_frame, text="Precision:",
@@ -1713,6 +1737,15 @@ class VideoProcessorApp:
             normalize = self.normalize_audio.get()
             save_timestamps = self.save_txt.get()
 
+            # Parse focus index from dropdown
+            focus_idx_str = self.focus_idx_var.get()
+            if focus_idx_str == "Both (58+60)":
+                focus_idx = "both"
+            elif "60" in focus_idx_str:
+                focus_idx = 60
+            else:
+                focus_idx = 58
+
             # Get model location if in a compiled app
             selected_model = get_bundle_filepath(selected_model)
 
@@ -1771,6 +1804,16 @@ class VideoProcessorApp:
                 )
             else:
                 padding = None
+
+            # --- derive focus_idx from UI dropdown（必须在 skip detection 之前）---
+            selected_focus = self.focus_idx_var.get()
+            if selected_focus == "Burps (58)":
+                focus_idx = 58
+            elif selected_focus == "Farts (60)":
+                focus_idx = 60
+            else:
+                focus_idx = "both"
+
             # --- Check for existing timestamps.txt ---
             txt_path = self.output_text_path.get()
             if txt_path and txt_path != "No file selected!" and os.path.exists(txt_path):
@@ -1831,6 +1874,7 @@ class VideoProcessorApp:
                         dict_list = _verify_and_expand(
                             dict_list, selected_model,
                             window=self.verify_window_var.get(),
+                            focus_idx=focus_idx,
                             logger=self.final_bar)
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
@@ -1860,8 +1904,29 @@ class VideoProcessorApp:
                     input_video_path = input_video_path.get_path()
                     print(
                         f"{Fore.GREEN}[{i + 1}/{len(self.uploaded_videos)}]{Style.RESET_ALL} Getting timestamps for {os.path.basename(input_video_path)}")
-                    timestamps, used_existing_data = get_timestamps(
-                        input_video_path, precision, block_size, threshold, 58, selected_model, self.final_bar)
+                    if focus_idx == "both":
+                        ts_burps, _ = get_timestamps(
+                            input_video_path, precision, block_size, threshold, 58, selected_model, self.final_bar)
+                        ts_farts, _ = get_timestamps(
+                            input_video_path, precision, block_size, threshold, 60, selected_model, self.final_bar)
+                        merged = ts_burps['timestamps'] + ts_farts['timestamps']
+                        merged.sort(key=lambda x: x['start'])
+                        timestamps = ts_burps
+                        if merged:
+                            deduped = [merged[0]]
+                            for ts in merged[1:]:
+                                if ts['start'] <= deduped[-1]['end'] + 2.0:
+                                    deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
+                                    deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
+                                else:
+                                    deduped.append(ts)
+                            timestamps['timestamps'] = deduped
+                        else:
+                            timestamps['timestamps'] = []
+                        used_existing_data = False
+                    else:
+                        timestamps, used_existing_data = get_timestamps(
+                            input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
                     dict_list.append(timestamps)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
                     num_found = len(timestamps['timestamps'])
@@ -1954,6 +2019,7 @@ class VideoProcessorApp:
                     dict_list = _verify_and_expand(
                         dict_list, selected_model,
                         window=self.verify_window_var.get(),
+                        focus_idx=focus_idx,
                         logger=self.final_bar)
                 if self.use_review.get():
                     _txt_path = txt_path if 'txt_path' in dir() else self.output_text_path.get()
