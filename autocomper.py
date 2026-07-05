@@ -66,6 +66,25 @@ def clean_filename(filename: str, replacement: str = "_") -> str:
 
 _temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
 TEMP_DIR = _temp_dir_obj.name
+def _save_selected_txt(dict_list, txt_path):
+    """保存审核后勾选的片段到 {原名}_selected.txt（与 timestamps.txt 同目录）。"""
+    if not txt_path or txt_path == "No file selected!" or not dict_list:
+        return
+    try:
+        selected_path = txt_path.rsplit('.', 1)[0] + '_selected.txt'
+        with open(selected_path, 'w', encoding='utf-8') as f:
+            for entry in dict_list:
+                f.write(f"{entry['filename']}\n")
+                for ts in entry['timestamps']:
+                    s = convert_seconds_to_timestamp(ts['start'])
+                    e = convert_seconds_to_timestamp(ts['end'])
+                    f.write(f"{s} - {e}, confidence: {ts['pred']}\n")
+                f.write("\n")
+        print(f"{Fore.GREEN}Saved selected clips to {selected_path}")
+    except Exception as e:
+        print(f"{Fore.YELLOW}Could not save _selected.txt: {e}")
+
+
 def _parse_timestamps_txt(txt_path):
     """Parse timestamps.txt -> (with videos, without videos)"""
     with_videos = []
@@ -1852,6 +1871,7 @@ class VideoProcessorApp:
                         if not dlg.result:
                             raise Exception("No segments selected after review.")
                         dict_list = dlg.result
+                        _save_selected_txt(dict_list, txt_path)
                     compile_vid(dict_list, output_video_path, merge_clips, combine, res, self.final_bar, normalize, self.is_video, padding)
                     print(f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                     messagebox.showinfo("Info", f"Video(s) exported to {output_video_path}. Enjoy!")
@@ -1977,6 +1997,8 @@ class VideoProcessorApp:
                     if not dlg.result:
                         raise Exception("No segments selected after review.")
                     dict_list = dlg.result
+                    # 保存 _selected.txt（仅勾选的片段）
+                    _save_selected_txt(dict_list, txt_path)
 
                 print(
                     f"Compiling and writing to {output_video_path.split('/')[-1]}...")
