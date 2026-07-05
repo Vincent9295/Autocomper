@@ -64,7 +64,8 @@ def clean_filename(filename: str, replacement: str = "_") -> str:
     return safe_name[:150]
 
 
-TEMP_DIR = tempfile.TemporaryDirectory().name
+_temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
+TEMP_DIR = _temp_dir_obj.name
 def _parse_timestamps_txt(txt_path):
     """Parse timestamps.txt -> (with videos, without videos)"""
     with_videos = []
@@ -1805,15 +1806,6 @@ class VideoProcessorApp:
             else:
                 padding = None
 
-            # --- derive focus_idx from UI dropdown（必须在 skip detection 之前）---
-            selected_focus = self.focus_idx_var.get()
-            if selected_focus == "Burps (58)":
-                focus_idx = 58
-            elif selected_focus == "Farts (60)":
-                focus_idx = 60
-            else:
-                focus_idx = "both"
-
             # --- Check for existing timestamps.txt ---
             txt_path = self.output_text_path.get()
             if txt_path and txt_path != "No file selected!" and os.path.exists(txt_path):
@@ -1911,7 +1903,7 @@ class VideoProcessorApp:
                             input_video_path, precision, block_size, threshold, 60, selected_model, self.final_bar)
                         merged = ts_burps['timestamps'] + ts_farts['timestamps']
                         merged.sort(key=lambda x: x['start'])
-                        timestamps = ts_burps
+                        timestamps = dict(ts_burps)  # 拷贝，防止修改缓存
                         if merged:
                             deduped = [merged[0]]
                             for ts in merged[1:]:
@@ -1927,6 +1919,7 @@ class VideoProcessorApp:
                     else:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
+                        timestamps = dict(timestamps)  # 拷贝，防止修改缓存
                     dict_list.append(timestamps)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
                     num_found = len(timestamps['timestamps'])
@@ -2022,11 +2015,10 @@ class VideoProcessorApp:
                         focus_idx=focus_idx,
                         logger=self.final_bar)
                 if self.use_review.get():
-                    _txt_path = txt_path if 'txt_path' in dir() else self.output_text_path.get()
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
                                       use_verify=self.use_verify.get(),
-                                      txt_path=_txt_path)
+                                      txt_path=txt_path)
                     if dlg.result is None:
                         print(f"{Fore.YELLOW}Review cancelled.")
                         self.reenable_disabled_objects()

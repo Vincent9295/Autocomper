@@ -142,8 +142,9 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         raise Exception("Block size must be a positive number!")
 
     file_hash = hash_file(file)
-    if ort_session is None and (file_hash, precision, block_size, threshold, model) in timestamps_dict:
-        previous_data = timestamps_dict[(file_hash, precision, block_size, threshold, model)]
+    cache_key = (file_hash, precision, block_size, threshold, model, focus_idx)
+    if ort_session is None and cache_key in timestamps_dict:
+        previous_data = timestamps_dict[cache_key]
         previous_data['filename'] = file
         if logger:
             bar_logger = default_bar_logger(logger)
@@ -188,5 +189,5 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
 
     if len(timestamps_dict) >= MAX_CACHE_SIZE:
         timestamps_dict.popitem(last=False)
-    timestamps_dict[(file_hash, precision, block_size, threshold, model)] = info
+    timestamps_dict[cache_key] = info
     return info, False
