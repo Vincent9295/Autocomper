@@ -66,6 +66,19 @@ def clean_filename(filename: str, replacement: str = "_") -> str:
 
 _temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
 TEMP_DIR = _temp_dir_obj.name
+
+def convert_seconds_to_timestamp(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    remaining_seconds = int(round((seconds % 3600) % 60))
+    if remaining_seconds == 60:
+        minutes += 1
+        remaining_seconds = 0
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+    return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
+
 def _save_selected_txt(dict_list, txt_path):
     """保存审核后勾选的片段到 {原名}_selected.txt（与 timestamps.txt 同目录）。"""
     if not txt_path or txt_path == "No file selected!" or not dict_list:
@@ -1940,23 +1953,6 @@ class VideoProcessorApp:
                         else:
                             txt_path = os.path.join(os.path.dirname(
                                 output_video_path), "timestamps.txt")
-
-                        def convert_seconds_to_timestamp(seconds: float) -> str:
-                            hours = int(seconds // 3600)
-                            minutes = int((seconds % 3600) // 60)
-                            remaining_seconds = int(
-                                round((seconds % 3600) % 60))
-
-                            if remaining_seconds == 60:
-                                minutes += 1
-                                remaining_seconds = 0
-
-                            if minutes == 60:
-                                hours += 1
-                                minutes = 0
-
-                            timestamp = f"{hours}:{minutes:02}:{remaining_seconds:02}"
-                            return timestamp
 
                         timestamps_text = ""
                         found_timestamps = False
