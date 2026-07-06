@@ -169,14 +169,15 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
             ts.setdefault('source', 'original')
 
         # --- P1: 提取完整音频一次 --------------------------------------------------
-        full_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        full_audio = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
         full_audio.close()
         try:
             extract_cmd = [
                 os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
                 '-y', '-hide_banner', '-loglevel', 'error',
                 '-i', filename,
-                '-vn', '-acodec', 'pcm_s16le', '-ar', str(SAMPLE_RATE), '-ac', '1',
+                '-vn', '-f', 's16le', '-acodec', 'pcm_s16le',
+                '-ar', str(SAMPLE_RATE), '-ac', '1',
                 full_audio.name
             ]
             _opts = {}
@@ -225,8 +226,8 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     rms = _np.sqrt(_np.mean(block ** 2))
                     if rms > 0.005:  # 避免静默块 blow up
                         gain = min(1.5, 0.1 / rms)  # 最多 +3.5dB 增益
-                        block = block * gain
-                    block = block.reshape(1, -1)
+                        block = block.copy() * gain
+                    block = block.reshape(1, -1).astype(_np.float32)
                     ort_inputs = {"input": block}
                     preds = verify_session.run(["output"], ort_inputs)[0]
                     block_offset = b_idx * block_size + ws
@@ -247,10 +248,11 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     preds2 = verify_session.run(["output"], ort_inputs2)[0]
                     confirm_segs = list(_compute_ts(preds2[0], precision, 0.50, focus_idx, 0))
                     if confirm_segs:
-                        ts['start'] = ts_abs_start
-                        ts['end'] = ts_abs_end
+                        best = max(confirm_segs, key=lambda x: x['pred'])
+                        ts['start'] = ts_abs_start - 0.5 + best['start']
+                        ts['end'] = ts_abs_start - 0.5 + best['end']
                         ts['source'] = 'new'
-                        ts['pred'] = max(s['pred'] for s in confirm_segs)
+                        ts['pred'] = best['pred']
                         merged_timestamps.append(ts)
                         confirmed += 1
                     else:
