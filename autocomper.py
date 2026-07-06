@@ -135,23 +135,29 @@ def _parse_timestamps_txt(txt_path):
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
                        focus_idx=58):
-    """在每个原片段周围用更低的阈值重扫描，补充漏掉的声音片段。
+    """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
-    新发现的片段标记 source='new'，原始片段标记 source='original'。
-    审核对话框中可凭此快速定位需要检查的新增片段。
+    P0: 加简易 DRC 压缩，把被音乐盖住的 burp 拉回来
+    P1: 每文件提取完整音频一次（消除 N 次 FFmpeg 调用的磁盘 I/O）
+    P3: 双阈值确认：低阈值 DRC 扫描 → 高阈值 raw 确认（滤假阳）
+    新片段标记 source='new'，原始片段标记 source='original'。
     """
     if not dict_list:
         return dict_list
 
-    # 预加载 ONNX 模型一次（所有窗口共享，省去每窗口 3-5s 的加载时间）
     import onnxruntime as ort
+    import numpy as _np
+    from sound_reader import compute_timestamps as _compute_ts
+
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     verify_session = ort.InferenceSession(selected_model, sess_options,
                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    SAMPLE_RATE = 32000
 
     checked = 0
-    new_found = 0
+    confirmed = 0
+    rejected = 0
 
     for entry in dict_list:
         filename = entry['filename']
@@ -159,78 +165,122 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
         if not original_ts:
             continue
 
-        # 标记所有原始片段
         for ts in original_ts:
             ts.setdefault('source', 'original')
 
-        # 合并重叠的扫描窗口
-        scan_windows = []
-        for ts in original_ts:
-            ws = max(0, ts['start'] - window)
-            we = ts['end'] + window
-            if scan_windows and ws <= scan_windows[-1][1] + 1:
-                scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
-            else:
-                scan_windows.append((ws, we))
+        # --- P1: 提取完整音频一次 --------------------------------------------------
+        full_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        full_audio.close()
+        try:
+            extract_cmd = [
+                os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
+                '-y', '-hide_banner', '-loglevel', 'error',
+                '-i', filename,
+                '-vn', '-acodec', 'pcm_s16le', '-ar', str(SAMPLE_RATE), '-ac', '1',
+                full_audio.name
+            ]
+            _opts = {}
+            if sys.platform == 'win32':
+                _opts['creationflags'] = 0x08000000
+            subprocess.run(extract_cmd, capture_output=True, timeout=60, **_opts)
 
-        # 用 FFmpeg 提取每段短音频 → 低阈值重跑 ONNX
-        merged_timestamps = list(original_ts)
-        for ws, we in scan_windows:
-            checked += 1
-            try:
-                tmp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-                tmp_audio.close()
-                extract_cmd = [
-                    os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
-                    '-y', '-hide_banner', '-loglevel', 'error',
-                    '-ss', str(ws), '-t', str(we - ws),
-                    '-i', filename,
-                    '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
-                    tmp_audio.name
-                ]
-                _opts = {}
-                if sys.platform == 'win32':
-                    _opts['creationflags'] = 0x08000000
-                subprocess.run(extract_cmd, capture_output=True, timeout=30, **_opts)
+            raw = _np.fromfile(full_audio.name, dtype=_np.int16).astype(_np.float32) / 32767.0
+            if len(raw) == 0:
+                continue
 
-                scan_result, _ = get_timestamps(
-                    tmp_audio.name, precision=precision, block_size=block_size,
-                    threshold=0.30, focus_idx=58, model=selected_model,
-                    logger=logger, ort_session=verify_session)
-                scan_ts = scan_result['timestamps']
-
-                for ts in scan_ts:
-                    ts['start'] += ws
-                    ts['end'] += ws
-                    ts['source'] = 'new'
-                    merged_timestamps.append(ts)
-                    new_found += 1
-            except Exception as e:
-                print(f"{Fore.YELLOW}  Verify scan failed for [{ws}-{we}]: {e}")
-            finally:
-                try:
-                    os.remove(tmp_audio.name)
-                except Exception:
-                    pass
-
-        # 合并相邻/重叠片段（2s 内视为同一声事件）
-        if merged_timestamps:
-            merged_timestamps.sort(key=lambda x: x['start'])
-            deduped = [merged_timestamps[0]]
-            for ts in merged_timestamps[1:]:
-                if ts['start'] <= deduped[-1]['end'] + 2.0:
-                    deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
-                    deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
+            # --- P2: 自适应扫描窗口 （密集 clips 合并为一个更大的块） ---------------
+            scan_windows = []
+            for ts in original_ts:
+                ws = max(0, ts['start'] - window)
+                we = ts['end'] + window
+                if scan_windows and ws <= scan_windows[-1][1] + 1:
+                    scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
                 else:
-                    deduped.append(ts)
-            entry['timestamps'] = deduped
+                    scan_windows.append((ws, we))
+
+            # --- P0 + P3: 逐窗口 DRC 扫描 + 双阈值确认 ----------------------------
+            merged_timestamps = list(original_ts)
+            for ws, we in scan_windows:
+                checked += 1
+                if we <= ws:
+                    continue
+                si = max(0, int(ws * SAMPLE_RATE))
+                ei = min(len(raw), int(we * SAMPLE_RATE))
+                if ei - si < SAMPLE_RATE:
+                    continue
+
+                slice_audio = raw[si:ei].copy()
+                total_samples = len(slice_audio)
+                frame_count = SAMPLE_RATE * block_size
+                if total_samples < frame_count:
+                    continue
+
+                # P0: 简易 DRC — 按块做增益缩放（不引入伪影的轻量压缩）
+                num_blocks = total_samples // frame_count
+                slice_audio = slice_audio[:num_blocks * frame_count]
+                blocks = slice_audio.reshape(num_blocks, frame_count)
+                scan_ts = []
+                for b_idx in range(num_blocks):
+                    block = blocks[b_idx]
+                    rms = _np.sqrt(_np.mean(block ** 2))
+                    if rms > 0.005:  # 避免静默块 blow up
+                        gain = min(1.5, 0.1 / rms)  # 最多 +3.5dB 增益
+                        block = block * gain
+                    block = block.reshape(1, -1)
+                    ort_inputs = {"input": block}
+                    preds = verify_session.run(["output"], ort_inputs)[0]
+                    block_offset = b_idx * block_size + ws
+                    scan_ts.extend(_compute_ts(preds[0], precision, 0.30, focus_idx, block_offset))
+
+                # P3: 双阈值确认 — 原始未压缩音频 + 高阈值 0.50
+                for ts in scan_ts:
+                    ts_abs_start = ts['start']
+                    ts_abs_end = ts['end']
+                    si2 = max(0, int((ts_abs_start - 0.5) * SAMPLE_RATE))
+                    ei2 = min(len(raw), int((ts_abs_end + 0.5) * SAMPLE_RATE))
+                    if ei2 - si2 < frame_count:
+                        continue
+                    chunk = raw[si2:ei2][:frame_count].reshape(1, -1).astype(_np.float32)
+                    if chunk.shape[1] != frame_count:
+                        chunk = _np.pad(chunk, ((0, 0), (0, frame_count - chunk.shape[1])))
+                    ort_inputs2 = {"input": chunk}
+                    preds2 = verify_session.run(["output"], ort_inputs2)[0]
+                    confirm_segs = list(_compute_ts(preds2[0], precision, 0.50, focus_idx, 0))
+                    if confirm_segs:
+                        ts['start'] = ts_abs_start
+                        ts['end'] = ts_abs_end
+                        ts['source'] = 'new'
+                        ts['pred'] = max(s['pred'] for s in confirm_segs)
+                        merged_timestamps.append(ts)
+                        confirmed += 1
+                    else:
+                        rejected += 1
+
+            # --- 合并相邻/重叠片段（2s 内视为同一声事件） -----------------------------
+            if merged_timestamps:
+                merged_timestamps.sort(key=lambda x: x['start'])
+                deduped = [merged_timestamps[0]]
+                for ts in merged_timestamps[1:]:
+                    if ts['start'] <= deduped[-1]['end'] + 2.0:
+                        deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
+                        deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
+                    else:
+                        deduped.append(ts)
+                entry['timestamps'] = deduped
+
+        except Exception as e:
+            print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {e}")
+        finally:
+            try:
+                os.remove(full_audio.name)
+            except Exception:
+                pass
 
     if checked > 0:
         print(f"{Fore.CYAN}Verification: scanned {checked} window(s), "
-              f"found {new_found} additional segment(s).")
+              f"confirmed {confirmed} new, rejected {rejected}.")
 
     return dict_list
-
 
 class ReviewDialog:
     """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消。"""
