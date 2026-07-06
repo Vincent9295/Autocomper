@@ -192,7 +192,11 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False):
     v_srcs = ''.join(f'[v{i}]' for i in range(n))
     a_srcs = ''.join(f'[a{i}]' for i in range(n))
     parts.append(f'{v_srcs}concat=n={n}:v=1:a=0[outv]')
-    parts.append(f'{a_srcs}concat=n={n}:v=0:a=1[outa]')
+    # aresample 嵌入 filter_complex（不能放 -af，与复杂滤波器图冲突）
+    if normalize:
+        parts.append(f'{a_srcs}concat=n={n}:v=0:a=1,loudnorm,aresample=async=1:first_pts=0[outa]')
+    else:
+        parts.append(f'{a_srcs}concat=n={n}:v=0:a=1,aresample=async=1:first_pts=0[outa]')
     filter_complex = ';'.join(parts)
 
     cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2']
@@ -204,8 +208,6 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False):
             '-rc-lookahead', '0', '-sar', '1:1',
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
             '-vsync', 'cfr', '-shortest']
-    if normalize:
-        cmd.extend(['-af', 'loudnorm'])
     cmd.append(output_file)
 
     # 验证所有输入文件有视频流
