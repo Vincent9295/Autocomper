@@ -1077,6 +1077,9 @@ class VideoProcessorApp:
             self.review_checkbox, 'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.')
         skip_auto_tooltip = CustomHovertip(
             self.skip_auto_checkbox, 'When a timestamps.txt file already exists, automatically use it without showing the confirmation dialog.')
+        hpss_tooltip = CustomHovertip(
+            self.vocal_sep_checkbox, 'Use HPSS (Harmonic-Percussive Source Separation) to isolate short impulse sounds '
+            '(e.g. burps) from sustained music before detection.\nRequires: librosa + scipy (bundled).')
 
         settings_tooltip = CustomHovertip(self.settings_button, "Settings")
 
@@ -1106,7 +1109,8 @@ class VideoProcessorApp:
             self.padding_after_entry,
             self.verify_checkbox,
             self.review_checkbox,
-            self.skip_auto_checkbox
+            self.skip_auto_checkbox,
+            self.vocal_sep_checkbox
         ]
         
         self.enable_while_processing = [
