@@ -273,6 +273,16 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                         deduped.append(ts)
                 entry['timestamps'] = deduped
 
+                # --- 修剪相邻 clip 的重叠（DRC 可能产生跨 clip 渗透） --------------------
+                if len(deduped) > 1:
+                    deduped.sort(key=lambda x: x['start'])
+                    for i in range(len(deduped) - 1):
+                        if deduped[i]['end'] > deduped[i + 1]['start']:
+                            # 重叠：在中点分割，阻止音频跨 clip 渗出
+                            mid = (deduped[i]['end'] + deduped[i + 1]['start']) / 2
+                            deduped[i]['end'] = mid
+                            deduped[i + 1]['start'] = mid
+
         except Exception as e:
             print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {e}")
         finally:

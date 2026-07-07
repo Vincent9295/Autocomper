@@ -154,7 +154,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             seg_file = os.path.join(seg_dir, f"_seg{i}.mp4")
             seg_files.append(seg_file)
             _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None, normalize=normalize, fps=fps)
-        _ffmpeg_concat(seg_files, output_file, res=res, normalize=normalize)
+        _ffmpeg_concat(seg_files, output_file, res=res, normalize=normalize, fps=fps)
     finally:
         for sf in seg_files:
             try:
@@ -164,7 +164,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     return True
 
 
-def _ffmpeg_concat(file_list, output_file, res=None, normalize=False):
+def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
     """Concatenate using concat FILTER (frame-level, not demuxer)."""
     if not file_list:
         return False
@@ -222,6 +222,9 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False):
             '-rc-lookahead', '0', '-sar', '1:1',
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
             '-vsync', 'cfr', '-shortest']
+    if fps and fps > 0:
+        cmd.insert(cmd.index('-shortest'), str(int(fps)))
+        cmd.insert(cmd.index(str(int(fps))), '-r')
     cmd.append(output_file)
 
     # 验证所有输入文件有视频流
@@ -250,7 +253,7 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False):
     return True
 
 
-def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6):
+def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6, fps=None):
     """Batched concat for large file lists."""
     if not file_list:
         return False
@@ -277,7 +280,7 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                 print(f"  Target resolution: {res[0]}x{res[1]}")
 
     if len(file_list) <= batch_size:
-        return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize)
+        return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize, fps=fps)
 
     temp_dir = os.path.dirname(output_file) or os.path.dirname(file_list[0])
     batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
@@ -287,11 +290,11 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
             batch_out = os.path.join(temp_dir, f"_batch{bi}.mp4")
             batch_files.append(batch_out)
             print(f"  Batch {bi + 1}/{len(batches)} ({len(batch)} files)...")
-            ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize)
+            ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
         print(f"  Final merge ({len(batch_files)} files)...")
-        _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize)
+        _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps)
     finally:
         for bf in batch_files:
             try:
@@ -501,7 +504,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 tempfiles = [t for t in [task[4] for task in tasks] if os.path.exists(t)]
                 print("Combining individual media, please do not close the program...", end="")
                 if is_video:
-                    _ffmpeg_concat_batched(tempfiles, output, res=res, normalize=normalize)
+                    _ffmpeg_concat_batched(tempfiles, output, res=res, normalize=normalize, fps=fps)
                 else:
                     concat_func(tempfiles, output, normalize=normalize)
                 print(f"{Fore.GREEN}Done combining media.")
