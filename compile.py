@@ -147,20 +147,40 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                             f"\n  rc={result.returncode}\n  stderr: {result.stderr}\n  stdout: {result.stdout}")
         return True
 
-    seg_files = []
-    seg_dir = os.path.dirname(output_file)
-    try:
+    # ── single-pass trim+concat filter graph ──
+    parts = []
+    if res:
+        w, h = res
         for i, (s, e) in enumerate(timestamps):
-            seg_file = os.path.join(seg_dir, f"_seg{i}.mp4")
-            seg_files.append(seg_file)
-            _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None, normalize=normalize, fps=fps)
-        _ffmpeg_concat(seg_files, output_file, res=res, normalize=normalize, fps=fps)
-    finally:
-        for sf in seg_files:
-            try:
-                os.remove(sf)
-            except OSError:
-                pass
+            parts.append(f'[0:v]trim={s}:{e},scale={w}:{h}:force_original_aspect_ratio=decrease,'
+                        f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1:1,'
+                        f'setpts=PTS-STARTPTS[v{i}]')
+            parts.append(f'[0:a]atrim={s}:{e},asetpts=PTS-STARTPTS[a{i}]')
+    else:
+        for i, (s, e) in enumerate(timestamps):
+            parts.append(f'[0:v]trim={s}:{e},setsar=1:1,setpts=PTS-STARTPTS[v{i}]')
+            parts.append(f'[0:a]atrim={s}:{e},asetpts=PTS-STARTPTS[a{i}]')
+    v_srcs = ''.join(f'[v{i}]' for i in range(n))
+    a_srcs = ''.join(f'[a{i}]' for i in range(n))
+    parts.append(f'{v_srcs}concat=n={n}:v=1:a=0[outv]')
+    if normalize:
+        parts.append(f'{a_srcs}concat=n={n}:v=0:a=1,loudnorm,aresample=async=1:first_pts=0[outa]')
+    else:
+        parts.append(f'{a_srcs}concat=n={n}:v=0:a=1,aresample=async=1:first_pts=0[outa]')
+    filter_complex = ';'.join(parts)
+
+    cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2',
+           '-accurate_seek', '-i', input_file,
+           '-filter_complex', filter_complex,
+           '-map', '[outv]', '-map', '[outa]'] + video_codec + [
+           '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+           '-avoid_negative_ts', 'make_zero',
+           '-vsync', 'cfr', '-shortest']
+    cmd.append(output_file)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, **_subprocess_opts)
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg trim+concat failed for {os.path.basename(input_file)}"
+                        f"\n  rc={result.returncode}\n  stderr: {result.stderr}\n  stdout: {result.stdout}")
     return True
 
 
