@@ -236,7 +236,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     block_offset = b_idx * block_size + ws
                     scan_ts.extend(_compute_ts(preds[0], precision, 0.30, focus_idx, block_offset))
 
-                # P3: 双阈值确认 — 原始未压缩音频 + 高阈值 0.50
+                # P3: 双阈值确认 — 原始未压缩音频 + 阈值 0.30
                 for ts in scan_ts:
                     ts_abs_start = ts['start']
                     ts_abs_end = ts['end']
@@ -249,7 +249,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                         chunk = _np.pad(chunk, ((0, 0), (0, frame_count - chunk.shape[1])))
                     ort_inputs2 = {"input": chunk}
                     preds2 = verify_session.run(["output"], ort_inputs2)[0]
-                    confirm_segs = list(_compute_ts(preds2[0], precision, 0.50, focus_idx, 0))
+                    confirm_segs = list(_compute_ts(preds2[0], precision, 0.30, focus_idx, 0))
                     if confirm_segs:
                         best = max(confirm_segs, key=lambda x: x['pred'])
                         ts['start'] = ts_abs_start - 0.5 + best['start']
@@ -959,6 +959,15 @@ class VideoProcessorApp:
             self.checkbox_frame_five, text="Re-verify clips (scan near segments for missed clips)",
             variable=self.use_verify)
         self.verify_checkbox.pack(anchor=tk.W)
+
+        # 人声分离 checkbox
+        self.checkbox_frame_vocal = ttk.Frame(self.left_frame)
+        self.checkbox_frame_vocal.pack(anchor=tk.W)
+        self.use_vocal_sep = tk.BooleanVar()
+        self.vocal_sep_checkbox = ttk.Checkbutton(
+            self.checkbox_frame_vocal, text="Separate Vocals (Demucs) — isolate voice from music before detection",
+            variable=self.use_vocal_sep)
+        self.vocal_sep_checkbox.pack(anchor=tk.W)
 
         # 审核 checkbox
         self.checkbox_frame_six = ttk.Frame(self.left_frame)
@@ -1967,7 +1976,8 @@ class VideoProcessorApp:
                     print(
                         f"{Fore.GREEN}[{i + 1}/{len(self.uploaded_videos)}]{Style.RESET_ALL} Getting timestamps for {os.path.basename(input_video_path)}")
                     timestamps, used_existing_data = get_timestamps(
-                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
+                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar,
+                        use_vocal_sep=self.use_vocal_sep.get())
                     timestamps = dict(timestamps)  # 拷贝，防止修改缓存
                     dict_list.append(timestamps)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")

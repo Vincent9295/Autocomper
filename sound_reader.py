@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 import hashlib
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import numpy as np
 import onnxruntime as ort
 from typing import Generator, Any, Dict, Tuple
@@ -132,8 +134,36 @@ MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
 
+def _separate_vocals(input_file, temp_dir):
+    """Run demucs to extract vocals from a video. Returns vocals.wav path or None."""
+    import tempfile as _tempfile
+    try:
+        audio_tmp = _tempfile.NamedTemporaryFile(suffix='.wav', dir=temp_dir, delete=False)
+        audio_tmp.close()
+        extract_cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+                       '-i', input_file, '-vn', '-acodec', 'pcm_s16le',
+                       '-ar', '44100', '-ac', '2', audio_tmp.name]
+        _opts = {'creationflags': subprocess.CREATE_NO_WINDOW} if is_windows else {}
+        if subprocess.run(extract_cmd, capture_output=True, timeout=120, **_opts).returncode != 0:
+            os.remove(audio_tmp.name)
+            return None
+        out_dir = _tempfile.mkdtemp(dir=temp_dir)
+        demucs_cmd = [sys.executable, '-m', 'demucs', '--two-stems', 'vocals',
+                      '-n', 'htdemucs', audio_tmp.name, '-o', out_dir]
+        subprocess.run(demucs_cmd, capture_output=True, timeout=900, **_opts)
+        basename = os.path.splitext(os.path.basename(audio_tmp.name))[0]
+        vocals_path = os.path.join(out_dir, 'htdemucs', basename, 'vocals.wav')
+        os.remove(audio_tmp.name)
+        if os.path.exists(vocals_path):
+            return vocals_path
+    except Exception:
+        pass
+    return None
+
+
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
-                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None):
+                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
+                   use_vocal_sep=False):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -160,9 +190,20 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         ort_session = ort.InferenceSession(model, sess_options,
                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
+    # --- vocal separation preprocessing ---
+    actual_file = file
+    _vocals_cleanup = None
+    if use_vocal_sep:
+        print("Running vocal separation (demucs)...")
+        _vocals_cleanup = _separate_vocals(file, os.path.dirname(file) or tempfile.gettempdir())
+        if _vocals_cleanup:
+            actual_file = _vocals_cleanup
+        else:
+            print("Warning: vocal separation failed, using original audio")
+
     offset = 0
-    blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size)
-    _dur = _get_audio_duration(file)
+    blocks = load_audio(actual_file, SAMPLE_RATE, SAMPLE_RATE * block_size)
+    _dur = _get_audio_duration(actual_file)
     if _dur is not None:
         blocks = _SizedIterable(blocks, max(1, int(_dur / block_size) + 1))
     else:
