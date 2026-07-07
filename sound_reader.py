@@ -66,7 +66,7 @@ def pad_array_if_needed(arr, desired_size, pad_value=0):
 
 def load_audio(file: str, sr: int, frame_count: int):
     cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'warning', '-i', file,
-           '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=c0[audio]',
+            '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=0.5*c0+0.5*c1[audio]',
            '-map', '[audio]', '-f', 's16le', '-acodec', 'pcm_s16le',
            '-ar', str(sr), '-ac', '1', '-bufsize', '128k', '-']
     subprocess_options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}

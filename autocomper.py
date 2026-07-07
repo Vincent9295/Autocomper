@@ -189,11 +189,14 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
             if len(raw) == 0:
                 continue
 
-            # --- P2: 自适应扫描窗口 （密集 clips 合并为一个更大的块） ---------------
+            # --- P2: 自适应扫描窗口 （确保不超出音频边界） ---------------
+            max_dur = len(raw) / SAMPLE_RATE
             scan_windows = []
             for ts in original_ts:
                 ws = max(0, ts['start'] - window)
-                we = ts['end'] + window
+                we = min(ts['end'] + window, max_dur - 0.1)  # 不超出音频末端
+                if we <= ws:
+                    continue
                 if scan_windows and ws <= scan_windows[-1][1] + 1:
                     scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
                 else:

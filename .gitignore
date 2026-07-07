@@ -27,6 +27,7 @@ models/*.onnx
 
 # Old builds (don't commit)
 Autocomper Modified/
+AutoComper Enhanced*/
 
 # Sensitive
 *.db

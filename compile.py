@@ -12,6 +12,8 @@ import tempfile
 from colorama import Fore, Style
 
 from utils import FFMPEG_PATH
+import sys
+import os
 
 MERGE_THRESHOLD = 2  # seconds
 
@@ -37,6 +39,15 @@ def _get_video_size(input_file: str):
     if m:
         return int(m.group(1)), int(m.group(2))
     return None, None
+
+
+def _get_frame_rate(input_file: str):
+    """Return frame rate (fps) of the first video stream, or default 30."""
+    stderr = _ffprobe(input_file)
+    m = re.search(r'(\d+(?:\.\d+)?)\s*fps', stderr)
+    if m:
+        return float(m.group(1))
+    return 30.0
 
 
 def _get_video_duration(input_file: str):
@@ -87,7 +98,8 @@ def _get_video_duration(input_file: str):
 
 # ═══ VIDEO cut / concat ═══════════════════════════════════════════════
 
-def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
+def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
+                fps=None):
     if not timestamps:
         return False
 
@@ -104,6 +116,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
 
     video_codec = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
                    '-rc-lookahead', '0', '-sar', '1:1']
+    if fps and fps > 0:
+        video_codec += ['-r', str(int(fps))]
     audio_codec_tmp = ['-c:a', 'flac']      # FLAC 无编码延迟，时长精确
     audio_codec_out = ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
     mem_opts = ['-threads', '2']
@@ -139,7 +153,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False):
         for i, (s, e) in enumerate(timestamps):
             seg_file = os.path.join(seg_dir, f"_seg{i}.mp4")
             seg_files.append(seg_file)
-            _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None, normalize=normalize)
+            _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None, normalize=normalize, fps=fps)
         _ffmpeg_concat(seg_files, output_file, res=res, normalize=normalize)
     finally:
         for sf in seg_files:
@@ -398,6 +412,19 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             tempfiles = []
             tasks = []
 
+            # 探测器 1：感知最常见的帧率，统一所有输出文件的帧率
+            fps = None
+            if is_video and combine_vids and len(dict_list) > 1:
+                from collections import Counter
+                fps_counter = Counter()
+                for elt in dict_list[:10]:  # sample first 10 files
+                    f = _get_frame_rate(elt["filename"])
+                    if f:
+                        fps_counter[int(f)] += 1
+                if fps_counter:
+                    fps = fps_counter.most_common(1)[0][0]
+                    print(f"{Fore.CYAN}Detected dominant frame rate: {fps} fps")
+
             for n, elt in enumerate(dict_list):
                 filename = elt["filename"]
                 filename_stripped = os.path.basename(str(filename))
@@ -458,7 +485,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 for task in tasks:
                     n, fn, fn_stripped, ts, tmp, cr = task
                     f = executor.submit(cut_func, fn, ts, tmp,
-                                       **({'res': cr} if is_video else {}), normalize=normalize)
+                                       **({'res': cr, 'fps': fps} if is_video else {}), normalize=normalize)
                     running[f] = (n, fn_stripped)
 
                 for future in concurrent.futures.as_completed(running):
