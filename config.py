@@ -1,2 +1,2 @@
-VERSION = "1.2.3"
-REPO_URL = "https://github.com/wz-bff/AutoComper/releases/latest"
+VERSION = "1.0.6"
+REPO_URL = "https://github.com/Vincent9295/Autocomper/releases/latest"
