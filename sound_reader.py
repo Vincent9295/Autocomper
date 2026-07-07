@@ -136,6 +136,11 @@ timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]'
 
 def _separate_vocals(input_file, temp_dir):
     """Run demucs to extract vocals from a video. Returns vocals.wav path or None."""
+    try:
+        import demucs  # noqa: F401
+    except ImportError:
+        print("Warning: demucs not installed. Run: pip install demucs")
+        return None
     import tempfile as _tempfile
     try:
         audio_tmp = _tempfile.NamedTemporaryFile(suffix='.wav', dir=temp_dir, delete=False)
