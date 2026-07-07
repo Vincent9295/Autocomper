@@ -378,7 +378,7 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False):
            '-fflags', '+genpts+igndts', '-f', 'concat', '-safe', '0', '-copytb', '0',
            '-i', list_path]
     if normalize:
-        cmd += ['-c:a', 'libmp3lame', '-b:a', '192k', '-af', 'loudnorm']
+        cmd += ['-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100', '-af', 'loudnorm']
     else:
         cmd += ['-c:a', 'copy']
     cmd.append(output_file)
@@ -415,18 +415,8 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             tempfiles = []
             tasks = []
 
-            # 探测器 1：感知最常见的帧率，统一所有输出文件的帧率
-            fps = None
-            if is_video and combine_vids and len(dict_list) > 1:
-                from collections import Counter
-                fps_counter = Counter()
-                for elt in dict_list[:10]:  # sample first 10 files
-                    f = _get_frame_rate(elt["filename"])
-                    if f:
-                        fps_counter[int(f)] += 1
-                if fps_counter:
-                    fps = fps_counter.most_common(1)[0][0]
-                    print(f"{Fore.CYAN}Detected dominant frame rate: {fps} fps")
+            # 固定输出帧率 30fps，防止 VFR / 25fps 导致的 A/V 偏移
+            fps = 30 if is_video else None
 
             for n, elt in enumerate(dict_list):
                 filename = elt["filename"]
