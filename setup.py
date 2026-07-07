@@ -6,7 +6,7 @@ base = 'Win32GUI' if sys.platform == 'win32' else None
 
 includefiles = ['ffmpeg/', 'img/', 'models/']
 includes = ['yt_dlp.utils._deprecated']
-excludes = ['Tkinter']
+excludes = ['Tkinter', 'librosa', 'numba', 'scipy', 'scikit-learn', 'soundfile']
 packages = ['moviepy']
 
 setup(
