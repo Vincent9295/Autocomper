@@ -960,12 +960,12 @@ class VideoProcessorApp:
             variable=self.use_verify)
         self.verify_checkbox.pack(anchor=tk.W)
 
-        # 人声分离 checkbox
+        # HPSS 冲击音分离 checkbox
         self.checkbox_frame_vocal = ttk.Frame(self.left_frame)
         self.checkbox_frame_vocal.pack(anchor=tk.W)
         self.use_vocal_sep = tk.BooleanVar()
         self.vocal_sep_checkbox = ttk.Checkbutton(
-            self.checkbox_frame_vocal, text="Separate Vocals (Demucs) — isolate voice from music before detection",
+            self.checkbox_frame_vocal, text="HPSS Percussive Isolation — extract short impulse sounds, suppress sustained music",
             variable=self.use_vocal_sep)
         self.vocal_sep_checkbox.pack(anchor=tk.W)
 

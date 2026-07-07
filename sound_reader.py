@@ -135,11 +135,12 @@ timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]'
 
 
 def _separate_vocals(input_file, temp_dir):
-    """Run demucs to extract vocals from a video. Returns vocals.wav path or None."""
+    """Extract percussive component via HPSS — isolates short impulse sounds (e.g. burps)
+    from sustained harmonic content (music/singing). Returns percussive.wav path or None."""
     try:
-        import demucs  # noqa: F401
+        import librosa
     except ImportError:
-        print("Warning: demucs not installed. Run: pip install demucs")
+        print("Warning: librosa not installed. Run: pip install librosa")
         return None
     import tempfile as _tempfile
     try:
@@ -147,20 +148,19 @@ def _separate_vocals(input_file, temp_dir):
         audio_tmp.close()
         extract_cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
                        '-i', input_file, '-vn', '-acodec', 'pcm_s16le',
-                       '-ar', '44100', '-ac', '2', audio_tmp.name]
+                       '-ar', '32000', '-ac', '1', audio_tmp.name]
         _opts = {'creationflags': subprocess.CREATE_NO_WINDOW} if is_windows else {}
         if subprocess.run(extract_cmd, capture_output=True, timeout=120, **_opts).returncode != 0:
             os.remove(audio_tmp.name)
             return None
-        out_dir = _tempfile.mkdtemp(dir=temp_dir)
-        demucs_cmd = [sys.executable, '-m', 'demucs', '--two-stems', 'vocals',
-                      '-n', 'htdemucs', audio_tmp.name, '-o', out_dir]
-        subprocess.run(demucs_cmd, capture_output=True, timeout=900, **_opts)
-        basename = os.path.splitext(os.path.basename(audio_tmp.name))[0]
-        vocals_path = os.path.join(out_dir, 'htdemucs', basename, 'vocals.wav')
+        y, sr = librosa.load(audio_tmp.name, sr=32000, mono=True)
+        _, y_percussive = librosa.effects.hpss(y)
+        out_path = _tempfile.NamedTemporaryFile(suffix='.wav', dir=temp_dir, delete=False)
+        out_path.close()
+        import soundfile as sf
+        sf.write(out_path.name, y_percussive, sr)
         os.remove(audio_tmp.name)
-        if os.path.exists(vocals_path):
-            return vocals_path
+        return out_path.name
     except Exception:
         pass
     return None
@@ -195,16 +195,16 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         ort_session = ort.InferenceSession(model, sess_options,
                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
-    # --- vocal separation preprocessing ---
+    # --- percussive isolation (HPSS) ---
     actual_file = file
     _vocals_cleanup = None
     if use_vocal_sep:
-        print("Running vocal separation (demucs)...")
+        print("Running HPSS percussive isolation...")
         _vocals_cleanup = _separate_vocals(file, os.path.dirname(file) or tempfile.gettempdir())
         if _vocals_cleanup:
             actual_file = _vocals_cleanup
         else:
-            print("Warning: vocal separation failed, using original audio")
+            print("Warning: HPSS failed, using original audio")
 
     offset = 0
     blocks = load_audio(actual_file, SAMPLE_RATE, SAMPLE_RATE * block_size)
