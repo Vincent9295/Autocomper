@@ -134,7 +134,7 @@ def _parse_timestamps_txt(txt_path):
 
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
-                       focus_idx=58):
+                       focus_idx=58, threshold=0.30, ort_session=None):
     """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
     P0: 加简易 DRC 压缩，把被音乐盖住的 burp 拉回来
@@ -145,19 +145,19 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
     if not dict_list:
         return dict_list
 
-    import onnxruntime as ort
     import numpy as _np
     from sound_reader import compute_timestamps as _compute_ts
 
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    verify_session = ort.InferenceSession(selected_model, sess_options,
-                                           providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    if ort_session is None:
+        import onnxruntime as ort
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        ort_session = ort.InferenceSession(selected_model, sess_options,
+                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
     SAMPLE_RATE = 32000
 
     checked = 0
-    confirmed = 0
-    rejected = 0
+    dskip = confirmed = rejected = 0
 
     for entry in dict_list:
         filename = entry['filename']
@@ -228,16 +228,20 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     block = blocks[b_idx]
                     rms = _np.sqrt(_np.mean(block ** 2))
                     if rms > 0.005:  # 避免静默块 blow up
-                        gain = min(1.5, 0.1 / rms)  # 最多 +3.5dB 增益
+                        gain = min(2.5, 0.15 / rms)  # 最多 +8dB 增益
                         block = block.copy() * gain
                     block = block.reshape(1, -1).astype(_np.float32)
-                    ort_inputs = {"input": block}
-                    preds = verify_session.run(["output"], ort_inputs)[0]
+                    preds = ort_session.run(["output"], {"input": block})[0]
                     block_offset = b_idx * block_size + ws
-                    scan_ts.extend(_compute_ts(preds[0], precision, 0.30, focus_idx, block_offset))
+                    scan_ts.extend(_compute_ts(preds[0], precision, threshold, focus_idx, block_offset))
 
-                # P3: 双阈值确认 — 原始未压缩音频 + 阈值 0.30
+                # P3: 双阈值确认 — 原始未压缩音频
                 for ts in scan_ts:
+                    if ts['pred'] > 0.80:  # 高分 DRC 跳过 P3，直接接受
+                        ts['source'] = 'new'
+                        merged_timestamps.append(ts)
+                        dskip += 1
+                        continue
                     ts_abs_start = ts['start']
                     ts_abs_end = ts['end']
                     si2 = max(0, int((ts_abs_start - 0.5) * SAMPLE_RATE))
@@ -247,9 +251,8 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     chunk = raw[si2:ei2][:frame_count].reshape(1, -1).astype(_np.float32)
                     if chunk.shape[1] != frame_count:
                         chunk = _np.pad(chunk, ((0, 0), (0, frame_count - chunk.shape[1])))
-                    ort_inputs2 = {"input": chunk}
-                    preds2 = verify_session.run(["output"], ort_inputs2)[0]
-                    confirm_segs = list(_compute_ts(preds2[0], precision, 0.30, focus_idx, 0))
+                    preds2 = ort_session.run(["output"], {"input": chunk})[0]
+                    confirm_segs = list(_compute_ts(preds2[0], precision, threshold, focus_idx, 0))
                     if confirm_segs:
                         best = max(confirm_segs, key=lambda x: x['pred'])
                         ts['start'] = ts_abs_start - 0.5 + best['start']
@@ -261,27 +264,34 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     else:
                         rejected += 1
 
-            # --- 合并相邻/重叠片段（2s 内视为同一声事件） -----------------------------
-            if merged_timestamps:
-                merged_timestamps.sort(key=lambda x: x['start'])
-                deduped = [merged_timestamps[0]]
-                for ts in merged_timestamps[1:]:
+            # --- 合并：new 片段独立，同类合并 -----------------------------
+            def _merge_ts(timestamps):
+                if not timestamps:
+                    return []
+                timestamps.sort(key=lambda x: x['start'])
+                deduped = [timestamps[0]]
+                for ts in timestamps[1:]:
                     if ts['start'] <= deduped[-1]['end'] + 2.0:
                         deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
                         deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
                     else:
                         deduped.append(ts)
-                entry['timestamps'] = deduped
+                return deduped
 
-                # --- 修剪相邻 clip 的重叠（DRC 可能产生跨 clip 渗透） --------------------
-                if len(deduped) > 1:
-                    deduped.sort(key=lambda x: x['start'])
-                    for i in range(len(deduped) - 1):
-                        if deduped[i]['end'] > deduped[i + 1]['start']:
-                            # 重叠：在中点分割，阻止音频跨 clip 渗出
-                            mid = (deduped[i]['end'] + deduped[i + 1]['start']) / 2
-                            deduped[i]['end'] = mid
-                            deduped[i + 1]['start'] = mid
+            originals = [t for t in merged_timestamps if t.get('source') == 'original']
+            news = [t for t in merged_timestamps if t.get('source') == 'new']
+            entry['timestamps'] = _merge_ts(originals) + _merge_ts(news)
+
+            # --- 修剪所有 clip 的重叠 --------------------
+            if len(entry['timestamps']) > 1:
+                deduped = entry['timestamps']
+                deduped.sort(key=lambda x: x['start'])
+                for i in range(len(deduped) - 1):
+                    if deduped[i]['end'] > deduped[i + 1]['start']:
+                        # 重叠：在中点分割，阻止音频跨 clip 渗出
+                        mid = (deduped[i]['end'] + deduped[i + 1]['start']) / 2
+                        deduped[i]['end'] = mid
+                        deduped[i + 1]['start'] = mid
 
         except Exception as e:
             print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {e}")
@@ -293,7 +303,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
     if checked > 0:
         print(f"{Fore.CYAN}Verification: scanned {checked} window(s), "
-              f"confirmed {confirmed} new, rejected {rejected}.")
+              f"confirmed {confirmed} new, DRC-skip {dskip}, rejected {rejected}.")
 
     return dict_list
 
@@ -1935,7 +1945,8 @@ class VideoProcessorApp:
                             dict_list, selected_model,
                             window=self.verify_window_var.get(),
                             focus_idx=focus_idx,
-                            logger=self.final_bar)
+                            logger=self.final_bar,
+                            threshold=threshold)
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
@@ -2044,7 +2055,8 @@ class VideoProcessorApp:
                         dict_list, selected_model,
                         window=self.verify_window_var.get(),
                         focus_idx=focus_idx,
-                        logger=self.final_bar)
+                        logger=self.final_bar,
+                        threshold=threshold)
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
