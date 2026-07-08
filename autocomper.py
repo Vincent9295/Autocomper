@@ -134,7 +134,7 @@ def _parse_timestamps_txt(txt_path):
 
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
-                       focus_idx=58, use_compressor=False):
+                       focus_idx=58):
     """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
     P0: 加简易 DRC 压缩，把被音乐盖住的 burp 拉回来
@@ -180,13 +180,6 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 '-ar', str(SAMPLE_RATE), '-ac', '1',
                 full_audio.name
             ]
-            if use_compressor:
-                # insert '-af filter' after '-i filename', before '-vn'
-                af = ('equalizer=f=400:width_type=h:width=700:gain=6,'
-                      'acompressor=threshold=-18dB:ratio=4:attack=15:release=50:makeup=3dB:knee=2dB:detection=peak')
-                idx = extract_cmd.index('-vn')
-                extract_cmd.insert(idx, af)
-                extract_cmd.insert(idx, '-af')
             _opts = {}
             if sys.platform == 'win32':
                 _opts['creationflags'] = 0x08000000
@@ -967,15 +960,6 @@ class VideoProcessorApp:
             variable=self.use_verify)
         self.verify_checkbox.pack(anchor=tk.W)
 
-        # Audio Compressor checkbox
-        self.checkbox_frame_vocal = ttk.Frame(self.left_frame)
-        self.checkbox_frame_vocal.pack(anchor=tk.W)
-        self.use_vocal_sep = tk.BooleanVar()
-        self.vocal_sep_checkbox = ttk.Checkbutton(
-            self.checkbox_frame_vocal, text="Audio Compressor — dynamic compression for detecting sounds in loud music",
-            variable=self.use_vocal_sep)
-        self.vocal_sep_checkbox.pack(anchor=tk.W)
-
         # 审核 checkbox
         self.checkbox_frame_six = ttk.Frame(self.left_frame)
         self.checkbox_frame_six.pack(anchor=tk.W)
@@ -1084,10 +1068,6 @@ class VideoProcessorApp:
             self.review_checkbox, 'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.')
         skip_auto_tooltip = CustomHovertip(
             self.skip_auto_checkbox, 'When a timestamps.txt file already exists, automatically use it without showing the confirmation dialog.')
-        hpss_tooltip = CustomHovertip(
-            self.vocal_sep_checkbox, 'Use HPSS (Harmonic-Percussive Source Separation) to isolate short impulse sounds '
-            '(e.g. burps) from sustained music before detection.\nRequires: librosa + scipy (bundled).')
-
         settings_tooltip = CustomHovertip(self.settings_button, "Settings")
 
         self.disable_while_processing = [
@@ -1117,7 +1097,6 @@ class VideoProcessorApp:
             self.verify_checkbox,
             self.review_checkbox,
             self.skip_auto_checkbox,
-            self.vocal_sep_checkbox
         ]
         
         self.enable_while_processing = [
@@ -1956,8 +1935,7 @@ class VideoProcessorApp:
                             dict_list, selected_model,
                             window=self.verify_window_var.get(),
                             focus_idx=focus_idx,
-                            logger=self.final_bar,
-                            use_compressor=self.use_vocal_sep.get())
+                            logger=self.final_bar)
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
@@ -1988,8 +1966,7 @@ class VideoProcessorApp:
                     print(
                         f"{Fore.GREEN}[{i + 1}/{len(self.uploaded_videos)}]{Style.RESET_ALL} Getting timestamps for {os.path.basename(input_video_path)}")
                     timestamps, used_existing_data = get_timestamps(
-                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar,
-                        use_vocal_sep=self.use_vocal_sep.get())
+                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
                     timestamps = dict(timestamps)  # 拷贝，防止修改缓存
                     dict_list.append(timestamps)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
@@ -2067,8 +2044,7 @@ class VideoProcessorApp:
                         dict_list, selected_model,
                         window=self.verify_window_var.get(),
                         focus_idx=focus_idx,
-                        logger=self.final_bar,
-                        use_compressor=self.use_vocal_sep.get())
+                        logger=self.final_bar)
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,

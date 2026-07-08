@@ -66,13 +66,9 @@ def pad_array_if_needed(arr, desired_size, pad_value=0):
     return arr
 
 
-def load_audio(file: str, sr: int, frame_count: int, pre_filter: str = ''):
-    filter_expr = '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=0.5*c0+0.5*c1'
-    if pre_filter:
-        filter_expr += ',' + pre_filter
-    filter_expr += '[audio]'
+def load_audio(file: str, sr: int, frame_count: int):
     cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'warning', '-i', file,
-            '-filter_complex', filter_expr,
+            '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=0.5*c0+0.5*c1[audio]',
            '-map', '[audio]', '-f', 's16le', '-acodec', 'pcm_s16le',
            '-ar', str(sr), '-ac', '1', '-bufsize', '128k', '-']
     subprocess_options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
@@ -138,8 +134,7 @@ MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
-                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
-                   use_vocal_sep=False):
+                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -166,14 +161,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         ort_session = ort.InferenceSession(model, sess_options,
                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
-    # --- audio compressor (acompressor) ---
-    pre_filter = ''
-    if use_vocal_sep:
-        pre_filter = ('equalizer=f=400:width_type=h:width=700:gain=6,'
-                      'acompressor=threshold=-18dB:ratio=4:attack=15:release=50:makeup=3dB:knee=2dB:detection=peak')
-
     offset = 0
-    blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size, pre_filter=pre_filter)
+    blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size)
     _dur = _get_audio_duration(file)
     if _dur is not None:
         blocks = _SizedIterable(blocks, max(1, int(_dur / block_size) + 1))
