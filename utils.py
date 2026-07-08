@@ -20,7 +20,7 @@ def get_bundle_filepath(filepath: str) -> str:
         if hasattr(sys, '_MEIPASS'):
             return os.path.join(sys._MEIPASS, filepath)
         else:
-            return os.path.join(os.path.dirname(sys.executable), '_internal', filepath)
+            return os.path.join(os.path.dirname(sys.executable), filepath)
     else:
         return os.path.join(Path.cwd(), filepath)
 
