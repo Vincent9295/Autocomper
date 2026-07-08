@@ -169,7 +169,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     # --- audio compressor (acompressor) ---
     pre_filter = ''
     if use_vocal_sep:
-        pre_filter = 'acompressor=threshold=-24dB:ratio=8:attack=2:release=50:makeup=8dB:knee=2dB:detection=peak'
+        pre_filter = ('equalizer=f=400:width_type=h:width=700:gain=6,'
+                      'acompressor=threshold=-18dB:ratio=4:attack=15:release=50:makeup=3dB:knee=2dB:detection=peak')
 
     offset = 0
     blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size, pre_filter=pre_filter)

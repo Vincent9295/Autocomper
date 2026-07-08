@@ -182,7 +182,8 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
             ]
             if use_compressor:
                 # insert '-af filter' after '-i filename', before '-vn'
-                af = 'acompressor=threshold=-24dB:ratio=8:attack=2:release=50:makeup=8dB:knee=2dB:detection=peak'
+                af = ('equalizer=f=400:width_type=h:width=700:gain=6,'
+                      'acompressor=threshold=-18dB:ratio=4:attack=15:release=50:makeup=3dB:knee=2dB:detection=peak')
                 idx = extract_cmd.index('-vn')
                 extract_cmd.insert(idx, af)
                 extract_cmd.insert(idx, '-af')
