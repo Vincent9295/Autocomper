@@ -16,9 +16,11 @@ DOWNLOAD_QUALITY_OPTIONS = ["No Limit", "144p", "240p", "360p",
 
 
 def get_bundle_filepath(filepath: str) -> str:
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        bundle_dir = str(sys._MEIPASS)
-        return os.path.join(Path.cwd(), bundle_dir, filepath)
+    if getattr(sys, 'frozen', False):
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, filepath)
+        else:
+            return os.path.join(os.path.dirname(sys.executable), '_internal', filepath)
     else:
         return os.path.join(Path.cwd(), filepath)
 

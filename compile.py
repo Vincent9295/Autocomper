@@ -456,6 +456,15 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     if len(timestamps) < orig_count:
                         print(f"{Fore.YELLOW}  Warning: {orig_count - len(timestamps)} segment(s) too short")
 
+                # ── 修剪相邻 clip 重叠（编译阶段最后防线）──
+                if len(timestamps) > 1:
+                    timestamps.sort(key=lambda x: x[0])
+                    for i in range(len(timestamps) - 1):
+                        if timestamps[i][1] > timestamps[i + 1][0]:
+                            mid = (timestamps[i][1] + timestamps[i + 1][0]) / 2
+                            timestamps[i] = (timestamps[i][0], mid)
+                            timestamps[i + 1] = (mid, timestamps[i + 1][1])
+
                 if not timestamps:
                     print(f"{Fore.YELLOW}No timestamps found for this video!")
                     continue

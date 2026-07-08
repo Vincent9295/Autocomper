@@ -66,9 +66,13 @@ def pad_array_if_needed(arr, desired_size, pad_value=0):
     return arr
 
 
-def load_audio(file: str, sr: int, frame_count: int):
+def load_audio(file: str, sr: int, frame_count: int, pre_filter: str = ''):
+    filter_expr = '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=0.5*c0+0.5*c1'
+    if pre_filter:
+        filter_expr += ',' + pre_filter
+    filter_expr += '[audio]'
     cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'warning', '-i', file,
-            '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=0.5*c0+0.5*c1[audio]',
+            '-filter_complex', filter_expr,
            '-map', '[audio]', '-f', 's16le', '-acodec', 'pcm_s16le',
            '-ar', str(sr), '-ac', '1', '-bufsize', '128k', '-']
     subprocess_options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
@@ -133,39 +137,6 @@ class _SizedIterable:
 MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
-
-def _separate_vocals(input_file, temp_dir):
-    """Extract percussive component via HPSS — isolates short impulse sounds (e.g. burps)
-    from sustained harmonic content (music/singing). Returns percussive.wav path or None."""
-    try:
-        import librosa
-    except ImportError:
-        print("Warning: librosa not installed. Run: pip install librosa")
-        return None
-    import tempfile as _tempfile
-    try:
-        audio_tmp = _tempfile.NamedTemporaryFile(suffix='.wav', dir=temp_dir, delete=False)
-        audio_tmp.close()
-        extract_cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
-                       '-i', input_file, '-vn', '-acodec', 'pcm_s16le',
-                       '-ar', '32000', '-ac', '1', audio_tmp.name]
-        _opts = {'creationflags': subprocess.CREATE_NO_WINDOW} if is_windows else {}
-        if subprocess.run(extract_cmd, capture_output=True, timeout=120, **_opts).returncode != 0:
-            os.remove(audio_tmp.name)
-            return None
-        y, sr = librosa.load(audio_tmp.name, sr=32000, mono=True)
-        _, y_percussive = librosa.effects.hpss(y)
-        out_path = _tempfile.NamedTemporaryFile(suffix='.wav', dir=temp_dir, delete=False)
-        out_path.close()
-        import soundfile as sf
-        sf.write(out_path.name, y_percussive, sr)
-        os.remove(audio_tmp.name)
-        return out_path.name
-    except Exception:
-        pass
-    return None
-
-
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_vocal_sep=False):
@@ -195,20 +166,14 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         ort_session = ort.InferenceSession(model, sess_options,
                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
-    # --- percussive isolation (HPSS) ---
-    actual_file = file
-    _vocals_cleanup = None
+    # --- audio compressor (acompressor) ---
+    pre_filter = ''
     if use_vocal_sep:
-        print("Running HPSS percussive isolation...")
-        _vocals_cleanup = _separate_vocals(file, os.path.dirname(file) or tempfile.gettempdir())
-        if _vocals_cleanup:
-            actual_file = _vocals_cleanup
-        else:
-            print("Warning: HPSS failed, using original audio")
+        pre_filter = 'acompressor=threshold=-24dB:ratio=8:attack=2:release=50:makeup=8dB:knee=2dB:detection=peak'
 
     offset = 0
-    blocks = load_audio(actual_file, SAMPLE_RATE, SAMPLE_RATE * block_size)
-    _dur = _get_audio_duration(actual_file)
+    blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size, pre_filter=pre_filter)
+    _dur = _get_audio_duration(file)
     if _dur is not None:
         blocks = _SizedIterable(blocks, max(1, int(_dur / block_size) + 1))
     else:

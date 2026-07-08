@@ -134,7 +134,7 @@ def _parse_timestamps_txt(txt_path):
 
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
-                       focus_idx=58):
+                       focus_idx=58, use_compressor=False):
     """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
     P0: 加简易 DRC 压缩，把被音乐盖住的 burp 拉回来
@@ -180,10 +180,16 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 '-ar', str(SAMPLE_RATE), '-ac', '1',
                 full_audio.name
             ]
+            if use_compressor:
+                # insert '-af filter' after '-i filename', before '-vn'
+                af = 'acompressor=threshold=-24dB:ratio=8:attack=2:release=50:makeup=8dB:knee=2dB:detection=peak'
+                idx = extract_cmd.index('-vn')
+                extract_cmd.insert(idx, af)
+                extract_cmd.insert(idx, '-af')
             _opts = {}
             if sys.platform == 'win32':
                 _opts['creationflags'] = 0x08000000
-            subprocess.run(extract_cmd, capture_output=True, timeout=60, **_opts)
+            subprocess.run(extract_cmd, capture_output=True, timeout=None, **_opts)
 
             raw = _np.fromfile(full_audio.name, dtype=_np.int16).astype(_np.float32) / 32767.0
             if len(raw) == 0:
@@ -633,7 +639,7 @@ class VideoProcessorApp:
         separator = ttk.Separator(root, orient='vertical')
         separator.grid(row=0, column=1, sticky='ns')
 
-        self.models_dir = "models/"
+        self.models_dir = get_bundle_filepath("models")
         self.preferences_file = 'preferences.ini'
 
         self.preferences = configparser.ConfigParser()
@@ -960,12 +966,12 @@ class VideoProcessorApp:
             variable=self.use_verify)
         self.verify_checkbox.pack(anchor=tk.W)
 
-        # HPSS 冲击音分离 checkbox
+        # Audio Compressor checkbox
         self.checkbox_frame_vocal = ttk.Frame(self.left_frame)
         self.checkbox_frame_vocal.pack(anchor=tk.W)
         self.use_vocal_sep = tk.BooleanVar()
         self.vocal_sep_checkbox = ttk.Checkbutton(
-            self.checkbox_frame_vocal, text="HPSS Percussive Isolation — extract short impulse sounds, suppress sustained music",
+            self.checkbox_frame_vocal, text="Audio Compressor — dynamic compression for detecting sounds in loud music",
             variable=self.use_vocal_sep)
         self.vocal_sep_checkbox.pack(anchor=tk.W)
 
@@ -1949,7 +1955,8 @@ class VideoProcessorApp:
                             dict_list, selected_model,
                             window=self.verify_window_var.get(),
                             focus_idx=focus_idx,
-                            logger=self.final_bar)
+                            logger=self.final_bar,
+                            use_compressor=self.use_vocal_sep.get())
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
@@ -2059,7 +2066,8 @@ class VideoProcessorApp:
                         dict_list, selected_model,
                         window=self.verify_window_var.get(),
                         focus_idx=focus_idx,
-                        logger=self.final_bar)
+                        logger=self.final_bar,
+                        use_compressor=self.use_vocal_sep.get())
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
