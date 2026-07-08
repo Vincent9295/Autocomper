@@ -33,7 +33,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Mixed resolutions** | Not handled | Auto-detect → scale/pad all to mode resolution |
 | **Clip overlap** | Possible audio bleed | Midpoint split between adjacent clips (detection + compile stages) |
 | **Stereo input** | Left channel only | **50/50 L+R mix** |
-| **Re-verify** | DRC +3.5dB, P3 0.50 fixed | DRC **+8dB**, threshold syncs to main, >0.80 skips P3 |
+| **Re-verify** | None | DRC **+8dB**, threshold syncs to main, >0.80 skips P3 |
 | **Memory** | Unbounded | `-threads 2`, batched concat (6 files/batch), segment-by-segment encoding |
 
 ---
