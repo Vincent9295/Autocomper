@@ -307,6 +307,50 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
     return dict_list
 
+
+def _smart_sort_key(filepath):
+    """Sort by: folder → date/title → part → natural."""
+    name = os.path.basename(filepath)
+    folder = os.path.basename(os.path.dirname(filepath)).lower()
+    name_no_ext = os.path.splitext(name)[0]
+
+    # --- folder key: extract date, fallback to natural sort
+    fm = re.search(r'(\d{4})年(\d{1,2})月', folder)
+    if fm:
+        fkey = (0, f'{fm[1]}{int(fm[2]):02d}', folder)
+    else:
+        fm = re.search(r'(\d{4})[-_](\d{2})', folder)
+        if fm:
+            fkey = (0, f'{fm[1]}{fm[2]}', folder)
+        else:
+            fp = re.split(r'(\d+)', folder)
+            fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
+
+    # --- file key
+    # 1. Chinese live stream date
+    m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})点场', name)
+    if m:
+        return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}')
+    # 2. ISO date: "2022-07-19" or "2022_07_19"
+    m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', name)
+    if m:
+        return (fkey, 0, f'{m[1]}{m[2]}{m[3]}')
+    # 3a. Part FIRST: "p0-title" or "0-title" (Bilibili)
+    m = re.search(r'^p?(\d{1,2})[\s_\-]+(.+)$', name_no_ext, re.IGNORECASE)
+    if m:
+        return (fkey, 1, m[2].strip().lower(), int(m[1]))
+    # 3b. Part LAST: "video_p1", "video part 2", "movie (3)"
+    m = re.search(r'^(.*?)[\s_\-]+p(?:art[\s_]*)?(\d+)$', name_no_ext, re.IGNORECASE)
+    if not m:
+        m = re.search(r'^(.*?)\s*\((\d+)\)\s*$', name_no_ext)
+    if m:
+        base = re.sub(r'[\s_\-]+$', '', m[1].strip().lower())
+        return (fkey, 1, base, int(m[2]))
+    # 4. Natural sort fallback
+    parts = re.split(r'(\d+)', name)
+    return (fkey, 2, tuple(int(p) if p.isdigit() else p.lower() for p in parts))
+
+
 class ReviewDialog:
     """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消。"""
 
@@ -791,6 +835,8 @@ class VideoProcessorApp:
             self.filelist_buttons_frame, text="↑", width=3, command=self.move_selected_up)
         self.down_arrow = ttk.Button(
             self.filelist_buttons_frame, text="↓", width=3, command=self.move_selected_down)
+        self.sort_button = ttk.Button(
+            self.filelist_buttons_frame, text="⇅", width=3, command=self.sort_filelist)
 
         self.remove_button = ttk.Button(
             self.filelist_buttons_frame, text="Remove Selected", command=self.remove_selected)
@@ -800,6 +846,7 @@ class VideoProcessorApp:
         self.add_button.pack(pady=5, padx=1, side=tk.LEFT)
         self.up_arrow.pack(pady=5, padx=3, side=tk.LEFT)
         self.down_arrow.pack(pady=5, padx=3, side=tk.LEFT)
+        self.sort_button.pack(pady=5, padx=3, side=tk.LEFT)
 
         self.clear_button.pack(pady=5, side=tk.RIGHT)
         self.remove_button.pack(pady=5, padx=5, side=tk.RIGHT)
@@ -1085,6 +1132,7 @@ class VideoProcessorApp:
             self.remove_button,
             self.up_arrow,
             self.down_arrow,
+            self.sort_button,
             self.clear_button,
             self.process_button,
             self.model_dropdown,
@@ -1426,6 +1474,11 @@ class VideoProcessorApp:
         self.uploaded_videos = []
         self.update_listbox()
 
+    def sort_filelist(self):
+        """Sort uploaded files by date extracted from filenames."""
+        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
+        self.update_listbox()
+
     def remove_urls_from_list(self):
         self.uploaded_videos = [
             x for x in self.uploaded_videos if os.path.dirname(x.get_path()) != TEMP_DIR]
@@ -1461,6 +1514,7 @@ class VideoProcessorApp:
                     full_path = os.path.join(root, f)
                     self.uploaded_videos.append(MediaUpload(full_path, 'video' if self.is_video else 'audio'))
                     found += 1
+        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
         self.update_listbox(scroll_to_bottom=True)
         print(f"{Fore.GREEN}Added {found} files from {folder}")
 
