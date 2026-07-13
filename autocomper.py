@@ -739,6 +739,7 @@ class VideoProcessorApp:
 
         # Create a list to store uploaded video file paths
         self.uploaded_videos = []
+        self.sort_ascending = True
 
         self.filelist_frame = ttk.Frame(self.left_frame)
 
@@ -1475,8 +1476,11 @@ class VideoProcessorApp:
         self.update_listbox()
 
     def sort_filelist(self):
-        """Sort uploaded files by date extracted from filenames."""
-        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
+        """Toggle sort direction: ascending (old→new) / descending (new→old)."""
+        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()),
+                                  reverse=not self.sort_ascending)
+        self.sort_ascending = not self.sort_ascending
+        self.sort_button.config(text="↑" if self.sort_ascending else "↓")
         self.update_listbox()
 
     def remove_urls_from_list(self):
@@ -1514,7 +1518,8 @@ class VideoProcessorApp:
                     full_path = os.path.join(root, f)
                     self.uploaded_videos.append(MediaUpload(full_path, 'video' if self.is_video else 'audio'))
                     found += 1
-        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
+        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()),
+                                  reverse=not self.sort_ascending)
         self.update_listbox(scroll_to_bottom=True)
         print(f"{Fore.GREEN}Added {found} files from {folder}")
 
