@@ -1191,6 +1191,9 @@ class VideoProcessorApp:
             self.verify_checkbox,
             self.review_checkbox,
             self.skip_auto_checkbox,
+            self.focus_idx_entry,
+            self.preset_combo,
+            self.save_preset_btn,
         ]
         
         self.enable_while_processing = [
