@@ -19,6 +19,8 @@ import threading
 import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
+from tkinterdnd2 import DND_FILES, TkinterDnD
+import proglog
 
 import sv_ttk
 from colorama import Fore, Style
@@ -204,7 +206,13 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
             # --- P0 + P3: 逐窗口 DRC 扫描 + 双阈值确认 ----------------------------
             merged_timestamps = list(original_ts)
-            for ws, we in scan_windows:
+            _bar = None
+            if logger:
+                _bar = proglog.default_bar_logger(logger)
+                _windows_iter = _bar.iter_bar(block=scan_windows)
+            else:
+                _windows_iter = scan_windows
+            for ws, we in _windows_iter:
                 checked += 1
                 if we <= ws:
                     continue
@@ -329,12 +337,13 @@ def _smart_sort_key(filepath):
     # --- file key
     # 1. Chinese live stream date
     m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})点场', name)
+    _pp = lambda n: int(re.search(r'^p?(\d{1,2})[\s_\-]', n).group(1)) if re.search(r'^p?(\d{1,2})[\s_\-]', n) else (int(re.search(r'part\s*(\d+)', n, re.I).group(1)) if re.search(r'part\s*(\d+)', n, re.I) else 0)
     if m:
-        return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}')
+        return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}', _pp(name))
     # 2. ISO date: "2022-07-19" or "2022_07_19"
     m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', name)
     if m:
-        return (fkey, 0, f'{m[1]}{m[2]}{m[3]}')
+        return (fkey, 0, f'{m[1]}{m[2]}{m[3]}', _pp(name))
     # 3a. Part FIRST: "p0-title" or "0-title" (Bilibili)
     m = re.search(r'^p?(\d{1,2})[\s_\-]+(.+)$', name_no_ext, re.IGNORECASE)
     if m:
@@ -710,6 +719,7 @@ class VideoProcessorApp:
         self.precision = tk.IntVar(value=100)
         self.block_size = tk.IntVar(value=600)
         self.threshold = tk.DoubleVar(value=0.90)
+        self.focus_idx = tk.IntVar(value=58)
         self.model = tk.StringVar(value="bdetectionmodel_05_01_23.onnx")
         self.merge_clips = tk.BooleanVar(value=True)
         self.combine_vids = tk.BooleanVar(value=True)
@@ -739,7 +749,7 @@ class VideoProcessorApp:
 
         # Create a list to store uploaded video file paths
         self.uploaded_videos = []
-        self.sort_ascending = True
+        self.sort_ascending = False  # first click → ascending
 
         self.filelist_frame = ttk.Frame(self.left_frame)
 
@@ -849,6 +859,10 @@ class VideoProcessorApp:
         self.down_arrow.pack(pady=5, padx=3, side=tk.LEFT)
         self.sort_button.pack(pady=5, padx=3, side=tk.LEFT)
 
+        # Drag and drop
+        root.drop_target_register(DND_FILES)
+        root.dnd_bind('<<Drop>>', self._on_drop)
+
         self.clear_button.pack(pady=5, side=tk.RIGHT)
         self.remove_button.pack(pady=5, padx=5, side=tk.RIGHT)
 
@@ -885,6 +899,15 @@ class VideoProcessorApp:
 
         self.model_dropdown.pack()
 
+        # Focus Index
+        ttk.Label(self.text_options_frame, text="Focus Index:",
+                  font=(None, 10, "bold")).pack(pady=(10, 1))
+        self.focus_idx_entry = ttk.Entry(self.text_options_frame, textvariable=self.focus_idx, width=5)
+        self.focus_idx_entry.pack()
+        def _idx_tooltip():
+            CustomHovertip(self.focus_idx_entry, "58=burp, 60=fart. Don't change unless custom model!")
+        self.focus_idx_entry.after(200, _idx_tooltip)
+
         # Precision Entry
         ttk.Label(self.text_options_frame, text="Precision:",
                   font=(None, 10, "bold")).pack(pady=(10, 1))
@@ -905,6 +928,18 @@ class VideoProcessorApp:
         self.threshold_entry = ttk.Entry(
             self.text_options_frame, textvariable=self.threshold, validate='key', validatecommand=self.decimal_check)
         self.threshold_entry.pack()
+
+        # preset save/load
+        self.preset_frame = ttk.Frame(self.text_options_frame)
+        self.preset_frame.pack(pady=(10, 0))
+        self.save_preset_btn = ttk.Button(self.preset_frame, text="Save Preset",
+                                           command=self.save_preset)
+        self.save_preset_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.preset_combo_var = tk.StringVar(value="Load Preset")
+        self.preset_combo = ttk.Combobox(self.preset_frame, textvariable=self.preset_combo_var,
+                                          values=[], state="readonly", width=12)
+        self.preset_combo.pack(side=tk.LEFT)
+        self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
         self.text_options_frame.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
@@ -1012,7 +1047,7 @@ class VideoProcessorApp:
         self.checkbox_frame_five = ttk.Frame(self.left_frame)
         self.checkbox_frame_five.pack(anchor=tk.W)
         self.use_verify = tk.BooleanVar()
-        self.verify_window_var = tk.DoubleVar(value=5.0)
+        self.verify_window_var = tk.DoubleVar(value=30.0)
         self.verify_checkbox = ttk.Checkbutton(
             self.checkbox_frame_five, text="Re-verify clips (scan near segments for missed clips)",
             variable=self.use_verify)
@@ -1161,6 +1196,8 @@ class VideoProcessorApp:
         self.enable_while_processing = [
             self.cancel_button
         ]
+
+        self._refresh_preset_combo()
 
     def disable_objects(self):
         for elt in self.disable_while_processing:
@@ -1476,12 +1513,90 @@ class VideoProcessorApp:
         self.update_listbox()
 
     def sort_filelist(self):
-        """Toggle sort direction: ascending (old→new) / descending (new→old)."""
+        """Toggle sort: first click ascending (0→1), second descending (1→0)."""
+        self.sort_ascending = not self.sort_ascending
         self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()),
                                   reverse=not self.sort_ascending)
-        self.sort_ascending = not self.sort_ascending
         self.sort_button.config(text="↑" if self.sort_ascending else "↓")
         self.update_listbox()
+
+    def _on_drop(self, event):
+        """Handle drag-and-drop of video files."""
+        files = self.root.tk.splitlist(event.data)
+        for f in files:
+            f = f.strip('{}')
+            if f.endswith(('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')):
+                existing = [x.get_path() if hasattr(x, 'get_path') else x for x in self.uploaded_videos]
+                if f not in existing:
+                    self.uploaded_videos.append(MediaUpload(f, 'video'))
+        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
+        self.update_listbox()
+
+    def _preset_path(self):
+        """Path to autocomper_presets.json — adjacent to the .exe or cwd."""
+        import sys, os as _os
+        if getattr(sys, 'frozen', False):
+            return _os.path.join(_os.path.dirname(sys.executable), 'autocomper_presets.json')
+        return _os.path.join(_os.getcwd(), 'autocomper_presets.json')
+
+    def save_preset(self):
+        """Save current settings to autocomper_presets.json with a custom name."""
+        import json, os as _os
+        from tkinter import simpledialog
+        name = simpledialog.askstring("Save Preset", "Preset name:")
+        if not name:
+            return
+        pp = self._preset_path()
+        try:
+            with open(pp, 'r') as f:
+                presets = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            presets = {}
+        presets[name] = {
+            'precision': self.precision.get(),
+            'block_size': self.block_size.get(),
+            'threshold': self.threshold.get(),
+            'focus_idx': self.focus_idx.get(),
+        }
+        with open(pp, 'w') as f:
+            json.dump(presets, f, indent=2)
+        print(f"{Fore.GREEN}Preset '{name}' saved.")
+        self._refresh_preset_combo()
+
+    def _refresh_preset_combo(self):
+        """Reload preset list into the ComboBox."""
+        import json
+        try:
+            with open(self._preset_path(), 'r') as f:
+                presets = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            presets = {}
+        names = list(presets.keys())
+        self.preset_combo["values"] = names
+        if names:
+            self.preset_combo_var.set(names[0])
+        else:
+            self.preset_combo_var.set("Load Preset")
+
+    def _on_preset_selected(self, event=None):
+        """ComboBox callback: load the selected preset."""
+        import json
+        name = self.preset_combo_var.get()
+        if not name or name == "Load Preset":
+            return
+        try:
+            with open(self._preset_path(), 'r') as f:
+                presets = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        data = presets.get(name)
+        if not data:
+            return
+        self.precision.set(data.get('precision', 100))
+        self.block_size.set(data.get('block_size', 600))
+        self.threshold.set(data.get('threshold', 0.90))
+        self.focus_idx.set(data.get('focus_idx', 58))
+        print(f"{Fore.GREEN}Preset '{name}' loaded.")
 
     def remove_urls_from_list(self):
         self.uploaded_videos = [
@@ -1518,8 +1633,7 @@ class VideoProcessorApp:
                     full_path = os.path.join(root, f)
                     self.uploaded_videos.append(MediaUpload(full_path, 'video' if self.is_video else 'audio'))
                     found += 1
-        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()),
-                                  reverse=not self.sort_ascending)
+        self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
         self.update_listbox(scroll_to_bottom=True)
         print(f"{Fore.GREEN}Added {found} files from {folder}")
 
@@ -1882,7 +1996,7 @@ class VideoProcessorApp:
             save_timestamps = self.save_txt.get()
 
             # Parse focus index from dropdown
-            focus_idx = 58  # burps only
+            focus_idx = self.focus_idx.get()  # user-configurable sound class
 
             # Get model location if in a compiled app
             selected_model = get_bundle_filepath(selected_model)
@@ -2005,7 +2119,7 @@ class VideoProcessorApp:
                             window=self.verify_window_var.get(),
                             focus_idx=focus_idx,
                             logger=self.final_bar,
-                            threshold=threshold)
+                            threshold=threshold * 0.6)
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
@@ -2115,7 +2229,7 @@ class VideoProcessorApp:
                         window=self.verify_window_var.get(),
                         focus_idx=focus_idx,
                         logger=self.final_bar,
-                        threshold=threshold)
+                        threshold=threshold * 0.6)
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
@@ -2276,7 +2390,7 @@ class FinalRenderBar(ProgressBarLogger):
 
 
 def main():
-    root = root = tk.Tk()
+    root = TkinterDnD.Tk()
     sv_ttk.set_theme("dark")
 
     app = VideoProcessorApp(root)
