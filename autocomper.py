@@ -236,7 +236,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     block = blocks[b_idx]
                     rms = _np.sqrt(_np.mean(block ** 2))
                     if rms > 0.005:  # 避免静默块 blow up
-                        gain = min(2.5, 0.15 / rms)  # 最多 +8dB 增益
+                        gain = min(4.0, 0.25 / rms)  # 最多 +12dB 增益
                         block = block.copy() * gain
                     block = block.reshape(1, -1).astype(_np.float32)
                     preds = ort_session.run(["output"], {"input": block})[0]
@@ -245,15 +245,15 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
                 # P3: 双阈值确认 — 原始未压缩音频
                 for ts in scan_ts:
-                    if ts['pred'] > 0.80:  # 高分 DRC 跳过 P3，直接接受
+                    if ts['pred'] > 0.45:  # 中分 DRC 跳过 P3，直接接受
                         ts['source'] = 'new'
                         merged_timestamps.append(ts)
                         dskip += 1
                         continue
                     ts_abs_start = ts['start']
                     ts_abs_end = ts['end']
-                    si2 = max(0, int((ts_abs_start - 0.5) * SAMPLE_RATE))
-                    ei2 = min(len(raw), int((ts_abs_end + 0.5) * SAMPLE_RATE))
+                    si2 = max(0, int((ts_abs_start - 3.0) * SAMPLE_RATE))
+                    ei2 = min(len(raw), int((ts_abs_end + 3.0) * SAMPLE_RATE))
                     if ei2 - si2 < frame_count:
                         continue
                     chunk = raw[si2:ei2][:frame_count].reshape(1, -1).astype(_np.float32)
