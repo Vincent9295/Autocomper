@@ -323,7 +323,7 @@ def _smart_sort_key(filepath):
     folder = os.path.basename(os.path.dirname(filepath)).lower()
     name_no_ext = os.path.splitext(name)[0]
 
-    # --- folder key: extract date, fallback to natural sort
+    # --- folder key: extract date from folder, then from filename
     fm = re.search(r'(\d{4})年(\d{1,2})月', folder)
     if fm:
         fkey = (0, f'{fm[1]}{int(fm[2]):02d}', folder)
@@ -332,8 +332,17 @@ def _smart_sort_key(filepath):
         if fm:
             fkey = (0, f'{fm[1]}{fm[2]}', folder)
         else:
-            fp = re.split(r'(\d+)', folder)
-            fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
+            # loose file in parent folder — try filename date to group with sibling folders
+            fm = re.search(r'(\d{4})年(\d{1,2})月', name)
+            if fm:
+                fkey = (0, f'{fm[1]}{int(fm[2]):02d}', folder)
+            else:
+                fm = re.search(r'(\d{4})[-_](\d{2})', name)
+                if fm:
+                    fkey = (0, f'{fm[1]}{fm[2]}', folder)
+                else:
+                    fp = re.split(r'(\d+)', folder)
+                    fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
 
     # --- file key
     # 1. Chinese live stream date
@@ -450,6 +459,22 @@ class ReviewDialog:
                                      f"{s_str} - {e_str}", bn,
                                      f"{f['pred']:.2f}", st), tags=(tag,))
             self._style(str(i), cv.get())
+
+        # Auto-deselect originals that overlap with new reverify clips
+        for i, f in enumerate(self.flat):
+            if f.get('source') != 'original':
+                continue
+            for j, g in enumerate(self.flat):
+                if g.get('source') != 'new':
+                    continue
+                if f['filename'] != g['filename']:
+                    continue
+                if f['start'] < g['end'] and g['start'] < f['end']:
+                    self.checks[i].set(False)
+                    self._style(str(i), False)
+                    self.tree.set(str(i), 0, '\u2610')
+                    self.tree.item(str(i), tags=('unchecked',))
+                    break
 
         self.tree.tag_configure('checked', foreground='#4caf50')
         self.tree.tag_configure('unchecked', foreground='#888888')
