@@ -136,7 +136,8 @@ def _parse_timestamps_txt(txt_path):
 
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
-                       focus_idx=58, threshold=0.30, ort_session=None):
+                       focus_idx=58, threshold=0.30, ort_session=None,
+                       verify_block_size=10):
     """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
     P0: 加简易 DRC 压缩，把被音乐盖住的 burp 拉回来
@@ -223,7 +224,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
                 slice_audio = raw[si:ei].copy()
                 total_samples = len(slice_audio)
-                frame_count = SAMPLE_RATE * block_size
+                frame_count = SAMPLE_RATE * verify_block_size
                 if total_samples < frame_count:
                     continue
 
@@ -240,7 +241,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                         block = block.copy() * gain
                     block = block.reshape(1, -1).astype(_np.float32)
                     preds = ort_session.run(["output"], {"input": block})[0]
-                    block_offset = b_idx * block_size + ws
+                    block_offset = b_idx * verify_block_size + ws
                     scan_ts.extend(_compute_ts(preds[0], precision, threshold, focus_idx, block_offset))
 
                 # P3: 双阈值确认 — 原始未压缩音频
