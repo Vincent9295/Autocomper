@@ -295,12 +295,18 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
             if len(entry['timestamps']) > 1:
                 deduped = entry['timestamps']
                 deduped.sort(key=lambda x: x['start'])
-                for i in range(len(deduped) - 1):
+                for i in range(len(deduped) - 2, -1, -1):
                     if deduped[i]['end'] > deduped[i + 1]['start']:
-                        # 重叠：在中点分割，阻止音频跨 clip 渗出
-                        mid = (deduped[i]['end'] + deduped[i + 1]['start']) / 2
-                        deduped[i]['end'] = mid
-                        deduped[i + 1]['start'] = mid
+                        # 重叠：保留更长的 clip，去掉短的
+                        dur_i = deduped[i]['end'] - deduped[i]['start']
+                        dur_j = deduped[i + 1]['end'] - deduped[i + 1]['start']
+                        if dur_i >= dur_j:
+                            deduped.pop(i + 1)
+                        else:
+                            deduped.pop(i)
+
+            # 过滤过短 clip（必须在 overlap trim 之后）
+            entry['timestamps'] = [t for t in entry['timestamps'] if t['end'] - t['start'] > 0.5]
 
         except Exception as e:
             print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {e}")
@@ -323,37 +329,38 @@ def _smart_sort_key(filepath):
     folder = os.path.basename(os.path.dirname(filepath)).lower()
     name_no_ext = os.path.splitext(name)[0]
 
-    # --- folder key: extract date from folder, then from filename
-    fm = re.search(r'(\d{4})年(\d{1,2})月', folder)
+    # --- folder key: extract date+time for both folder names and loose filenames
+    _h = lambda s: ('{:02d}'.format(int(m.group(1))) if (m := re.search(r'(\d{1,2})点场', s)) else '\uffff')
+    _src = folder if re.search(r'\d{4}年', folder) else name
+    fm = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', _src)
     if fm:
-        fkey = (0, f'{fm[1]}{int(fm[2]):02d}', folder)
+        fkey = (0, f'{fm[1]}{int(fm[2]):02d}{int(fm[3]):02d}', _h(_src))
     else:
-        fm = re.search(r'(\d{4})[-_](\d{2})', folder)
+        fm = re.search(r'(\d{4})年(\d{1,2})月', _src)
         if fm:
-            fkey = (0, f'{fm[1]}{fm[2]}', folder)
+            fkey = (0, f'{fm[1]}{int(fm[2]):02d}', _h(_src))
         else:
-            # loose file in parent folder — try filename date to group with sibling folders
-            fm = re.search(r'(\d{4})年(\d{1,2})月', name)
+            fm = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', _src)
             if fm:
-                fkey = (0, f'{fm[1]}{int(fm[2]):02d}', folder)
+                fkey = (0, f'{fm[1]}{fm[2]}{fm[3]}', _h(_src))
+            elif re.search(r'(\d{4})[-_](\d{2})', _src):
+                fm = re.search(r'(\d{4})[-_](\d{2})', _src)
+                fkey = (0, f'{fm[1]}{fm[2]}', _h(_src))
             else:
-                fm = re.search(r'(\d{4})[-_](\d{2})', name)
-                if fm:
-                    fkey = (0, f'{fm[1]}{fm[2]}', folder)
-                else:
-                    fp = re.split(r'(\d+)', folder)
-                    fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
+                fp = re.split(r'(\d+)', folder)
+                fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
 
     # --- file key
+    _of = lambda n: 1 if re.search(r'\bOriginal\b', n) else 0
+    _pp = lambda n: int(re.search(r'^p?(\d{1,2})[\s_\-]', n).group(1)) if re.search(r'^p?(\d{1,2})[\s_\-]', n) else (int(re.search(r'part\s*(\d+)', n, re.I).group(1)) if re.search(r'part\s*(\d+)', n, re.I) else 0)
     # 1. Chinese live stream date
     m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})点场', name)
-    _pp = lambda n: int(re.search(r'^p?(\d{1,2})[\s_\-]', n).group(1)) if re.search(r'^p?(\d{1,2})[\s_\-]', n) else (int(re.search(r'part\s*(\d+)', n, re.I).group(1)) if re.search(r'part\s*(\d+)', n, re.I) else 0)
     if m:
-        return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}', _pp(name))
+        return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}', _of(name), _pp(name))
     # 2. ISO date: "2022-07-19" or "2022_07_19"
     m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', name)
     if m:
-        return (fkey, 0, f'{m[1]}{m[2]}{m[3]}', _pp(name))
+        return (fkey, 0, f'{m[1]}{m[2]}{m[3]}', _of(name), _pp(name))
     # 3a. Part FIRST: "p0-title" or "0-title" (Bilibili)
     m = re.search(r'^p?(\d{1,2})[\s_\-]+(.+)$', name_no_ext, re.IGNORECASE)
     if m:
@@ -469,7 +476,8 @@ class ReviewDialog:
                     continue
                 if f['filename'] != g['filename']:
                     continue
-                if f['start'] < g['end'] and g['start'] < f['end']:
+                # deselect original only if new fully covers it
+                if g['start'] <= f['start'] and g['end'] >= f['end']:
                     self.checks[i].set(False)
                     self._style(str(i), False)
                     self.tree.set(str(i), 0, '\u2610')
@@ -2152,6 +2160,20 @@ class VideoProcessorApp:
                             focus_idx=focus_idx,
                             logger=self.final_bar,
                             threshold=threshold * 0.6)
+                    # auto-deselect originals fully covered by new reverify clips
+                    for entry in dict_list:
+                        ts = entry.get('timestamps', [])
+                        news = [t for t in ts if t.get('source') == 'new']
+                        if not news:
+                            continue
+                        filtered = []
+                        for t in ts:
+                            if t.get('source') == 'original':
+                                covered = any(g['start'] <= t['start'] and g['end'] >= t['end'] for g in news)
+                                if covered:
+                                    continue
+                            filtered.append(t)
+                        entry['timestamps'] = filtered
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
@@ -2262,6 +2284,20 @@ class VideoProcessorApp:
                         focus_idx=focus_idx,
                         logger=self.final_bar,
                         threshold=threshold * 0.6)
+                # auto-deselect originals fully covered by new reverify clips
+                for entry in dict_list:
+                    ts = entry.get('timestamps', [])
+                    news = [t for t in ts if t.get('source') == 'new']
+                    if not news:
+                        continue
+                    filtered = []
+                    for t in ts:
+                        if t.get('source') == 'original':
+                            covered = any(g['start'] <= t['start'] and g['end'] >= t['end'] for g in news)
+                            if covered:
+                                continue
+                        filtered.append(t)
+                    entry['timestamps'] = filtered
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
