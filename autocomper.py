@@ -1528,10 +1528,13 @@ class VideoProcessorApp:
         files = self.root.tk.splitlist(event.data)
         for f in files:
             f = f.strip('{}')
-            if f.endswith(('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')):
+            video_exts = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')
+            audio_exts = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac')
+            if f.lower().endswith(video_exts + audio_exts):
                 existing = [x.get_path() if hasattr(x, 'get_path') else x for x in self.uploaded_videos]
                 if f not in existing:
-                    self.uploaded_videos.append(MediaUpload(f, 'video'))
+                    mtype = 'video' if f.lower().endswith(video_exts) else 'audio'
+                    self.uploaded_videos.append(MediaUpload(f, mtype))
         self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
         self.update_listbox()
 
