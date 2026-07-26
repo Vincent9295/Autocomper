@@ -68,7 +68,7 @@ def get_video_codec():
     """NVENC 可用则用，否则回退 libx264。结果缓存。"""
     global _VIDEO_CODEC_CACHE
     if _VIDEO_CODEC_CACHE is not None:
-        return _VIDEO_CODEC_CACHE
+        return list(_VIDEO_CODEC_CACHE)
     nvenc = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
              '-rc-lookahead', '0', '-sar', '1:1']
     x264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-sar', '1:1']
@@ -81,7 +81,7 @@ def get_video_codec():
         _VIDEO_CODEC_CACHE = x264
     if _VIDEO_CODEC_CACHE is x264:
         print(f"{Fore.YELLOW}NVENC unavailable, using libx264 (CPU).")
-    return _VIDEO_CODEC_CACHE
+    return list(_VIDEO_CODEC_CACHE)
 
 
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
