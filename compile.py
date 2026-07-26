@@ -11,7 +11,7 @@ import tempfile
 
 from colorama import Fore, Style
 
-from utils import FFMPEG_PATH
+from utils import FFMPEG_PATH, run_tracked
 import sys
 import os
 
@@ -23,10 +23,10 @@ if sys.platform == 'win32':
 
 
 def _ffprobe(input_file: str):
-    """Run ffmpeg -i to probe container metadata (fast, reads header only)."""
+    """ffmpeg -i 探测容器元数据（包内无 ffprobe）。"""
     try:
-        cmd = [FFMPEG_PATH, '-hide_banner', '-i', input_file]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **_subprocess_opts)
+        out = run_tracked([FFMPEG_PATH, '-hide_banner', '-i', input_file],
+                          timeout=10, text=True)
         return out.stderr or ''
     except Exception:
         return ''
@@ -51,43 +51,7 @@ def _get_frame_rate(input_file: str):
 
 
 def _get_video_duration(input_file: str):
-    """Return total duration of the media file in seconds, or None.
-
-    优先 stream=duration（精确到帧），回退 format=duration，最后 ffmpeg -i。
-    """
-    # 方法 1: ffprobe stream duration (most accurate, works with 2017+ FFmpeg)
-    for stream in ('v:0', 'a:0'):
-        try:
-            cmd = [
-                FFMPEG_PATH, '-v', 'error',
-                '-select_streams', stream,
-                '-show_entries', 'stream=duration',
-                '-of', 'csv=p=0',
-                input_file,
-            ]
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **_subprocess_opts)
-            val = out.stdout.strip()
-            if val and val != 'N/A':
-                return float(val)
-        except Exception:
-            pass
-
-    # 方法 2: format duration (container-level fallback)
-    try:
-        cmd = [
-            FFMPEG_PATH, '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'csv=p=0',
-            input_file,
-        ]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **_subprocess_opts)
-        val = out.stdout.strip()
-        if val and val != 'N/A':
-            return float(val)
-    except Exception:
-        pass
-
-    # 方法 3: ffmpeg -i (pre-2017 FFmpeg, WAV files, etc.)
+    """Return total duration of the media file in seconds, or None."""
     stderr = _ffprobe(input_file)
     m = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', stderr)
     if m:
