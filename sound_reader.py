@@ -10,7 +10,7 @@ import onnxruntime as ort
 from typing import Generator, Any, Dict, Tuple
 from collections import OrderedDict
 
-from utils import FFMPEG_PATH
+from utils import FFMPEG_PATH, run_tracked
 from proglog import default_bar_logger
 
 SAMPLE_RATE = 32000
@@ -48,6 +48,9 @@ def get_segments(scores: np.ndarray, precision: int, threshold: float, offset: i
 
 
 def compute_timestamps(framewise_output, precision, threshold, focus_idx, offset):
+    if not (0 <= focus_idx < framewise_output.shape[1]):
+        raise ValueError(f"focus_idx {focus_idx} out of range "
+                         f"(model has {framewise_output.shape[1]} classes)")
     focus = framewise_output[:, focus_idx]
     subsampled_scores = subsample(focus, precision)
     segments = map(lambda segment: {
@@ -68,7 +71,7 @@ def pad_array_if_needed(arr, desired_size, pad_value=0):
 
 def load_audio(file: str, sr: int, frame_count: int):
     cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'warning', '-i', file,
-            '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,pan=mono|c0=0.5*c0+0.5*c1[audio]',
+            '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,aformat=channel_layouts=stereo,pan=mono|c0=0.5*c0+0.5*c1[audio]',
            '-map', '[audio]', '-f', 's16le', '-acodec', 'pcm_s16le',
            '-ar', str(sr), '-ac', '1', '-bufsize', '128k', '-']
     subprocess_options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
@@ -109,8 +112,7 @@ def _get_audio_duration(file):
     """用 ffmpeg（非 ffprobe）快速探测时长。"""
     try:
         cmd = [FFMPEG_PATH, '-hide_banner', '-i', file]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
-                             **({'creationflags': subprocess.CREATE_NO_WINDOW} if is_windows else {}))
+        out = run_tracked(cmd, timeout=10, text=True)
         m = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', out.stderr or '')
         if m:
             h, mi, s, ms = map(int, m.groups())
