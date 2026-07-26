@@ -160,8 +160,12 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
         import onnxruntime as ort
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        ort_session = ort.InferenceSession(selected_model, sess_options,
-                                            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        try:
+            ort_session = ort.InferenceSession(selected_model, sess_options,
+                                                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        except Exception:
+            ort_session = ort.InferenceSession(selected_model, sess_options,
+                                                providers=['CPUExecutionProvider'])
     SAMPLE_RATE = 32000
 
     checked = 0
@@ -2067,6 +2071,12 @@ class VideoProcessorApp:
             block_size = self.block_size.get()
             threshold = self.threshold.get()
             selected_model = os.path.join(self.models_dir, self.model.get())
+            if not os.path.isfile(selected_model):
+                available = [f for f in os.listdir(self.models_dir) if f.endswith('.onnx')]
+                if not available:
+                    raise Exception(f"No models found in directory {self.models_dir}")
+                self.model.set(available[0])
+                selected_model = os.path.join(self.models_dir, available[0])
             merge_clips = self.merge_clips.get()
             combine = self.combine_vids.get()
             normalize = self.normalize_audio.get()
