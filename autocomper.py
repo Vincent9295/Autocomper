@@ -6,6 +6,11 @@ import sys
 import subprocess
 import tempfile
 
+# Windows Store Python sandbox fix: add CUDA Toolkit bin to DLL search path
+_cuda_bin = r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin'
+if os.path.isdir(_cuda_bin) and hasattr(os, 'add_dll_directory'):
+    os.add_dll_directory(_cuda_bin)
+
 # 必须在导入 moviepy 之前设置 FFmpeg 路径
 _ffmpeg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg')
 if sys.platform == 'win32':
@@ -1579,9 +1584,47 @@ class VideoProcessorApp:
             return _os.path.join(_os.path.dirname(sys.executable), 'autocomper_presets.json')
         return _os.path.join(_os.getcwd(), 'autocomper_presets.json')
 
+    def _collect_all_vars(self):
+        """Collect all tkinter variable values into a dict."""
+        import tkinter as tk
+        preset = {}
+        for attr in dir(self):
+            if attr.startswith('_'):
+                continue
+            try:
+                v = getattr(self, attr)
+            except Exception:
+                continue
+            if isinstance(v, tk.BooleanVar):
+                preset[attr] = v.get()
+            elif isinstance(v, tk.IntVar):
+                preset[attr] = v.get()
+            elif isinstance(v, tk.DoubleVar):
+                preset[attr] = v.get()
+            elif isinstance(v, tk.StringVar):
+                preset[attr] = v.get()
+        # remove transient/state vars
+        for k in ['active_thread', 'thread_active']:
+            preset.pop(k, None)
+        return preset
+
+    def _apply_all_vars(self, data):
+        """Restore tkinter variable values from a dict."""
+        import tkinter as tk
+        for attr, val in data.items():
+            try:
+                v = getattr(self, attr)
+            except Exception:
+                continue
+            if isinstance(v, (tk.BooleanVar, tk.IntVar, tk.DoubleVar, tk.StringVar)):
+                try:
+                    v.set(val)
+                except Exception:
+                    pass
+
     def save_preset(self):
         """Save current settings to autocomper_presets.json with a custom name."""
-        import json, os as _os
+        import json
         from tkinter import simpledialog
         name = simpledialog.askstring("Save Preset", "Preset name:")
         if not name:
@@ -1592,12 +1635,7 @@ class VideoProcessorApp:
                 presets = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             presets = {}
-        presets[name] = {
-            'precision': self.precision.get(),
-            'block_size': self.block_size.get(),
-            'threshold': self.threshold.get(),
-            'focus_idx': self.focus_idx.get(),
-        }
+        presets[name] = self._collect_all_vars()
         with open(pp, 'w') as f:
             json.dump(presets, f, indent=2)
         print(f"{Fore.GREEN}Preset '{name}' saved.")
@@ -1632,10 +1670,9 @@ class VideoProcessorApp:
         data = presets.get(name)
         if not data:
             return
-        self.precision.set(data.get('precision', 100))
-        self.block_size.set(data.get('block_size', 600))
-        self.threshold.set(data.get('threshold', 0.90))
-        self.focus_idx.set(data.get('focus_idx', 58))
+        self._apply_all_vars(data)
+        # sync padding UI with loaded values
+        self.toggle_padding_text_boxes()
         print(f"{Fore.GREEN}Preset '{name}' loaded.")
 
     def remove_urls_from_list(self):

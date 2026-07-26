@@ -25,7 +25,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | Area | Original | Enhanced |
 |------|----------|----------|
 | **Video pipeline** | MoviePy (`libx264` CPU) | Native FFmpeg subprocess (`h264_nvenc` GPU) |
-| **Inference** | `onnxruntime` (CPU) | `onnxruntime-gpu` (CUDA) + CPU fallback |
+| **Inference** | `onnxruntime` (CPU) | `onnxruntime-gpu` (CUDA) — falls back to CPU automatically |
 | **Audio loading** | `list()` full memory load | Streaming generator + LRU cache |
 | **Frame rate** | Inherit from source | Fixed **30 fps** output (prevents VFR desync) |
 | **Audio sample rate** | Variable | Fixed **44100 Hz** output |
@@ -67,6 +67,23 @@ python setup.py build
 ```
 
 The executable is at `build/exe.win-*/autocomper.exe`. Copy `ffmpeg/`, `img/`, and `models/` into the build directory.
+
+---
+
+## 🎮 NVIDIA GPU Acceleration (Optional)
+
+The app works fine on CPU, but NVIDIA GPU users can speed up inference by installing:
+
+1. **[CUDA Toolkit 11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive)** (~3 GB)
+   - Uncheck "Nsight VSE" and "Visual Studio Integration" — not needed.
+2. **[cuDNN 8.9.7 for CUDA 11.x](https://developer.nvidia.com/rdp/cudnn-archive)** (requires free NVIDIA account)
+   - Download `cudnn-windows-x86_64-8.9.7.29_cuda11-archive.zip`
+   - Extract and copy files:
+     - `bin\*.dll` → `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin\`
+     - `include\*.h` → `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\include\`
+     - `lib\x64\*.lib` → `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\lib\x64\`
+
+If CUDA isn't installed, the app falls back to CPU automatically.
 
 ---
 
