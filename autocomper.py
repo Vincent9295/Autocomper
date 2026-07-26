@@ -1,5 +1,6 @@
 import configparser
 import os
+import queue
 import re
 import shutil
 import sys
@@ -30,7 +31,8 @@ from custom_tooltip import CustomHovertip
 from sound_reader import get_timestamps
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
                    download_audio, download_video, get_bundle_filepath,
-                   get_number_of_vids_in_playlist, is_valid_yt_dlp_url)
+                   get_number_of_vids_in_playlist, is_valid_yt_dlp_url,
+                   kill_tracked_procs, run_tracked)
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
 VIDEO_OUTPUT = [("Video Files", "*.mp4"), ("All Files", "*.*")]
@@ -183,10 +185,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 '-ar', str(SAMPLE_RATE), '-ac', '1',
                 full_audio.name
             ]
-            _opts = {}
-            if sys.platform == 'win32':
-                _opts['creationflags'] = 0x08000000
-            subprocess.run(extract_cmd, capture_output=True, timeout=None, **_opts)
+            run_tracked(extract_cmd)
 
             raw = _np.fromfile(full_audio.name, dtype=_np.int16).astype(_np.float32) / 32767.0
             if len(raw) == 0:
@@ -627,10 +626,7 @@ class ReviewDialog:
                        '-ss', str(ss), '-t', str(dur), '-i', f['filename'],
                        '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
                        tmp.name]
-            _opts = {}
-            if sys.platform == 'win32':
-                _opts['creationflags'] = 0x08000000
-            subprocess.run(cmd, capture_output=True, timeout=30, **_opts)
+            run_tracked(cmd, timeout=30)
             if sys.platform == 'win32':
                 os.startfile(tmp.name)
             elif sys.platform == 'darwin':
@@ -1162,7 +1158,7 @@ class VideoProcessorApp:
         self.stdout_frame.pack(fill=tk.BOTH, expand=True)
 
         # Redirect stdout to the Text widget
-        sys.stdout = StdoutRedirector(self.stdout_text)  # TODO: Change this
+        sys.stdout = StdoutRedirector(self.stdout_text, self.root)
 
         self.active_thread = None
 
@@ -1730,6 +1726,7 @@ class VideoProcessorApp:
                                           f"The current job will be cancelled, losing all progress. Would you like to cancel?")
             if confirm:
                 try:
+                    kill_tracked_procs()
                     self.active_thread.terminate()
                 finally:
                     print(
@@ -2395,11 +2392,28 @@ class VideoProcessorApp:
 
 class StdoutRedirector:
 
-    def __init__(self, text_widget):
+    def __init__(self, text_widget, root):
         self.text_widget = text_widget
+        self.root = root
+        self.queue = queue.Queue()
         self.text_widget["state"] = tk.DISABLED
+        self.root.after(100, self._poll)
 
     def write(self, text):
+        self.queue.put(text)
+
+    def flush(self):
+        return
+
+    def _poll(self):
+        try:
+            while True:
+                self._render(self.queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll)
+
+    def _render(self, text):
         self.text_widget["state"] = tk.NORMAL
 
         # Check/apply colorama colors
@@ -2445,9 +2459,6 @@ class StdoutRedirector:
 
         self.text_widget.see(tk.END)  # Scroll to the end of the text
         self.text_widget["state"] = tk.DISABLED
-
-    def flush(self):
-        return
 
 
 class FinalRenderBar(ProgressBarLogger):
