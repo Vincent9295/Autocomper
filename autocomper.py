@@ -14,6 +14,7 @@ if os.path.isdir(_cuda_bin) and hasattr(os, 'add_dll_directory'):
 
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -62,6 +63,24 @@ def clean_filename(filename: str, replacement: str = "_") -> str:
     safe_name = re.sub(unsafe_characters, replacement, filename)
     safe_name = safe_name.strip()  # .replace(" ", replacement)
     return safe_name[:150]
+
+
+def _elide_middle(text: str, max_pixels: int, measure) -> str:
+    """Middle-truncate long names so head (e.g. part number) and tail (e.g. date) stay visible."""
+    if measure(text) <= max_pixels:
+        return text
+    budget = (max_pixels - measure('…')) // 2
+    head = ''
+    for ch in text:
+        if measure(head + ch) > budget:
+            break
+        head += ch
+    tail = ''
+    for ch in reversed(text):
+        if measure(ch + tail) > budget:
+            break
+        tail = ch + tail
+    return head + '…' + tail
 
 
 _temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
@@ -837,27 +856,18 @@ class VideoProcessorApp:
 
         self.media_toggle_frame.pack(fill=tk.BOTH)
 
-        # inner frame: listbox 与垂直滚动条同一行，水平滚动条单独占外层底部一行
-        self.listbox_inner = ttk.Frame(self.filelist_frame)
-        self.listbox_inner.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
         self.video_listbox = ttk.Treeview(
-            self.listbox_inner, selectmode=tk.EXTENDED, columns="#1", show='')
-        self.video_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        # stretch=False 固定宽 1200：超长文件名（"2024年MM月DD日N点场-主播名.mp4" 等）
-        # 末尾日期部分在视口右边可见，配合下方水平滚动条查看完整
-        self.video_listbox.column("#1", stretch=False, width=1200, anchor='w')
+            self.filelist_frame, selectmode=tk.EXTENDED, columns="#1", show='')
+        self.video_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._listbox_font = tkfont.nametofont("TkDefaultFont")
+        self._listbox_resize_after = None
+        self.video_listbox.bind('<Configure>', self._on_listbox_resize)
 
-        scrollbar = ttk.Scrollbar(self.listbox_inner, orient="vertical")
+        scrollbar = ttk.Scrollbar(self.filelist_frame, orient="vertical")
         scrollbar.config(command=self.video_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.video_listbox.config(yscrollcommand=scrollbar.set)
-
-        h_scrollbar = ttk.Scrollbar(self.filelist_frame, orient="horizontal")
-        h_scrollbar.config(command=self.video_listbox.xview)
-        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.video_listbox.config(xscrollcommand=h_scrollbar.set)
 
         self.filelist_frame.pack(fill=tk.BOTH)
 
@@ -1475,6 +1485,19 @@ class VideoProcessorApp:
         self.entry_window.grab_set()
         self.root.wait_window(self.entry_window)
 
+    def _on_listbox_resize(self, event):
+        if self._listbox_resize_after is not None:
+            self.root.after_cancel(self._listbox_resize_after)
+        self._listbox_resize_after = self.root.after(200, self.update_listbox)
+
+    def _display_name(self, video_path: str) -> str:
+        """Listbox 显示名：超长文件名中间省略，保住开头序号与结尾日期。"""
+        name = str(os.path.basename(video_path))
+        w = self.video_listbox.winfo_width()
+        if w < 50:  # 尚未渲染，按主窗口左栏常见宽度兜底
+            w = 700
+        return _elide_middle(name, w - 30, self._listbox_font.measure)
+
     def update_listbox(self, scroll_to_bottom: bool = False):
         self.video_listbox.delete(*self.video_listbox.get_children())
 
@@ -1486,7 +1509,7 @@ class VideoProcessorApp:
                     str(video_path),))
             else:
                 self.video_listbox.insert("", "end", item_number, values=(
-                    str(os.path.basename(video_path))))
+                    self._display_name(video_path),))
 
         if scroll_to_bottom:
             self.video_listbox.yview_moveto(1.0)
@@ -1499,8 +1522,7 @@ class VideoProcessorApp:
 
         for video in self.uploaded_videos:
             video_path = video.get_path()
-            video_key = str(video_path) if video.get_is_url() else str(
-                os.path.basename(video_path))
+            video_key = str(video_path) if video.get_is_url() else self._display_name(video_path)
 
             if video_key not in current_items:
                 item_number = len(self.video_listbox.get_children())
