@@ -37,6 +37,14 @@ def run_tracked(cmd, timeout=None, text=False):
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
+def register_proc(p):
+    _ACTIVE_PROCS.add(p)
+
+
+def unregister_proc(p):
+    _ACTIVE_PROCS.discard(p)
+
+
 def kill_tracked_procs():
     for p in list(_ACTIVE_PROCS):
         try:

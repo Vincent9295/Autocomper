@@ -10,7 +10,7 @@ import onnxruntime as ort
 from typing import Generator, Any, Dict, Tuple
 from collections import OrderedDict
 
-from utils import FFMPEG_PATH, run_tracked
+from utils import FFMPEG_PATH, run_tracked, register_proc, unregister_proc
 from proglog import default_bar_logger
 
 SAMPLE_RATE = 32000
@@ -79,22 +79,26 @@ def load_audio(file: str, sr: int, frame_count: int):
         subprocess_options['creationflags'] = subprocess.CREATE_NO_WINDOW
     chunk_size = frame_count * 2
     process = subprocess.Popen(cmd, bufsize=1, **subprocess_options)
+    register_proc(process)
     try:
-        while True:
-            chunk = process.stdout.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
-    except GeneratorExit:
-        process.terminate()
-        process.wait()
-        return
-    process.stdout.close()
-    return_code = process.wait()
-    if return_code:
-        if process.returncode != 0:
-            raise Exception("Failed to process the file. Either the file does not exist or is corrupted.")
-        raise subprocess.CalledProcessError(return_code, cmd)
+        try:
+            while True:
+                chunk = process.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        except GeneratorExit:
+            process.terminate()
+            process.wait()
+            return
+        process.stdout.close()
+        return_code = process.wait()
+        if return_code:
+            if process.returncode != 0:
+                raise Exception("Failed to process the file. Either the file does not exist or is corrupted.")
+            raise subprocess.CalledProcessError(return_code, cmd)
+    finally:
+        unregister_proc(process)
 
 
 def hash_file(file_path, algorithm='sha256', chunk_size=8192) -> str:

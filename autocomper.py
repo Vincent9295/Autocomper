@@ -774,8 +774,11 @@ class VideoProcessorApp:
         self.max_quality.set(
             self.preferences.get("Settings", "max_quality"))
         
-        self.max_download_speed.set(int(
-            self.preferences.get("Settings", "max_download_speed")))
+        try:
+            self.max_download_speed.set(int(
+                self.preferences.get("Settings", "max_download_speed")))
+        except (configparser.Error, ValueError, tk.TclError):
+            self.max_download_speed.set(0)
 
         self.output_text_path.set(
             self.preferences.get("Settings", "output_text_path"))
@@ -1771,7 +1774,7 @@ class VideoProcessorApp:
         ))
         try:
             self.max_download_speed.set(int(self.preferences.get("Settings", "max_download_speed")))
-        except (ValueError, tk.TclError):
+        except (configparser.Error, ValueError, tk.TclError):
             self.max_download_speed.set(0)
         self.output_text_path.set(self.preferences.get(
             "Settings", "output_text_path"

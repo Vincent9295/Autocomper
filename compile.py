@@ -5,7 +5,6 @@ import concurrent.futures
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -16,10 +15,6 @@ import sys
 import os
 
 MERGE_THRESHOLD = 2  # seconds
-
-_subprocess_opts = {}
-if sys.platform == 'win32':
-    _subprocess_opts['creationflags'] = 0x08000000
 
 
 def _ffprobe(input_file: str):
@@ -126,7 +121,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             cmd.extend(['-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
                                f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2'])
         cmd.append(output_file)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, **_subprocess_opts)
+        result = run_tracked(cmd, timeout=600, text=True)
         if result.returncode != 0:
             raise Exception(f"FFmpeg cut failed for {os.path.basename(input_file)}"
                             f"\n  rc={result.returncode}\n  stderr: {result.stderr}\n  stdout: {result.stdout}")
@@ -216,7 +211,7 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
         if sz[0] is None:
             raise Exception(f"FFmpeg concat: file {i} has no video stream: {fp}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, **_subprocess_opts)
+    result = run_tracked(cmd, timeout=1200, text=True)
     if result.returncode != 0:
         missing = [fp for fp in file_list if not os.path.exists(fp)]
         no_video = []
@@ -312,7 +307,7 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
         if normalize:
             cmd.extend(['-af', 'loudnorm'])
         cmd.append(output_file)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, **_subprocess_opts)
+        result = run_tracked(cmd, timeout=600, text=True)
         if result.returncode != 0:
             raise Exception(f"FFmpeg audio cut failed for {os.path.basename(input_file)}:\n{result.stderr}")
         return True
@@ -364,7 +359,7 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False):
         cmd += ['-c:a', 'copy']
     cmd.append(output_file)
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, **_subprocess_opts)
+    result = run_tracked(cmd, timeout=600, text=True)
     try:
         os.remove(list_path)
     except OSError:
