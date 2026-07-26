@@ -16,6 +16,13 @@ import os
 
 MERGE_THRESHOLD = 2  # seconds
 
+# 输入 -ss 在 MPEG-TS（尤其直播录像，PTS 不连续）上按字节估算落点，
+# 视频可能落在目标数秒之外（实测 +3.5s），而音频落点正确。
+# 此时 -vsync cfr 会用首帧填满 0..pts 空隙，-shortest 又在音频长度处截断，
+# 导致整段 clip 画面冻结（用户报"corrupted"）。
+# 对策：输入多回退 _SEEK_PAD 秒，再用输出 -ss/-to 精确定位（PTS 相对值不变）。
+_SEEK_PAD = 10.0  # seconds
+
 
 def _ffprobe(input_file: str):
     """ffmpeg -i 探测容器元数据（包内无 ffprobe）。"""
@@ -110,13 +117,15 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     if n == 1:
         s, e = timestamps[0]
         dur = e - s
-        af = f'atrim=0:{dur}'
+        pad = min(_SEEK_PAD, s)
+        af = f'atrim={pad}:{pad + dur}'
         if normalize:
             af += ',loudnorm'
         cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
             '-accurate_seek',
-            '-ss', str(s), '-to', str(e),
+            '-ss', str(s - pad),
             '-i', input_file,
+            '-ss', str(pad), '-to', str(pad + dur),
             '-af', af,
             '-avoid_negative_ts', 'make_zero',
             '-vsync', 'cfr', '-shortest',
@@ -306,8 +315,10 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
 
     if n == 1:
         s, e = timestamps[0]
+        pad = min(_SEEK_PAD, s)
         cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2',
-               '-ss', str(s), '-to', str(e), '-i', input_file,
+               '-ss', str(s - pad), '-i', input_file,
+               '-ss', str(pad), '-to', str(pad + (e - s)),
                '-avoid_negative_ts', 'make_zero'] + audio_codec
         if normalize:
             cmd.extend(['-af', 'loudnorm'])
