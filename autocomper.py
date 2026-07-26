@@ -2408,7 +2408,11 @@ class StdoutRedirector:
     def _poll(self):
         try:
             while True:
-                self._render(self.queue.get_nowait())
+                text = self.queue.get_nowait()
+                try:
+                    self._render(text)
+                except Exception:
+                    pass
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
