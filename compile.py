@@ -62,6 +62,28 @@ def _get_video_duration(input_file: str):
 
 # ═══ VIDEO cut / concat ═══════════════════════════════════════════════
 
+_VIDEO_CODEC_CACHE = None
+
+def get_video_codec():
+    """NVENC 可用则用，否则回退 libx264。结果缓存。"""
+    global _VIDEO_CODEC_CACHE
+    if _VIDEO_CODEC_CACHE is not None:
+        return _VIDEO_CODEC_CACHE
+    nvenc = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
+             '-rc-lookahead', '0', '-sar', '1:1']
+    x264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-sar', '1:1']
+    try:
+        r = run_tracked([FFMPEG_PATH, '-hide_banner', '-loglevel', 'error',
+                         '-f', 'lavfi', '-i', 'color=black:s=64x64:d=0.1']
+                        + nvenc + ['-f', 'null', '-'], timeout=15)
+        _VIDEO_CODEC_CACHE = nvenc if r.returncode == 0 else x264
+    except Exception:
+        _VIDEO_CODEC_CACHE = x264
+    if _VIDEO_CODEC_CACHE is x264:
+        print(f"{Fore.YELLOW}NVENC unavailable, using libx264 (CPU).")
+    return _VIDEO_CODEC_CACHE
+
+
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 fps=None):
     if not timestamps:
@@ -78,8 +100,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     if n == 0:
         return False
 
-    video_codec = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
-                   '-rc-lookahead', '0', '-sar', '1:1']
+    video_codec = get_video_codec()
     if fps and fps > 0:
         video_codec += ['-r', str(int(fps))]
     audio_codec_tmp = ['-c:a', 'flac']      # FLAC 无编码延迟，时长精确
@@ -180,12 +201,11 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
     cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2']
     for fp in file_list:
         cmd += ['-i', fp]
-    cmd += ['-filter_complex', filter_complex,
-            '-map', '[outv]', '-map', '[outa]',
-            '-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
-            '-rc-lookahead', '0', '-sar', '1:1',
-            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
-            '-vsync', 'cfr', '-shortest']
+    cmd += (['-filter_complex', filter_complex,
+             '-map', '[outv]', '-map', '[outa]']
+            + get_video_codec() +
+            ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+             '-vsync', 'cfr', '-shortest'])
     if fps and fps > 0:
         cmd.insert(cmd.index('-shortest'), str(int(fps)))
         cmd.insert(cmd.index(str(int(fps))), '-r')
