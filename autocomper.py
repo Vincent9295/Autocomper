@@ -11,15 +11,6 @@ _cuda_bin = r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin'
 if os.path.isdir(_cuda_bin) and hasattr(os, 'add_dll_directory'):
     os.add_dll_directory(_cuda_bin)
 
-# 必须在导入 moviepy 之前设置 FFmpeg 路径
-_ffmpeg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg')
-if sys.platform == 'win32':
-    os.environ['FFMPEG_BINARY'] = os.path.join(_ffmpeg_dir, 'windows', 'ffmpeg.exe')
-elif sys.platform == 'darwin':
-    os.environ['FFMPEG_BINARY'] = os.path.join(_ffmpeg_dir, 'osx', 'ffmpeg')
-else:
-    os.environ['FFMPEG_BINARY'] = os.path.join(_ffmpeg_dir, 'linux', 'ffmpeg')
-
 import threading
 import tkinter as tk
 import webbrowser
@@ -33,7 +24,7 @@ from kthread import KThread
 from PIL import Image, ImageTk
 from proglog import ProgressBarLogger
 
-from compile import compile_vid
+from compile import compile_vid, get_video_codec
 from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
 from sound_reader import get_timestamps
@@ -627,10 +618,10 @@ class ReviewDialog:
             tmp.close()
             ff = os.environ.get('FFMPEG_BINARY', 'ffmpeg')
             if video:
-                cmd = [ff, '-y', '-hide_banner', '-loglevel', 'error',
-                       '-ss', str(ss), '-t', str(dur), '-i', f['filename'],
-                       '-c:v', 'h264_nvenc', '-preset', '3',
-                       '-c:a', 'aac', '-b:a', '128k', tmp.name]
+                cmd = ([ff, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-ss', str(ss), '-t', str(dur), '-i', f['filename']]
+                       + get_video_codec() +
+                       ['-c:a', 'aac', '-b:a', '128k', tmp.name])
             else:
                 cmd = [ff, '-y', '-hide_banner', '-loglevel', 'error',
                        '-ss', str(ss), '-t', str(dur), '-i', f['filename'],
@@ -688,7 +679,7 @@ class ReviewDialog:
 
         # 保存勾选的 timestamps 到 _selected.txt
         if self.txt_path and self.txt_path != "No file selected!":
-            selected_path = self.txt_path.replace('.txt', '_selected.txt')
+            selected_path = self.txt_path.rsplit('.txt', 1)[0] + '_selected.txt'
             lines = []
             for entry in result:
                 lines.append(entry['filename'])
@@ -1397,7 +1388,7 @@ class VideoProcessorApp:
                 number_vids_label.pack_forget()
                 messagebox.showerror(
                     "Error",  f"Invalid URL: {url}\nError: {str(e)}")
-                url_entry["state"] = tk.ACTIVE
+                url_entry["state"] = tk.NORMAL
                 self.thread_active = False
                 return
 
@@ -1439,7 +1430,7 @@ class VideoProcessorApp:
                 number_vids_label.pack_forget()
                 messagebox.showerror(
                     "Error",  f"Invalid URL: {errors[0] if errors else 'Unknown error'}")
-                url_entry["state"] = tk.ACTIVE
+                url_entry["state"] = tk.NORMAL
                 return
             elif len(errors) > 0:
                 messagebox.showwarning(
@@ -1484,7 +1475,7 @@ class VideoProcessorApp:
                     str(video_path),))
             else:
                 self.video_listbox.insert("", "end", item_number, values=(
-                    str(os.path.basename(video_path)).replace(" ", "\ ")))
+                    str(os.path.basename(video_path))))
 
         if scroll_to_bottom:
             self.video_listbox.yview_moveto(1.0)
@@ -1498,7 +1489,7 @@ class VideoProcessorApp:
         for video in self.uploaded_videos:
             video_path = video.get_path()
             video_key = str(video_path) if video.get_is_url() else str(
-                os.path.basename(video_path)).replace(" ", "\ ")
+                os.path.basename(video_path))
 
             if video_key not in current_items:
                 item_number = len(self.video_listbox.get_children())
@@ -1573,7 +1564,6 @@ class VideoProcessorApp:
         """Handle drag-and-drop of video files."""
         files = self.root.tk.splitlist(event.data)
         for f in files:
-            f = f.strip('{}')
             video_exts = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')
             audio_exts = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac')
             if f.lower().endswith(video_exts + audio_exts):
@@ -2259,7 +2249,8 @@ class VideoProcessorApp:
                         f"{Fore.GREEN}[{i + 1}/{len(self.uploaded_videos)}]{Style.RESET_ALL} Getting timestamps for {os.path.basename(input_video_path)}")
                     timestamps, used_existing_data = get_timestamps(
                         input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
-                    timestamps = dict(timestamps)  # 拷贝，防止修改缓存
+                    timestamps = {'filename': timestamps['filename'],
+                                  'timestamps': [dict(t) for t in timestamps['timestamps']]}
                     dict_list.append(timestamps)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
                     num_found = len(timestamps['timestamps'])
