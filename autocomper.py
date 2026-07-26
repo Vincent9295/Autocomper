@@ -837,15 +837,27 @@ class VideoProcessorApp:
 
         self.media_toggle_frame.pack(fill=tk.BOTH)
 
-        self.video_listbox = ttk.Treeview(
-            self.filelist_frame, selectmode=tk.EXTENDED, columns="#1", show='')
-        self.video_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # inner frame: listbox 与垂直滚动条同一行，水平滚动条单独占外层底部一行
+        self.listbox_inner = ttk.Frame(self.filelist_frame)
+        self.listbox_inner.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        scrollbar = ttk.Scrollbar(self.filelist_frame, orient="vertical")
+        self.video_listbox = ttk.Treeview(
+            self.listbox_inner, selectmode=tk.EXTENDED, columns="#1", show='')
+        self.video_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # stretch=False 固定宽 1200：超长文件名（"2024年MM月DD日N点场-主播名.mp4" 等）
+        # 末尾日期部分在视口右边可见，配合下方水平滚动条查看完整
+        self.video_listbox.column("#1", stretch=False, width=1200, anchor='w')
+
+        scrollbar = ttk.Scrollbar(self.listbox_inner, orient="vertical")
         scrollbar.config(command=self.video_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.video_listbox.config(yscrollcommand=scrollbar.set)
+
+        h_scrollbar = ttk.Scrollbar(self.filelist_frame, orient="horizontal")
+        h_scrollbar.config(command=self.video_listbox.xview)
+        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.video_listbox.config(xscrollcommand=h_scrollbar.set)
 
         self.filelist_frame.pack(fill=tk.BOTH)
 
