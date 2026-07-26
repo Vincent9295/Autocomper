@@ -348,7 +348,7 @@ def _smart_sort_key(filepath):
     name_no_ext = os.path.splitext(name)[0]
 
     # --- folder key: extract date+time for both folder names and loose filenames
-    _h = lambda s: ('{:02d}'.format(int(m.group(1))) if (m := re.search(r'(\d{1,2})点场', s)) else '\uffff')
+    _h = lambda s: ('{:02d}'.format(int(m.group(1))) if (m := re.search(r'(\d{1,2})点场?', s)) else '\uffff')
     _src = folder if re.search(r'\d{4}年', folder) else name
     fm = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', _src)
     if fm:
@@ -372,7 +372,7 @@ def _smart_sort_key(filepath):
     _of = lambda n: 1 if re.search(r'\bOriginal\b', n) else 0
     _pp = lambda n: int(re.search(r'^p?(\d{1,2})[\s_\-]', n).group(1)) if re.search(r'^p?(\d{1,2})[\s_\-]', n) else (int(re.search(r'part\s*(\d+)', n, re.I).group(1)) if re.search(r'part\s*(\d+)', n, re.I) else 0)
     # 1. Chinese live stream date
-    m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})点场', name)
+    m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})点场?', name)
     if m:
         return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}', _of(name), _pp(name))
     # 2. ISO date: "2022-07-19" or "2022_07_19"
