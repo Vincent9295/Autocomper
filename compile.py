@@ -201,15 +201,12 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
     cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2']
     for fp in file_list:
         cmd += ['-i', fp]
-    cmd += (['-filter_complex', filter_complex,
-             '-map', '[outv]', '-map', '[outa]']
-            + get_video_codec() +
-            ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
-             '-vsync', 'cfr', '-shortest'])
+    cmd += ['-filter_complex', filter_complex,
+            '-map', '[outv]', '-map', '[outa]'] + get_video_codec() + \
+           ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
     if fps and fps > 0:
-        cmd.insert(cmd.index('-shortest'), str(int(fps)))
-        cmd.insert(cmd.index(str(int(fps))), '-r')
-    cmd.append(output_file)
+        cmd += ['-r', str(int(fps))]
+    cmd += ['-vsync', 'cfr', '-shortest', output_file]
 
     # 验证所有输入文件有视频流
     for i, fp in enumerate(file_list):
@@ -394,9 +391,9 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
         cut_func, concat_func = _ffmpeg_cut_audio, _ffmpeg_concat_audio
         max_parallel = 5
 
+    tempfiles = []
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            tempfiles = []
             tasks = []
 
             # 固定输出帧率 30fps，防止 VFR / 25fps 导致的 A/V 偏移
@@ -421,8 +418,9 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     i = 0
                     while i < len(timestamps) - 1:
                         if timestamps[i + 1][0] - timestamps[i][1] < MERGE_THRESHOLD:
-                            timestamps[i] = (timestamps[i][0], timestamps[i + 1][1])
-                            timestamps.remove(timestamps[i + 1])
+                            timestamps[i] = (timestamps[i][0],
+                                             max(timestamps[i][1], timestamps[i + 1][1]))
+                            del timestamps[i + 1]
                         else:
                             i += 1
 
@@ -443,11 +441,18 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 # ── 修剪相邻 clip 重叠（编译阶段最后防线）──
                 if len(timestamps) > 1:
                     timestamps.sort(key=lambda x: x[0])
-                    for i in range(len(timestamps) - 1):
+                    i = 0
+                    while i < len(timestamps) - 1:
                         if timestamps[i][1] > timestamps[i + 1][0]:
-                            mid = (timestamps[i][1] + timestamps[i + 1][0]) / 2
-                            timestamps[i] = (timestamps[i][0], mid)
-                            timestamps[i + 1] = (mid, timestamps[i + 1][1])
+                            dur_i = timestamps[i][1] - timestamps[i][0]
+                            dur_j = timestamps[i + 1][1] - timestamps[i + 1][0]
+                            if dur_i >= dur_j:
+                                del timestamps[i + 1]
+                            else:
+                                del timestamps[i]
+                        else:
+                            i += 1
+                    timestamps = [(s, e) for s, e in timestamps if e - s >= 1.0]
 
                 if not timestamps:
                     print(f"{Fore.YELLOW}No timestamps found for this video!")
