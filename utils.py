@@ -3,6 +3,8 @@ import os
 import platform
 import shutil
 import re
+import subprocess
+import time
 from pathlib import Path
 
 from typing import Literal, Tuple, Dict, Any, Optional, List
@@ -10,6 +12,39 @@ from typing import Literal, Tuple, Dict, Any, Optional, List
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from yt_dlp.networking.exceptions import TransportError
+
+_ACTIVE_PROCS = set()
+
+
+def run_tracked(cmd, timeout=None, text=False):
+    """subprocess.run 等价物，注册进程以便取消时统一终止。"""
+    opts = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
+    if sys.platform == 'win32':
+        opts['creationflags'] = 0x08000000
+    p = subprocess.Popen(cmd, **opts)
+    _ACTIVE_PROCS.add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        raise
+    finally:
+        _ACTIVE_PROCS.discard(p)
+    if text:
+        out = out.decode('utf-8', errors='replace') if out is not None else None
+        err = err.decode('utf-8', errors='replace') if err is not None else None
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def kill_tracked_procs():
+    for p in list(_ACTIVE_PROCS):
+        try:
+            p.kill()
+        except Exception:
+            pass
+    _ACTIVE_PROCS.clear()
+
 
 DOWNLOAD_QUALITY_OPTIONS = ["No Limit", "144p", "240p", "360p",
                             "480p", "720p", "1080p", "1440p", "2160p", "4320p"]
@@ -47,7 +82,7 @@ def convert_quality_str_to_int(quality: str) -> int:
         # Case like '720p' where there is only one number
         return int(numbers[0])
     elif len(numbers) == 2:
-        # Case like '256x144' where there are two numbers; return the greater number
+        # Case like '256x144' where there are two numbers; return the smaller (height) number
         return min(tuple(map(int, numbers)))
     else:
         return None
@@ -100,13 +135,17 @@ def get_urls(base_url: str):
         'skip_download': True,
         'extract_flat': 'in_playlist',  # Extract only metadata, not the video itself
     }
+    attempts = 0
     while True:
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(base_url, download=False)
                 break
         except TransportError:
-            continue
+            attempts += 1
+            if attempts >= 3:
+                raise
+            time.sleep(1)
         except Exception:
             raise
 
@@ -261,7 +300,7 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
             except Exception as e:
                 attempts += 1
                 if attempts >= n_retries:
-                    return False, str(e).encode("utf-8")
+                    return False, str(e)
             finally:
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
