@@ -64,9 +64,14 @@ def get_video_codec():
     global _VIDEO_CODEC_CACHE
     if _VIDEO_CODEC_CACHE is not None:
         return list(_VIDEO_CODEC_CACHE)
+    # 必须显式质量控制：无 -b:v/-cq 时 nvenc 默认码率极低（实测 1080p 仅 ~570 kb/s），
+    # 高动态画面严重糊化/块状损坏。CQ 模式 + maxrate 封顶，兼顾画质与体积。
     nvenc = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
-             '-rc-lookahead', '0', '-sar', '1:1']
-    x264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-sar', '1:1']
+             '-rc', 'vbr', '-cq', '20', '-b:v', '0',
+             '-maxrate', '12M', '-bufsize', '24M',
+             '-rc-lookahead', '20', '-sar', '1:1']
+    x264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+            '-crf', '18', '-maxrate', '12M', '-bufsize', '24M', '-sar', '1:1']
     try:
         r = run_tracked([FFMPEG_PATH, '-hide_banner', '-loglevel', 'error',
                          '-f', 'lavfi', '-i', 'color=black:s=64x64:d=0.1']
