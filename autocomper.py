@@ -775,8 +775,11 @@ class VideoProcessorApp:
         
         self.output_text_path = tk.StringVar()
 
-        self.keep_downloaded_vids.set(bool(
-            self.preferences.get("Settings", "keep_downloaded_vids")))
+        try:
+            _kdv = self.preferences.getboolean("Settings", "keep_downloaded_vids")
+        except (configparser.Error, ValueError):
+            _kdv = False
+        self.keep_downloaded_vids.set(_kdv)
 
         self.download_video_path.set(
             self.preferences.get("Settings", "download_path"))
@@ -1768,17 +1771,21 @@ class VideoProcessorApp:
             self.preferences.write(configfile)
 
     def reset_preferences_to_file(self):
-        self.keep_downloaded_vids.set(self.preferences.get(
-            "Settings", "keep_downloaded_vids"))
+        try:
+            _kdv = self.preferences.getboolean("Settings", "keep_downloaded_vids")
+        except (configparser.Error, ValueError):
+            _kdv = False
+        self.keep_downloaded_vids.set(_kdv)
         self.download_video_path.set(self.preferences.get(
             "Settings", "download_path"
         ))
         self.max_quality.set(self.preferences.get(
             "Settings", "max_quality"
         ))
-        self.max_download_speed.set(self.preferences.get(
-            "Settings", "max_download_speed"
-        ))
+        try:
+            self.max_download_speed.set(int(self.preferences.get("Settings", "max_download_speed")))
+        except (ValueError, tk.TclError):
+            self.max_download_speed.set(0)
         self.output_text_path.set(self.preferences.get(
             "Settings", "output_text_path"
         ))
