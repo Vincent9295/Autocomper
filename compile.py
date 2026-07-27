@@ -77,29 +77,32 @@ def get_video_codec():
              '-rc', 'vbr', '-cq', '20', '-b:v', '0',
              '-maxrate', '12M', '-bufsize', '24M',
              '-rc-lookahead', '20', '-sar', '1:1']
-    x264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-            '-crf', '18', '-maxrate', '12M', '-bufsize', '24M', '-sar', '1:1']
-    reason = ''
+    x264 = list(_X264_CODEC)
+    # 探针帧必须 >= 256x144：新款 GPU（如 RTX 50 系）NVENC 最小编码尺寸 > 64x64，
+    # 用 64x64 探测会误报 "Frame Dimension less than the minimum supported value"。
     try:
         r = run_tracked([FFMPEG_PATH, '-hide_banner', '-loglevel', 'error',
-                         '-f', 'lavfi', '-i', 'color=black:s=64x64:d=0.1']
-                        + nvenc + ['-f', 'null', '-'], timeout=15, text=True)
-        if r.returncode == 0:
-            _VIDEO_CODEC_CACHE = nvenc
-        else:
-            _VIDEO_CODEC_CACHE = x264
-            lines = [l.strip() for l in (r.stderr or '').splitlines() if l.strip()]
-            reason = lines[-1] if lines else f'rc={r.returncode}'
-    except Exception as ex:
+                         '-f', 'lavfi', '-i', 'color=black:s=256x144:d=0.1']
+                        + nvenc + ['-f', 'null', '-'], timeout=15)
+        _VIDEO_CODEC_CACHE = nvenc if r.returncode == 0 else x264
+    except Exception:
         _VIDEO_CODEC_CACHE = x264
-        reason = str(ex)
     if _VIDEO_CODEC_CACHE is x264:
-        # 正常回退：质量与 NVENC 一致（CRF18），仅速度较慢。打印真实原因便于诊断。
+        # 正常回退：质量与 NVENC 一致（CRF18），仅速度较慢
         print(f"{Fore.YELLOW}NVENC unavailable, using libx264 (CPU). "
               f"This is fine - same output quality, just slower.{Style.RESET_ALL}")
-        if reason:
-            print(f"{Fore.YELLOW}  Reason: {reason[:200]}{Style.RESET_ALL}")
     return list(_VIDEO_CODEC_CACHE)
+
+
+_X264_CODEC = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+               '-crf', '18', '-maxrate', '12M', '-bufsize', '24M', '-sar', '1:1']
+
+
+def _fallback_to_x264():
+    """NVENC 编码中途失败时，永久回退 libx264（更新缓存）。"""
+    global _VIDEO_CODEC_CACHE
+    _VIDEO_CODEC_CACHE = _X264_CODEC
+    print(f"{Fore.YELLOW}NVENC encode failed; falling back to libx264 (CPU).{Style.RESET_ALL}")
 
 
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
@@ -132,21 +135,31 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         af = f'atrim={pad}:{pad + dur}'
         if normalize:
             af += ',loudnorm'
-        cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
-            '-accurate_seek',
-            '-ss', str(s - pad),
-            '-i', input_file,
-            '-ss', str(pad), '-to', str(pad + dur),
-            '-af', af,
-            '-avoid_negative_ts', 'make_zero',
-            '-vsync', 'cfr', '-shortest',
-        ] + video_codec + audio_codec_tmp
-        if res:
-            w, h = res
-            cmd.extend(['-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
-                               f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2'])
-        cmd.append(output_file)
-        result = run_tracked(cmd, timeout=600, text=True)
+
+        def build_cmd(codec):
+            c = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
+                '-accurate_seek',
+                '-ss', str(s - pad),
+                '-i', input_file,
+                '-ss', str(pad), '-to', str(pad + dur),
+                '-af', af,
+                '-avoid_negative_ts', 'make_zero',
+                '-vsync', 'cfr', '-shortest',
+            ] + codec + audio_codec_tmp
+            if res:
+                w, h = res
+                c.extend(['-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
+                                 f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2'])
+            c.append(output_file)
+            return c
+
+        result = run_tracked(build_cmd(video_codec), timeout=600, text=True)
+        if result.returncode != 0 and 'h264_nvenc' in video_codec:
+            _fallback_to_x264()
+            codec = list(_X264_CODEC)
+            if fps and fps > 0:
+                codec += ['-r', str(int(fps))]
+            result = run_tracked(build_cmd(codec), timeout=600, text=True)
         if result.returncode != 0:
             raise Exception(f"FFmpeg cut failed for {os.path.basename(input_file)}"
                             f"\n  rc={result.returncode}\n  stderr: {result.stderr}\n  stdout: {result.stdout}")
