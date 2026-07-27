@@ -79,15 +79,26 @@ def get_video_codec():
              '-rc-lookahead', '20', '-sar', '1:1']
     x264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
             '-crf', '18', '-maxrate', '12M', '-bufsize', '24M', '-sar', '1:1']
+    reason = ''
     try:
         r = run_tracked([FFMPEG_PATH, '-hide_banner', '-loglevel', 'error',
                          '-f', 'lavfi', '-i', 'color=black:s=64x64:d=0.1']
-                        + nvenc + ['-f', 'null', '-'], timeout=15)
-        _VIDEO_CODEC_CACHE = nvenc if r.returncode == 0 else x264
-    except Exception:
+                        + nvenc + ['-f', 'null', '-'], timeout=15, text=True)
+        if r.returncode == 0:
+            _VIDEO_CODEC_CACHE = nvenc
+        else:
+            _VIDEO_CODEC_CACHE = x264
+            lines = [l.strip() for l in (r.stderr or '').splitlines() if l.strip()]
+            reason = lines[-1] if lines else f'rc={r.returncode}'
+    except Exception as ex:
         _VIDEO_CODEC_CACHE = x264
+        reason = str(ex)
     if _VIDEO_CODEC_CACHE is x264:
-        print(f"{Fore.YELLOW}NVENC unavailable, using libx264 (CPU).")
+        # 正常回退：质量与 NVENC 一致（CRF18），仅速度较慢。打印真实原因便于诊断。
+        print(f"{Fore.YELLOW}NVENC unavailable, using libx264 (CPU). "
+              f"This is fine - same output quality, just slower.{Style.RESET_ALL}")
+        if reason:
+            print(f"{Fore.YELLOW}  Reason: {reason[:200]}{Style.RESET_ALL}")
     return list(_VIDEO_CODEC_CACHE)
 
 
