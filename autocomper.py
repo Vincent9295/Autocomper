@@ -252,7 +252,6 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 num_blocks = total_samples // frame_count
                 slice_audio = slice_audio[:num_blocks * frame_count]
                 blocks = slice_audio.reshape(num_blocks, frame_count)
-                rows_per_sec = 100.0 / precision  # framewise 行率（100/precision）
                 for b_idx in range(num_blocks):
                     block = blocks[b_idx]
                     rms = _np.sqrt(_np.mean(block ** 2))
@@ -262,21 +261,15 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     block = block.reshape(1, -1).astype(_np.float32)
                     preds = ort_session.run(["output"], {"input": block})[0]
                     block_offset = b_idx * verify_block_size + ws
-                    # P3: 双阈值 — >direct_accept 直收；中段分数过 argmax 门：
-                    # 命中的峰值帧上 burp 必须是 527 类最高分，否则否决。
+                    # P3: 双阈值 — >direct_accept 直收；中段分数须非 suspect
+                    # （argmax 门在 compute_timestamps 内统一计算：burp 必须是
+                    # 命中峰值帧上 527 类的最高分，否则否决）。
                     for ts in _compute_ts(preds[0], precision, threshold, focus_idx, block_offset):
                         if ts['pred'] > direct_accept:
                             ts['source'] = 'new'
                             merged_timestamps.append(ts)
                             dskip += 1
-                            continue
-                        f0 = max(0, int((ts['start'] - block_offset) * rows_per_sec))
-                        f1 = min(preds[0].shape[0] - 1,
-                                 int((ts['end'] - block_offset) * rows_per_sec))
-                        if f1 < f0:
-                            f1 = f0
-                        peak = f0 + int(_np.argmax(preds[0][f0:f1 + 1, focus_idx]))
-                        if int(_np.argmax(preds[0][peak, :])) == focus_idx:
+                        elif not ts['suspect']:
                             ts['source'] = 'new'
                             merged_timestamps.append(ts)
                             confirmed += 1
@@ -409,6 +402,7 @@ class ReviewDialog:
                     'start': ts['start'], 'end': ts['end'],
                     'pred': ts.get('pred', 0),
                     'source': ts.get('source', 'original'),
+                    'suspect': ts.get('suspect', False),
                 })
 
         self.win = tk.Toplevel(parent)
@@ -433,9 +427,12 @@ class ReviewDialog:
         info_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
         total = len(self.flat)
         new_count = sum(1 for f in self.flat if f.get('source') == 'new')
+        suspect_count = sum(1 for f in self.flat if f.get('suspect'))
         t = f"Total: {total} segments"
         if use_verify and new_count > 0:
             t += f"  |  New: {new_count}"
+        if suspect_count > 0:
+            t += f"  |  Suspect: {suspect_count}"
         ttk.Label(info_frame, text=t).pack(side=tk.LEFT)
         ttk.Label(info_frame,
                   text="Right-click for preview  |  Click row to toggle",
@@ -464,18 +461,25 @@ class ReviewDialog:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         for i, f in enumerate(self.flat):
-            cv = tk.BooleanVar(value=True)
+            suspect = f.get('suspect', False)
+            cv = tk.BooleanVar(value=not suspect)  # suspect 预取消勾选（软标记，可勾回）
             self.checks.append(cv)
             s_str = self._fmt(f['start'])
             e_str = self._fmt(f['end'])
             bn = os.path.basename(f['filename'])
-            st = 'New' if f.get('source') == 'new' else 'Original'
+            if suspect:
+                st = 'Suspect'
+            else:
+                st = 'New' if f.get('source') == 'new' else 'Original'
             tag = 'checked'
             self.tree.insert('', tk.END, iid=str(i),
-                             values=('\u2611' if cv.get() else '\u2610',
+                             values=('☑' if cv.get() else '☐',
                                      f"{s_str} - {e_str}", bn,
                                      f"{f['pred']:.2f}", st), tags=(tag,))
             self._style(str(i), cv.get())
+            if suspect:
+                self.tree.set(str(i), 0, '☐')
+                self.tree.item(str(i), tags=('unchecked',))
 
         # Auto-deselect originals that overlap with new reverify clips
         for i, f in enumerate(self.flat):
@@ -1112,6 +1116,16 @@ class VideoProcessorApp:
             variable=self.use_review)
         self.review_checkbox.pack(anchor=tk.W)
 
+        # 严格假阳过滤 checkbox（argmax 门，默认关）
+        self.checkbox_frame_seven = ttk.Frame(self.left_frame)
+        self.checkbox_frame_seven.pack(anchor=tk.W)
+        self.use_strict_fp = tk.BooleanVar()
+        self.strict_fp_checkbox = ttk.Checkbutton(
+            self.checkbox_frame_seven,
+            text="Strict FP filter (drop clips where burp is not the top class)",
+            variable=self.use_strict_fp)
+        self.strict_fp_checkbox.pack(anchor=tk.W)
+
         # Right Column Widgets
         right_frame = ttk.Frame(root, width=300)
         right_frame.grid(row=0, column=2, padx=10, pady=30, sticky="nsew")
@@ -1209,6 +1223,8 @@ class VideoProcessorApp:
             self.verify_checkbox, 'After AI detection, scan near each clip with a lower threshold to find clips the AI may have missed.')
         review_tooltip = CustomHovertip(
             self.review_checkbox, 'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.')
+        strict_fp_tooltip = CustomHovertip(
+            self.strict_fp_checkbox, 'Drop clips where another sound class (speech/scream/etc.) scores higher than burp.\nReduces false positives for noisy streamers, but may rarely miss real burps mixed with loud talking.\nSuspect clips are also shown pre-deselected in Review regardless of this option.')
         skip_auto_tooltip = CustomHovertip(
             self.skip_auto_checkbox, 'When a timestamps.txt file already exists, automatically use it without showing the confirmation dialog.')
         settings_tooltip = CustomHovertip(self.settings_button, "Settings")
@@ -1240,6 +1256,7 @@ class VideoProcessorApp:
             self.padding_after_entry,
             self.verify_checkbox,
             self.review_checkbox,
+            self.strict_fp_checkbox,
             self.skip_auto_checkbox,
             self.focus_idx_entry,
             self.preset_combo,
@@ -2277,6 +2294,13 @@ class VideoProcessorApp:
                         input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
                     timestamps = {'filename': timestamps['filename'],
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
+                    if self.use_strict_fp.get():
+                        before = len(timestamps['timestamps'])
+                        timestamps['timestamps'] = [
+                            t for t in timestamps['timestamps'] if not t.get('suspect')]
+                        dropped = before - len(timestamps['timestamps'])
+                        if dropped:
+                            print(f"{Fore.CYAN}Strict FP filter: dropped {dropped} suspect clip(s).")
                     dict_list.append(timestamps)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
                     num_found = len(timestamps['timestamps'])

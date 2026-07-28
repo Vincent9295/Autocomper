@@ -53,11 +53,23 @@ def compute_timestamps(framewise_output, precision, threshold, focus_idx, offset
                          f"(model has {framewise_output.shape[1]} classes)")
     focus = framewise_output[:, focus_idx]
     subsampled_scores = subsample(focus, precision)
-    segments = map(lambda segment: {
-        'start': segment['start'] * precision / 100 + offset,
-        'end': segment['end'] * precision / 100 + offset + 1,
-        'pred': round(float(segment['pred']), 6)
-    }, get_segments(subsampled_scores, precision, threshold, offset))
+    segments = []
+    for segment in get_segments(subsampled_scores, precision, threshold, offset):
+        # 峰值帧 argmax 检查：focus 类必须是 527 类最高分。
+        # 怪声音（假阳）常有竞争类更高 → suspect=True；真 burp 几乎总是 argmax
+        # （实测：920/920 干净合集 + 5/5 噪声直播真 burp 全部 argmax==focus）。
+        f0 = segment['start'] * precision
+        f1 = min(framewise_output.shape[0], (segment['end'] + 1) * precision)
+        peak = f0 + int(np.argmax(framewise_output[f0:f1, focus_idx]))
+        top1_idx = int(np.argmax(framewise_output[peak, :]))
+        segments.append({
+            'start': segment['start'] * precision / 100 + offset,
+            'end': segment['end'] * precision / 100 + offset + 1,
+            'pred': round(float(segment['pred']), 6),
+            'suspect': top1_idx != focus_idx,
+            'top1_idx': top1_idx,
+            'top1_score': round(float(framewise_output[peak, top1_idx]), 6),
+        })
     return segments
 
 
