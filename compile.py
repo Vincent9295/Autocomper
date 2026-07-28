@@ -172,7 +172,9 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             seg_file = os.path.join(seg_dir, f"_seg{i}.mp4")
             seg_files.append(seg_file)
             _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None, normalize=normalize, fps=fps)
-        _ffmpeg_concat(seg_files, output_file, res=res, normalize=normalize, fps=fps)
+        # 必须走 batched：单视频上千 segment 时 _ffmpeg_concat 会把所有 -i
+        # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206
+        _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize, fps=fps)
     finally:
         for sf in seg_files:
             try:
@@ -267,8 +269,9 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
     return True
 
 
-def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6, fps=None):
-    """Batched concat for large file lists."""
+def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6, fps=None, _lvl=0):
+    """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
+    保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。"""
     if not file_list:
         return False
     if len(file_list) == 1 and not res and not normalize:
@@ -301,13 +304,18 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
     batch_files = []
     try:
         for bi, batch in enumerate(batches):
-            batch_out = os.path.join(temp_dir, f"_batch{bi}.mp4")
+            batch_out = os.path.join(temp_dir, f"_batchL{_lvl}_{bi}.mp4")
             batch_files.append(batch_out)
             print(f"  Batch {bi + 1}/{len(batches)} ({len(batch)} files)...")
             ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
         print(f"  Final merge ({len(batch_files)} files)...")
+        if len(batch_files) > batch_size:
+            # 批数仍过多，继续递归分批（层级文件名避免覆盖同层）
+            return _ffmpeg_concat_batched(batch_files, output_file, res=res,
+                                          normalize=normalize, batch_size=batch_size,
+                                          fps=fps, _lvl=_lvl + 1)
         _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps)
     finally:
         for bf in batch_files:
