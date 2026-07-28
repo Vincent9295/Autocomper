@@ -154,12 +154,14 @@ def _parse_timestamps_txt(txt_path):
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
                        focus_idx=58, threshold=0.30, ort_session=None,
-                       verify_block_size=10):
+                       verify_block_size=10, direct_accept=0.75):
     """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
-    P0: 加简易 DRC 压缩，把被音乐盖住的 burp 拉回来
+    P0: 加简易 DRC 压缩（最多 +8dB），把被音乐盖住的 burp 拉回来
     P1: 每文件提取完整音频一次（消除 N 次 FFmpeg 调用的磁盘 I/O）
-    P3: 双阈值确认：低阈值 DRC 扫描 → 高阈值 raw 确认（滤假阳）
+    P3: 双阈值：>direct_accept 直收；中段分数须过 argmax 门——
+        burp 必须是 527 类预测向量的最高分。怪声音（尖叫/说话/唱歌）
+        在 burp 中等分时通常有竞争类更高，被否决；小声真 burp 仍为 argmax，保留。
     新片段标记 source='new'，原始片段标记 source='original'。
     """
     if not dict_list:
@@ -250,46 +252,36 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 num_blocks = total_samples // frame_count
                 slice_audio = slice_audio[:num_blocks * frame_count]
                 blocks = slice_audio.reshape(num_blocks, frame_count)
-                scan_ts = []
+                rows_per_sec = 100.0 / precision  # framewise 行率（100/precision）
                 for b_idx in range(num_blocks):
                     block = blocks[b_idx]
                     rms = _np.sqrt(_np.mean(block ** 2))
                     if rms > 0.005:  # 避免静默块 blow up
-                        gain = min(4.0, 0.25 / rms)  # 最多 +12dB 增益
+                        gain = min(2.5, 0.25 / rms)  # 最多 +8dB 增益
                         block = block.copy() * gain
                     block = block.reshape(1, -1).astype(_np.float32)
                     preds = ort_session.run(["output"], {"input": block})[0]
                     block_offset = b_idx * verify_block_size + ws
-                    scan_ts.extend(_compute_ts(preds[0], precision, threshold, focus_idx, block_offset))
-
-                # P3: 双阈值确认 — 原始未压缩音频
-                for ts in scan_ts:
-                    if ts['pred'] > 0.45:  # 中分 DRC 跳过 P3，直接接受
-                        ts['source'] = 'new'
-                        merged_timestamps.append(ts)
-                        dskip += 1
-                        continue
-                    ts_abs_start = ts['start']
-                    ts_abs_end = ts['end']
-                    si2 = max(0, int((ts_abs_start - 3.0) * SAMPLE_RATE))
-                    ei2 = min(len(raw), int((ts_abs_end + 3.0) * SAMPLE_RATE))
-                    if ei2 - si2 < frame_count:
-                        continue
-                    chunk = raw[si2:ei2][:frame_count].reshape(1, -1).astype(_np.float32)
-                    if chunk.shape[1] != frame_count:
-                        chunk = _np.pad(chunk, ((0, 0), (0, frame_count - chunk.shape[1])))
-                    preds2 = ort_session.run(["output"], {"input": chunk})[0]
-                    confirm_segs = list(_compute_ts(preds2[0], precision, threshold, focus_idx, 0))
-                    if confirm_segs:
-                        best = max(confirm_segs, key=lambda x: x['pred'])
-                        ts['start'] = ts_abs_start - 0.5 + best['start']
-                        ts['end'] = ts_abs_start - 0.5 + best['end']
-                        ts['source'] = 'new'
-                        ts['pred'] = best['pred']
-                        merged_timestamps.append(ts)
-                        confirmed += 1
-                    else:
-                        rejected += 1
+                    # P3: 双阈值 — >direct_accept 直收；中段分数过 argmax 门：
+                    # 命中的峰值帧上 burp 必须是 527 类最高分，否则否决。
+                    for ts in _compute_ts(preds[0], precision, threshold, focus_idx, block_offset):
+                        if ts['pred'] > direct_accept:
+                            ts['source'] = 'new'
+                            merged_timestamps.append(ts)
+                            dskip += 1
+                            continue
+                        f0 = max(0, int((ts['start'] - block_offset) * rows_per_sec))
+                        f1 = min(preds[0].shape[0] - 1,
+                                 int((ts['end'] - block_offset) * rows_per_sec))
+                        if f1 < f0:
+                            f1 = f0
+                        peak = f0 + int(_np.argmax(preds[0][f0:f1 + 1, focus_idx]))
+                        if int(_np.argmax(preds[0][peak, :])) == focus_idx:
+                            ts['source'] = 'new'
+                            merged_timestamps.append(ts)
+                            confirmed += 1
+                        else:
+                            rejected += 1
 
             # --- 合并：new 片段独立，同类合并 -----------------------------
             def _merge_ts(timestamps):
