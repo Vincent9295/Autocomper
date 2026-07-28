@@ -424,7 +424,8 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False):
 # ═══ Public API ═══════════════════════════════════════════════════════
 
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
-                res=None, logger=None, normalize=False, is_video=True, padding=None):
+                res=None, logger=None, normalize=False, is_video=True, padding=None,
+                excluded=None):
     output_format = ".mp4" if is_video else ".mp3"
 
     if is_video:
@@ -457,10 +458,25 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     for i, ts in enumerate(timestamps):
                         timestamps[i] = (ts[0] - before, ts[1] + after)
 
+                # Review 取消勾选 / Strict FP 丢弃的片段：merge 不允许跨过这些
+                # 区间桥接，否则被删片段的内容会随桥接重新出现在成片里（~1s 残影）。
+                blocked = []
+                if excluded:
+                    blocked = [(s, e) for s, e in excluded.get(filename, []) if e > s]
+                    # 与保留片段重叠的排除段不是用户删除（如 reverify 新增 clip
+                    # 覆盖后被 auto-deselect 的 original），不能当禁区
+                    blocked = [r for r in blocked
+                               if not any(r[0] < te and r[1] > ts
+                                          for ts, te in timestamps)]
+
                 if merge_clips:
                     i = 0
                     while i < len(timestamps) - 1:
-                        if timestamps[i + 1][0] - timestamps[i][1] < MERGE_THRESHOLD:
+                        gap_s, gap_e = timestamps[i][1], timestamps[i + 1][0]
+                        gap_blocked = (gap_e > gap_s and
+                                       any(r[0] < gap_e and r[1] > gap_s
+                                           for r in blocked))
+                        if (gap_e - gap_s < MERGE_THRESHOLD) and not gap_blocked:
                             timestamps[i] = (timestamps[i][0],
                                              max(timestamps[i][1], timestamps[i + 1][1]))
                             del timestamps[i + 1]

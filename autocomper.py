@@ -2145,6 +2145,9 @@ class VideoProcessorApp:
             output_video_path = self.output_video_path.get()
 
             dict_list = []
+            # filename -> [(s,e)]：被排除的片段（Review 取消勾选 / Strict FP 丢弃），
+            # 传给 compile_vid 防止 merge 桥接把已删片段带回成片
+            excluded = {}
 
             if combine and os.path.exists(output_video_path):
                 if not messagebox.askyesno("Confirm Overwrite",
@@ -2261,6 +2264,8 @@ class VideoProcessorApp:
                                     continue
                             filtered.append(t)
                         entry['timestamps'] = filtered
+                    pre_review = {e['filename']: [(t['start'], t['end']) for t in e.get('timestamps', [])]
+                                  for e in dict_list}
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
@@ -2273,8 +2278,15 @@ class VideoProcessorApp:
                         if not dlg.result:
                             raise Exception("No segments selected after review.")
                         dict_list = dlg.result
+                        for entry in dict_list:
+                            fn = entry['filename']
+                            sel = {(round(t['start'], 3), round(t['end'], 3)) for t in entry['timestamps']}
+                            removed = [iv for iv in pre_review.get(fn, [])
+                                       if (round(iv[0], 3), round(iv[1], 3)) not in sel]
+                            if removed:
+                                excluded.setdefault(fn, []).extend(removed)
                         _save_selected_txt(dict_list, txt_path)
-                    compile_vid(dict_list, output_video_path, merge_clips, combine, res, self.final_bar, normalize, self.is_video, padding)
+                    compile_vid(dict_list, output_video_path, merge_clips, combine, res, self.final_bar, normalize, self.is_video, padding, excluded=excluded)
                     print(f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                     messagebox.showinfo("Info", f"Video(s) exported to {output_video_path}. Enjoy!")
                     print(f"{Fore.GREEN}SUCCESS!")
@@ -2296,6 +2308,10 @@ class VideoProcessorApp:
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
                     if self.use_strict_fp.get():
                         before = len(timestamps['timestamps'])
+                        dropped_ts = [t for t in timestamps['timestamps'] if t.get('suspect')]
+                        if dropped_ts:
+                            excluded.setdefault(timestamps['filename'], []).extend(
+                                (t['start'], t['end']) for t in dropped_ts)
                         timestamps['timestamps'] = [
                             t for t in timestamps['timestamps'] if not t.get('suspect')]
                         dropped = before - len(timestamps['timestamps'])
@@ -2393,6 +2409,8 @@ class VideoProcessorApp:
                                 continue
                         filtered.append(t)
                     entry['timestamps'] = filtered
+                pre_review = {e['filename']: [(t['start'], t['end']) for t in e.get('timestamps', [])]
+                              for e in dict_list}
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
@@ -2405,13 +2423,21 @@ class VideoProcessorApp:
                     if not dlg.result:
                         raise Exception("No segments selected after review.")
                     dict_list = dlg.result
+                    for entry in dict_list:
+                        fn = entry['filename']
+                        sel = {(round(t['start'], 3), round(t['end'], 3)) for t in entry['timestamps']}
+                        removed = [iv for iv in pre_review.get(fn, [])
+                                   if (round(iv[0], 3), round(iv[1], 3)) not in sel]
+                        if removed:
+                            excluded.setdefault(fn, []).extend(removed)
                     # 保存 _selected.txt（仅勾选的片段）
                     _save_selected_txt(dict_list, txt_path)
 
                 print(
                     f"Compiling and writing to {output_video_path.split('/')[-1]}...")
                 compile_vid(dict_list, output_video_path, merge_clips,
-                            combine, res, self.final_bar, normalize, self.is_video, padding)
+                            combine, res, self.final_bar, normalize, self.is_video, padding,
+                            excluded=excluded)
                 print(
                     f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                 messagebox.showinfo(
