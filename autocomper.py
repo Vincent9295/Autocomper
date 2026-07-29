@@ -2212,8 +2212,19 @@ class VideoProcessorApp:
                 padding = None
 
             # --- Check for existing timestamps.txt ---
-            txt_path = self.output_text_path.get()
-            if txt_path and txt_path != "No file selected!" and os.path.exists(txt_path):
+            # 候选路径与保存逻辑一致：设置里的路径优先，其次是默认位置
+            # （<输出目录>/timestamps.txt）——否则未设置 txt 路径时上次保存的
+            # timestamps.txt 永远找不到，用户会被迫重跑检测
+            txt_candidates = []
+            _cfg_txt = self.output_text_path.get()
+            if _cfg_txt and _cfg_txt != "No file selected!":
+                txt_candidates.append(_cfg_txt)
+            if os.path.isdir(output_video_path):
+                txt_candidates.append(os.path.join(output_video_path, "timestamps.txt"))
+            else:
+                txt_candidates.append(os.path.join(os.path.dirname(output_video_path), "timestamps.txt"))
+            txt_path = next((p for p in txt_candidates if os.path.exists(p)), None)
+            if txt_path:
                 auto_use = self.skip_detection_auto.get()
                 if auto_use or messagebox.askyesno(
                     "Skip Detection",
