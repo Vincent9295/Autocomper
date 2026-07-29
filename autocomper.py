@@ -213,7 +213,11 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
             ]
             run_tracked(extract_cmd)
 
-            raw = _np.fromfile(full_audio.name, dtype=_np.int16).astype(_np.float32) / 32767.0
+            # memmap：12h 流全文 PCM 有 2.7GB，读进 RAM 再转 float32 峰值 ~14GB 会卡死机
+            # 改用内存映射，只把命中的扫描窗口转 float32（窗口级 ~10MB）
+            if os.path.getsize(full_audio.name) == 0:
+                continue
+            raw = _np.memmap(full_audio.name, dtype=_np.int16, mode='r')
             if len(raw) == 0:
                 continue
 
@@ -247,7 +251,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 if ei - si < SAMPLE_RATE:
                     continue
 
-                slice_audio = raw[si:ei].copy()
+                slice_audio = raw[si:ei].astype(_np.float32) / 32767.0
                 total_samples = len(slice_audio)
                 frame_count = SAMPLE_RATE * verify_block_size
                 if total_samples < frame_count:
@@ -319,6 +323,11 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
         except Exception as e:
             print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {e}")
         finally:
+            # memmap 持有文件句柄，Windows 下须先释放才能删临时文件
+            try:
+                del raw
+            except Exception:
+                pass
             try:
                 os.remove(full_audio.name)
             except Exception:
