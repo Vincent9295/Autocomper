@@ -152,7 +152,8 @@ MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
-                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None):
+                   model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
+                   use_gpu=True):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -176,10 +177,14 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     if ort_session is None:
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            ort_session = ort.InferenceSession(model, sess_options,
-                                               providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        except Exception:
+        if use_gpu:
+            try:
+                ort_session = ort.InferenceSession(model, sess_options,
+                                                   providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            except Exception:
+                ort_session = ort.InferenceSession(model, sess_options,
+                                                   providers=['CPUExecutionProvider'])
+        else:
             ort_session = ort.InferenceSession(model, sess_options,
                                                providers=['CPUExecutionProvider'])
 

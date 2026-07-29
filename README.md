@@ -19,21 +19,23 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Add Folder** | Recursively scan a folder for video/audio files — no need to pick files one by one. |
 | **Save Selected** | Review dialog exports checked clips to `{original}_selected.txt` for future re-use. |
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat. |
+| **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
 
 ### Technical Improvements
 
 | Area | Original | Enhanced |
 |------|----------|----------|
 | **Video pipeline** | MoviePy (`libx264` CPU) | Native FFmpeg subprocess (`h264_nvenc` GPU) |
-| **Inference** | `onnxruntime` (CPU) | `onnxruntime-gpu` (CUDA) — falls back to CPU automatically |
+| **Inference** | `onnxruntime` (CPU) | `onnxruntime-gpu` (CUDA) — falls back to CPU automatically; **CPU/GPU toggle** for quiet overnight runs |
 | **Audio loading** | `list()` full memory load | Streaming generator + LRU cache |
 | **Frame rate** | Inherit from source | Fixed **30 fps** output (prevents VFR desync) |
 | **Audio sample rate** | Variable | Fixed **44100 Hz** output |
 | **Concat method** | Concat demuxer (timestamp bugs) | Concat **filter** (frame-level, no drift) |
 | **Mixed resolutions** | Not handled | Auto-detect → scale/pad all to mode resolution |
-| **Clip overlap** | Possible audio bleed | Midpoint split between adjacent clips (detection + compile stages) |
+| **Clip overlap** | Possible audio bleed | Keep longer clip, discard shorter; compile never bridges gaps containing removed clips |
 | **Stereo input** | Left channel only | **50/50 L+R mix** |
-| **Re-verify** | None | DRC **+8dB**, threshold syncs to main, >0.80 skips P3 |
+| **Re-verify** | None | DRC **+8dB**, threshold syncs to main, >0.75 direct accept, argmax gate on mid-score hits |
+| **False positives** | None | Optional **Strict FP filter** (drop clips where burp isn't the top class); suspect clips pre-deselected in Review |
 | **Memory** | Unbounded | `-threads 2`, batched concat (6 files/batch), segment-by-segment encoding |
 
 ---
@@ -85,6 +87,8 @@ The app works fine on CPU, but NVIDIA GPU users can speed up inference by instal
 
 If CUDA isn't installed, the app falls back to CPU automatically.
 
+**Prefer silence over speed?** Uncheck **"Use GPU (CUDA)"** (next to the Process button) to run detection purely on CPU — slower, but your GPU stays quiet for overnight runs.
+
 ---
 
 ## 📖 Usage
@@ -103,7 +107,7 @@ Re-verify uses DRC (Dynamic Range Compression) to boost quiet sounds near detect
 
 - **DRC gain**: up to +8 dB (boosts quiet burps buried in music)
 - **Threshold**: automatically syncs to your main detection threshold (no mismatch)
-- **High-score skip**: DRC hits with confidence > 0.80 bypass P3 confirmation
+- **High-score skip**: DRC hits with confidence > 0.75 bypass P3 confirmation
 - **New/original**: DRC-discovered clips shown separately — no automatic boundary expansion
 - **Output**: `Verification: scanned X window(s), confirmed Y new, DRC-skip Z, rejected W.`
 

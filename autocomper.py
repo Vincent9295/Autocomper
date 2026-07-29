@@ -154,7 +154,8 @@ def _parse_timestamps_txt(txt_path):
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
                        focus_idx=58, threshold=0.30, ort_session=None,
-                       verify_block_size=10, direct_accept=0.75):
+                       verify_block_size=10, direct_accept=0.75,
+                       use_gpu=True):
     """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
 
     P0: 加简易 DRC 压缩（最多 +8dB），把被音乐盖住的 burp 拉回来
@@ -174,10 +175,14 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
         import onnxruntime as ort
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            ort_session = ort.InferenceSession(selected_model, sess_options,
-                                                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        except Exception:
+        if use_gpu:
+            try:
+                ort_session = ort.InferenceSession(selected_model, sess_options,
+                                                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            except Exception:
+                ort_session = ort.InferenceSession(selected_model, sess_options,
+                                                    providers=['CPUExecutionProvider'])
+        else:
             ort_session = ort.InferenceSession(selected_model, sess_options,
                                                 providers=['CPUExecutionProvider'])
     SAMPLE_RATE = 32000
@@ -1144,6 +1149,13 @@ class VideoProcessorApp:
             right_frame, text="Select Output File", width=34, command=self.select_output_location)
         self.output_location_button.pack(pady=(15, 2.5))
 
+        # CPU/GPU toggle (prominent placement for testers)
+        self.use_gpu = tk.BooleanVar(value=True)
+        self.use_gpu_checkbox = ttk.Checkbutton(
+            right_frame, text="Use GPU (CUDA)",
+            variable=self.use_gpu)
+        self.use_gpu_checkbox.pack()
+
         self.process_cancel_frame = ttk.Frame(right_frame)
         self.process_cancel_frame.pack()
 
@@ -1214,6 +1226,8 @@ class VideoProcessorApp:
             self.output_location_label, f"{self.output_video_path.get()}")
         cancel_tooltip = CustomHovertip(
             self.cancel_button, 'Cancel the current compilation process.')
+        gpu_tooltip = CustomHovertip(
+            self.use_gpu_checkbox, 'Run AI detection on your NVIDIA GPU (much faster).\nUncheck to run on CPU instead — slower, but keeps your GPU quiet and cool.\nHas no effect if you don\'t have CUDA set up.')
         timestamps_tooltip = CustomHovertip(
             self.txt_output_checkbox, 'Save the timestamps to a txt file (by default `timestamps.txt` in the output directory).\nYou can change the file name in settings.')
         padding_tooltip = CustomHovertip(
@@ -1261,6 +1275,7 @@ class VideoProcessorApp:
             self.focus_idx_entry,
             self.preset_combo,
             self.save_preset_btn,
+            self.use_gpu_checkbox,
         ]
         
         self.enable_while_processing = [
@@ -2249,7 +2264,8 @@ class VideoProcessorApp:
                             window=self.verify_window_var.get(),
                             focus_idx=focus_idx,
                             logger=self.final_bar,
-                            threshold=threshold * 0.6)
+                            threshold=threshold * 0.6,
+                            use_gpu=self.use_gpu.get())
                     # auto-deselect originals fully covered by new reverify clips
                     for entry in dict_list:
                         ts = entry.get('timestamps', [])
@@ -2303,7 +2319,8 @@ class VideoProcessorApp:
                     print(
                         f"{Fore.GREEN}[{i + 1}/{len(self.uploaded_videos)}]{Style.RESET_ALL} Getting timestamps for {os.path.basename(input_video_path)}")
                     timestamps, used_existing_data = get_timestamps(
-                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar)
+                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar,
+                        use_gpu=self.use_gpu.get())
                     timestamps = {'filename': timestamps['filename'],
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
                     if self.use_strict_fp.get():
@@ -2394,7 +2411,8 @@ class VideoProcessorApp:
                         window=self.verify_window_var.get(),
                         focus_idx=focus_idx,
                         logger=self.final_bar,
-                        threshold=threshold * 0.6)
+                        threshold=threshold * 0.6,
+                        use_gpu=self.use_gpu.get())
                 # auto-deselect originals fully covered by new reverify clips
                 for entry in dict_list:
                     ts = entry.get('timestamps', [])
