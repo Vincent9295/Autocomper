@@ -157,6 +157,24 @@ class CustomHovertip(Hovertip):
     def __init__(self, widget, text, delay=1000):
         super().__init__(widget, text, delay)
 
+    def showtip(self):
+        super().showtip()
+        self._keep_on_screen()
+
+    def _keep_on_screen(self):
+        tw = self.tipwindow
+        if not tw:
+            return
+        tw.update_idletasks()
+        w, h = tw.winfo_reqwidth(), tw.winfo_reqheight()
+        x, y = tw.winfo_x(), tw.winfo_y()
+        sw, sh = tw.winfo_screenwidth(), tw.winfo_screenheight()
+        if x + w > sw:
+            x = self.anchor_widget.winfo_rootx() - w - 2
+        if y + h > sh:
+            y = self.anchor_widget.winfo_rooty() - h - 2
+        tw.wm_geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
     def showcontents(self):
         label = ttk.Label(self.tipwindow, text=self.text, justify=LEFT,
                       background="#ffffe0", foreground="black", relief=SOLID, borderwidth=1)
