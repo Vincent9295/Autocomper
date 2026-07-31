@@ -5,6 +5,7 @@ import concurrent.futures
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -233,25 +234,44 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
         parts.append(f'{a_srcs}concat=n={n}:v=0:a=1,aresample=async=1:first_pts=0[outa]')
     filter_complex = ';'.join(parts)
 
-    cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2']
-    for fp in file_list:
-        cmd += ['-i', fp]
-    cmd += ['-filter_complex', filter_complex,
-            '-map', '[outv]', '-map', '[outa]'] + get_video_codec() + \
-           ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
-    if fps and fps > 0:
-        cmd += ['-r', str(int(fps))]
-    cmd += ['-vsync', 'cfr', '-shortest', output_file]
+    def build_cmd(codec):
+        c = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2']
+        for fp in file_list:
+            c += ['-i', fp]
+        c += ['-filter_complex', filter_complex,
+              '-map', '[outv]', '-map', '[outa]'] + codec + \
+             ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
+        if fps and fps > 0:
+            c += ['-r', str(int(fps))]
+        c += ['-vsync', 'cfr', '-shortest', output_file]
+        return c
 
-    # 验证所有输入文件有视频流
+    # 验证所有输入文件有视频流；顺带累加总时长用于动态超时
+    # （固定 1200s 会误杀多小时合集的健康编码）
+    total_dur = 0.0
     for i, fp in enumerate(file_list):
         if not os.path.exists(fp):
             raise Exception(f"FFmpeg concat: file {i} missing: {fp}")
-        sz = _get_video_size(fp)
-        if sz[0] is None:
+        probe = _ffprobe(fp)
+        if re.search(r'Stream #0:\d+.*Video:.*?(\d{2,})x(\d{2,})', probe) is None:
             raise Exception(f"FFmpeg concat: file {i} has no video stream: {fp}")
+        dm = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', probe)
+        if dm:
+            h, mi, s, ms = map(int, dm.groups())
+            total_dur += h * 3600 + mi * 60 + s + ms / 100
+    concat_timeout = max(1800, int(total_dur * 2) + 600)
 
-    result = run_tracked(cmd, timeout=1200, text=True)
+    video_codec = get_video_codec()
+    try:
+        result = run_tracked(build_cmd(video_codec), timeout=concat_timeout, text=True)
+    except subprocess.TimeoutExpired:
+        if 'h264_nvenc' not in video_codec:
+            raise
+        # NVENC 卡死（如睡眠唤醒后驱动死锁）：永久回退 x264 重试一次
+        result = None
+    if result is None or (result.returncode != 0 and 'h264_nvenc' in video_codec):
+        _fallback_to_x264()
+        result = run_tracked(build_cmd(list(_X264_CODEC)), timeout=concat_timeout, text=True)
     if result.returncode != 0:
         missing = [fp for fp in file_list if not os.path.exists(fp)]
         no_video = []
@@ -427,6 +447,16 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
                 excluded=None):
     output_format = ".mp4" if is_video else ".mp3"
+
+    # 清理上次崩溃/强杀残留的中间文件（只删我们自己的命名模式，不碰用户文件）
+    _out_dir = output if os.path.isdir(output) else os.path.dirname(output)
+    if _out_dir and os.path.isdir(_out_dir):
+        for _stale in os.listdir(_out_dir):
+            if re.fullmatch(r'(_batchL\d+_\d+|_seg\d+|_aseg\d+)\.(mp4|mp3)', _stale):
+                try:
+                    os.remove(os.path.join(_out_dir, _stale))
+                except OSError:
+                    pass
 
     if is_video:
         cut_func, concat_func = _ffmpeg_cut, _ffmpeg_concat

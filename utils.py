@@ -27,7 +27,13 @@ def run_tracked(cmd, timeout=None, text=False):
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         p.kill()
-        p.wait()
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            # 进程卡在驱动层调用（如睡眠唤醒后 NVENC 死锁）时 TerminateProcess
+            # 也杀不掉，wait 会永久挂起冻结整个 app。放弃僵尸进程照常报错，
+            # 让上层回退/重试，僵尸由 OS 自行回收。
+            print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
         raise
     finally:
         _ACTIVE_PROCS.discard(p)
