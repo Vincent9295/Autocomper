@@ -1,16 +1,44 @@
 import configparser
 import os
+import shutil
 import queue
 import re
 import shutil
 import sys
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-# Windows Store Python sandbox fix: add CUDA Toolkit bin to DLL search path
-_cuda_bin = r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin'
-if os.path.isdir(_cuda_bin) and hasattr(os, 'add_dll_directory'):
-    os.add_dll_directory(_cuda_bin)
+
+_DLL_DIRECTORY_HANDLES = []
+
+
+def runtime_lib_directory(executable=None, meipass=None, source_dir=None, frozen=False):
+    """Return the bundled lib directory for frozen or source execution."""
+    if meipass:
+        return Path(meipass) / "lib"
+    if frozen and executable:
+        return Path(executable).resolve().parent / "lib"
+    return Path(source_dir or Path(__file__).resolve().parent) / "lib"
+
+
+def _register_dll_directory(path):
+    if hasattr(os, "add_dll_directory") and os.path.isdir(path):
+        _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(path))
+
+
+if hasattr(os, "add_dll_directory"):
+    _register_dll_directory(runtime_lib_directory(
+        executable=sys.executable,
+        meipass=getattr(sys, "_MEIPASS", None),
+        frozen=bool(getattr(sys, "frozen", False)),
+    ))
+    # Windows Store Python sandbox fix: add CUDA Toolkit bin to DLL search path
+    _cuda_bin = r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin'
+    _register_dll_directory(_cuda_bin)
+
+import onnxruntime as ort
 
 import threading
 import tkinter as tk
@@ -25,15 +53,21 @@ from colorama import Fore, Style
 from kthread import KThread
 from PIL import Image, ImageTk
 from proglog import ProgressBarLogger
+from progress import ProgressWidgetAdapter, format_compile_progress, format_transfer_progress
 
-from compile import compile_vid, get_video_codec
+from compile import _get_video_duration, compile_vid, get_video_codec
 from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
-from sound_reader import get_timestamps
+from sound_reader import RemoteAudioIncompleteError, get_timestamps
+from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
+                           PlaylistDescriptor, PlaylistEntry, describe_input,
+                           expand_input, resolve_source, select_audio_candidate,
+                     stable_source_id, SourceResolveError,
+                     _audio_cache_format_identity)
+from remote_cache import CacheStore
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
-                   download_audio, download_video, get_bundle_filepath,
-                   get_number_of_vids_in_playlist, is_valid_yt_dlp_url,
-                   kill_tracked_procs, run_tracked)
+                     download_audio, download_video, get_bundle_filepath,
+                     kill_tracked_procs, run_tracked, run_tracked_progress)
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
 VIDEO_OUTPUT = [("Video Files", "*.mp4"), ("All Files", "*.*")]
@@ -45,8 +79,316 @@ DEFAULT_SETTINGS = {
     'download_path': "No location selected!",
     'max_quality': "No Limit",
     'max_download_speed': '0',
-    'output_text_path': "No file selected!"
+    'output_text_path': "No file selected!",
+    'remote_cache_path': str(CacheStore().root),
 }
+
+REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
+REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge")
+PLAYLIST_PAGE_SIZE = 30
+MAX_PLAYLIST_ENTRIES = 1000
+REMOTE_MODE_TOOLTIP_TEXT = (
+    "Remote Stream: read remote audio directly and fetch video only when needed.\n"
+    "Audio Cache: download compressed audio once, then detect from the local cache.\n"
+    "Full Download: use the complete remote-video download workflow."
+)
+REMOTE_BROWSER_COOKIES_TOOLTIP_TEXT = (
+    "Auto: try direct access first, then browser cookies when the site requires them.\n"
+    "None: never read browser cookies.\n"
+    "Firefox, Chrome, or Edge: read cookies from that browser. The browser must be\n"
+    "installed and logged in to the account that can access the remote media."
+)
+REMOTE_CACHE_TOOLTIP_TEXT = (
+    "Remote Stream, Audio Cache, reverify, and downloaded segment files are stored here.\n"
+    "Full Download does not necessarily use this cache. The cache can be cleared, but\n"
+    "the next run may need to download or detect the remote media again.\n\n"
+    "External audio files are not identified automatically from their contents.\n"
+    "To use one safely, it must be associated with the matching VOD source ID and\n"
+    "must cover the same VOD timeline. For Bilibili multi-part videos, each part\n"
+    "has its own source ID. Audio files stay local and are never uploaded."
+)
+EXTERNAL_AUDIO_TOOLTIP_TEXT = (
+    "Import audio downloaded separately for the selected Remote VOD.\n"
+    "Select exactly one YouTube, Twitch, or Bilibili URL in the main list first.\n"
+    "The audio must cover the same VOD timeline; AutoComper cannot identify its\n"
+    "source from audio content alone. Bilibili multi-part videos are imported\n"
+    "one part at a time. The file is converted to m4a and stays local."
+)
+
+
+def paginate_sources(sources, page_size=PLAYLIST_PAGE_SIZE):
+    """Split playlist sources into ordered pages, rejecting oversized playlists."""
+    if len(sources) > MAX_PLAYLIST_ENTRIES:
+        raise ValueError(f"Playlist contains more than {MAX_PLAYLIST_ENTRIES} entries")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    return [sources[index:index + page_size]
+            for index in range(0, len(sources), page_size)]
+
+
+def selected_sources(sources, selected_ids):
+    """Return selected sources in their original order."""
+    selected_ids = set(selected_ids)
+    return [source for source in sources if stable_source_id(source) in selected_ids]
+
+
+def selected_playlist_entries(descriptor, selected_ids, selected_order=None):
+    """Return confirmed playlist entries in descriptor or explicit order."""
+    selected_ids = set(selected_ids)
+    entries = {entry.entry_id: entry for entry in descriptor._entries}
+    if selected_order is not None:
+        return [entries[entry_id] for entry_id in selected_order
+                if entry_id in selected_ids and entry_id in entries]
+    return [entry for entry in descriptor._entries if entry.entry_id in selected_ids]
+
+
+def hydration_update_is_current(entry_id, page_index, generation, current_page,
+                                 current_generation, visible_entry_ids):
+    """Return whether a worker result may update the visible page."""
+    return (page_index == current_page and generation == current_generation
+            and entry_id in visible_entry_ids)
+
+
+def playlist_order_map(selected_order):
+    """Return one-based visible order numbers for selected playlist entries."""
+    return {entry_id: index for index, entry_id in enumerate(selected_order, 1)}
+
+
+def playlist_entry_display_date(entry):
+    """Return the best date label for a playlist entry without network access."""
+    upload_date = str(getattr(entry, "upload_date", "") or "")
+    if upload_date:
+        return upload_date
+    platform = str(getattr(entry, "platform", "") or "").casefold()
+    if "bilibili" in platform:
+        match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", str(getattr(entry, "title", "") or ""))
+        if match:
+            return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    return "Unknown"
+
+
+def playlist_tree_values(entry, selected_ids, selected_order):
+    """Build Tk-independent values for one playlist row."""
+    metadata = getattr(entry, "metadata", {}) or {}
+    part = playlist_entry_part_number(entry)
+    part_count = metadata.get("part_count")
+    if part is None:
+        part_label = "Unknown"
+    elif part_count is not None:
+        part_label = f"{part}/{part_count}"
+    else:
+        part_label = part
+    failed = bool(metadata.get("hydration_failed"))
+    display_date = "Unknown" if failed else playlist_entry_display_date(entry)
+    missing_metadata = (
+        entry.title == "Unknown"
+        or entry.duration is None
+        or display_date == "Unknown"
+    )
+    loading = bool(metadata.get("hydration_pending")) and missing_metadata and not failed
+    return (
+        playlist_order_map(selected_order).get(entry.entry_id, "")
+        if entry.entry_id in selected_ids else "",
+        "[x]" if entry.entry_id in selected_ids else "[ ]",
+        "Loading..." if loading else entry.title,
+        part_label,
+        format_playlist_duration(entry.duration),
+        display_date,
+        "Metadata failed" if failed else ("Loading..." if loading else "Ready"),
+    )
+
+
+def format_playlist_duration(duration):
+    """Format playlist seconds as an unbounded HH:MM:SS label."""
+    if duration is None:
+        return "Unknown"
+    try:
+        total = max(0, int(float(duration)))
+    except (TypeError, ValueError, OverflowError):
+        return "Unknown"
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def extract_part_number(title):
+    """Return a one-based part/episode number from a title, when recognizable."""
+    text = str(title or "")
+    patterns = (
+        r"第\s*(\d+)\s*(?:部分|集)",
+        r"\b[Pp]\s*0*(\d+)\b",
+        r"\bPart\s+0*(\d+)\b",
+        r"\b[Pp]\s*0*(\d+)\s*/\s*\d+\b",
+        r"\bPart\s+0*(\d+)\s*/\s*\d+\b",
+        r"第\s*(\d+)\s*/\s*\d+\s*部分",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def playlist_entry_part_number(entry):
+    """Return an entry part number from metadata, then from its title."""
+    metadata = getattr(entry, "metadata", {}) or {}
+    if metadata.get("part_number") is not None:
+        try:
+            return int(metadata["part_number"])
+        except (TypeError, ValueError):
+            pass
+    return extract_part_number(getattr(entry, "title", ""))
+
+
+def sort_playlist_entries(entries):
+    """Return entries sorted by group/date/title/part, preserving unknown-part index."""
+    def normalized_title(title):
+        text = str(title or "Unknown")
+        text = re.sub(r"第\s*\d+\s*(?:部分|集)", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b[Pp]\s*0*\d+\b", "", text)
+        text = re.sub(r"\bPart\s+0*\d+\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b0*\d+\s*/\s*\d+\b", "", text)
+        return " ".join(text.split()).casefold()
+
+    def key(entry):
+        metadata = getattr(entry, "metadata", {}) or {}
+        group = str(metadata.get("group") or metadata.get("series") or "").casefold()
+        date = str(getattr(entry, "upload_date", "") or "")
+        raw_title = str(getattr(entry, "title", "") or "Unknown")
+        title = normalized_title(raw_title)
+        part = playlist_entry_part_number(entry)
+        return (group, date, title, part is None, part if part is not None else entry.index, entry.index)
+
+    return sorted(entries, key=key)
+
+
+def resolve_playlist_entries(
+    entries,
+    selected_ids,
+    resolver=None,
+    expander=None,
+    browser_cookies=None,
+    failure_logger=None,
+    status_logger=None,
+    expansion_stats=None,
+):
+    """Resolve confirmed entries independently, keeping successful sources."""
+    resolver = resolver or resolve_source
+    expander = expander or expand_input
+    selected_ids = set(selected_ids)
+    sources = []
+    seen_source_ids = set()
+    expansion_stats = expansion_stats if expansion_stats is not None else {}
+    expansion_stats.setdefault("expanded_entries", 0)
+    expansion_stats.setdefault("expanded_parts", 0)
+
+    def add_source(source):
+        source_id = stable_source_id(source) if isinstance(source, MediaSource) else source
+        if source_id not in seen_source_ids:
+            seen_source_ids.add(source_id)
+            sources.append(source)
+
+    for entry in entries:
+        if entry.entry_id not in selected_ids:
+            continue
+        try:
+            add_source(resolver(entry.webpage_url, browser_cookies=browser_cookies))
+        except Exception as exc:
+            is_bilibili_playlist = (
+                isinstance(exc, SourceResolveError)
+                and "bilibili" in str(getattr(entry, "platform", "")).casefold()
+                and "source is a playlist" in str(exc).casefold()
+            )
+            if is_bilibili_playlist:
+                try:
+                    expanded = expander(
+                        entry.webpage_url, browser_cookies=browser_cookies
+                    )
+                    expansion_stats["expanded_entries"] += 1
+                    message = f"Expanded {entry.webpage_url} into {len(expanded)} parts"
+                    (status_logger or print)(message)
+                    source_count_before = len(sources)
+                    for source in expanded:
+                        add_source(source)
+                    expansion_stats["expanded_parts"] += len(sources) - source_count_before
+                    continue
+                except Exception as expansion_error:
+                    exc = expansion_error
+            message = f"Remote source failed ({entry.webpage_url}): {exc}"
+            (failure_logger or print)(message)
+    return sources
+
+
+def media_uploads_for_sources(sources, media_type="video"):
+    """Wrap selected remote sources without resolving or downloading media."""
+    return [MediaUpload(
+        source.display_name or source.source_url,
+        media_type,
+        True,
+        source.source_url,
+        source,
+    ) for source in sources]
+
+
+def format_cache_size(size: int) -> str:
+    """Format cache bytes for the compact settings display."""
+    value = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def cache_open_command(platform: str, path: str) -> list[str]:
+    """Return the non-Windows folder opener command for a platform."""
+    if platform == "darwin":
+        return ["open", path]
+    return ["xdg-open", path]
+
+
+def normalize_remote_settings(data):
+    """Return preset data with safe defaults for remote settings."""
+    normalized = dict(data)
+    mode = normalized.get("remote_mode", "Remote Stream")
+    cookies = normalized.get("remote_browser_cookies", "Auto")
+    normalized["remote_mode"] = mode if mode in REMOTE_MODES else "Remote Stream"
+    normalized["remote_browser_cookies"] = (
+        cookies if cookies in REMOTE_BROWSER_COOKIES else "Auto"
+    )
+    normalized.pop("remote_cache_size", None)
+    return normalized
+
+
+def select_remote_cache_store(current_store: CacheStore, selected_path) -> CacheStore:
+    """Return a validated store for a selected path, or the current store on cancel."""
+    if not selected_path:
+        return current_store
+    store = CacheStore(selected_path)
+    store.ensure_ready()
+    return store
+
+
+def restore_remote_cache_path(app, selected_path, warning_func=None) -> CacheStore:
+    """Apply a preset cache path without replacing the current store on failure."""
+    try:
+        store = select_remote_cache_store(app.remote_cache_store, selected_path)
+    except OSError as exc:
+        warning = f"Could not use preset remote cache folder:\n{exc}"
+        if warning_func is not None:
+            warning_func(warning)
+        else:
+            print(f"WARNING: {warning}")
+        return app.remote_cache_store
+
+    app.remote_cache_store = store
+    app.remote_cache_path.set(str(store.root))
+    return store
+
+
+def prepare_remote_cache_store(store: CacheStore) -> CacheStore:
+    """Validate the selected cache store once for a processing session."""
+    store.ensure_ready()
+    return store
 
 os.environ['FFMPEG_BINARY'] = FFMPEG_PATH
 
@@ -86,6 +428,305 @@ def _elide_middle(text: str, max_pixels: int, measure) -> str:
 _temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
 TEMP_DIR = _temp_dir_obj.name
 
+
+def ensure_temp_dir():
+    """Recreate the shared temporary root after a successful run cleans it."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+TEMP_CHILD_PREFIXES = ("remote-compile-", "reverify-", "preview-")
+
+
+def cleanup_temp_children(temp_root=None, prefixes=TEMP_CHILD_PREFIXES):
+    """Remove only application-owned temporary children below the session root."""
+    root = Path(temp_root or TEMP_DIR)
+    if not root.is_dir():
+        return
+    for child in root.iterdir():
+        if child.name.startswith(tuple(prefixes)):
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+
+
+def processing_uploads_for_batch(uploaded_videos, local_entries, remote_entries):
+    """Return resolved local and remote uploads in their original batch order."""
+    local_ids = {id(upload) for upload in local_entries}
+    remote_ids = {id(upload) for upload, _ in remote_entries}
+    return [upload for upload in uploaded_videos
+            if id(upload) in local_ids or id(upload) in remote_ids]
+
+
+def create_inference_session(selected_model, use_gpu=True):
+    """Create the one ONNX session shared by a processing batch."""
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if use_gpu:
+        try:
+            return ort.InferenceSession(
+                selected_model, sess_options,
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        except Exception:
+            return ort.InferenceSession(
+                selected_model, sess_options,
+                providers=['CPUExecutionProvider'])
+    return ort.InferenceSession(
+        selected_model, sess_options,
+        providers=['CPUExecutionProvider'])
+
+
+def log_shared_session_providers(shared_session, log_func=print):
+    """Report the providers actually selected by the shared ONNX session."""
+    providers = shared_session.get_providers()
+    label = "GPU (CUDA)" if "CUDAExecutionProvider" in providers else "CPU"
+    log_func(f"ONNX inference provider: {label}")
+
+
+def detection_block_size(remote_mode, user_block_size, is_remote=True):
+    """Return the configured block size for every processing mode."""
+    return user_block_size
+
+
+def get_source_display_name(value):
+    if isinstance(value, MediaSource):
+        return value.display_name or value.source_url or stable_source_id(value)
+    return os.path.basename(str(value))
+
+
+def get_source_persistence_name(value):
+    if isinstance(value, MediaSource):
+        return value.source_url or get_source_display_name(value)
+    return str(value)
+
+
+def _get_external_audio_codec(path):
+    result = run_tracked([
+        FFMPEG_PATH, "-hide_banner", "-i", str(path),
+    ], timeout=60, text=True)
+    output = (getattr(result, "stderr", "") or "") + (getattr(result, "stdout", "") or "")
+    match = re.search(r"Audio:\s*([^,\s]+)", output, flags=re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def source_key(value):
+    """Return a stable dictionary key for local paths and remote sources."""
+    if isinstance(value, MediaSource):
+        return stable_source_id(value)
+    return os.path.normcase(os.path.normpath(str(value)))
+
+
+def remote_mode_actions(mode):
+    """Return (resolve_sources, cache_audio, full_download) for a UI mode."""
+    return mode != "Full Download", mode == "Audio Cache", mode == "Full Download"
+
+
+def browser_cookie_setting_value(label):
+    """Convert the GUI browser-cookie label to the resolver setting."""
+    value = str(label or "Auto").strip().lower()
+    return None if value == "none" else value
+
+
+def remote_detection_input(upload, mode, audio_cache_paths):
+    """Select the detection input without changing the source used for compile."""
+    if not upload.get_is_url():
+        return upload.get_path()
+    source = upload.get_source()
+    if mode == "Audio Cache":
+        return audio_cache_paths[stable_source_id(source)]
+    if mode == "Remote Stream":
+        return source
+    return upload.get_path()
+
+
+def preserve_remote_result(result, source):
+    """Attach original remote identity after detection ran on cached audio."""
+    preserved = dict(result)
+    preserved["filename"] = source
+    preserved["source_url"] = source.source_url
+    preserved["source_metadata"] = {
+        "platform": source.platform,
+        "source_id": source.source_id,
+        "display_name": get_source_display_name(source),
+    }
+    return preserved
+
+
+def resolve_remote_uploads(
+    uploaded_videos,
+    resolver=None,
+    logger=None,
+    browser_cookies=None,
+):
+    """Resolve URL uploads without changing local uploads.
+
+    Returns local uploads and ``(upload, source)`` pairs. A bad URL is isolated
+    so the remaining batch can continue.
+    """
+    resolver = resolver or resolve_source
+    local_entries = []
+    remote_sources = []
+    remote_count = 0
+    for upload in uploaded_videos:
+        if not upload.get_is_url():
+            local_entries.append(upload)
+            continue
+        remote_count += 1
+        source = upload.get_source()
+        try:
+            if source is None:
+                source_url = upload.get_url() or upload.get_path()
+                if browser_cookies is None:
+                    source = resolver(source_url)
+                else:
+                    source = resolver(source_url, browser_cookies=browser_cookies)
+            upload.set_source(source)
+            upload.set_path(source.display_name or source.source_url)
+            remote_sources.append((upload, source))
+        except Exception as exc:
+            message = f"Remote source failed ({upload.get_url() or upload.get_path()}): {exc}"
+            (logger or print)(message)
+    if remote_count and not remote_sources and not local_entries:
+        raise RuntimeError("No remote sources could be resolved; see the preceding errors.")
+    return local_entries, remote_sources
+
+
+def select_remote_stream_audio(remote_entries, selector=None, logger=None):
+    """Prefer fast remote audio candidates without blocking detection on probe errors."""
+    selector = selector or select_audio_candidate
+    log = logger or print
+    for _, source in remote_entries:
+        try:
+            selected = selector(source, log_func=log)
+            if selected is not None:
+                log(
+                    f"Remote Stream audio selected: format_id={selected.get('format_id') or 'unknown'} "
+                    f"abr={selected.get('abr') or selected.get('tbr') or 'unknown'}"
+                )
+        except Exception as exc:
+            log(f"Remote Stream audio probe skipped: {type(exc).__name__}")
+
+
+def refresh_remote_source(source, browser_cookies=None):
+    """Resolve fresh stream URLs without logging signed URL or cookie details."""
+    refreshed = resolve_source(source.source_url, browser_cookies=browser_cookies)
+    if refreshed.platform in {"bilibili", "bilibiliweb"}:
+        try:
+            select_audio_candidate(refreshed, probe_duration=1, log_func=None)
+        except Exception:
+            pass
+    return refreshed
+
+
+def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
+                               selected_intervals=None, cache_store=None, padding=None,
+                               is_video=True, refresh_func=None, failures=None,
+                               progress_callback=None):
+    """Return compile-ready entries with padding normalized exactly once."""
+    selected_intervals = selected_intervals or {}
+    before, after = (padding or (0, 0))
+    before, after = float(before), float(after)
+    if before < 0 or after < 0:
+        raise ValueError("Clip padding cannot be negative!")
+    materialized = []
+    remote_video_total = sum(
+        1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
+    )
+    remote_video_index = 0
+    for entry_index, entry in enumerate(entries):
+        source = entry.get('filename')
+        if not isinstance(source, MediaSource):
+            if padding is None:
+                materialized.append(entry)
+            else:
+                local_entry = dict(entry)
+                local_entry['timestamps'] = [
+                    dict(ts, start=float(ts['start']) - before, end=float(ts['end']) + after)
+                    for ts in entry.get('timestamps', [])
+                ]
+                materialized.append(local_entry)
+            continue
+        remote_video_index += 1
+        identity = stable_source_id(source)
+        requested = selected_intervals.get(identity)
+        timestamps = entry.get('timestamps', [])
+        if requested is not None:
+            requested = {(round(start, 3), round(end, 3)) for start, end in requested}
+            timestamps = [ts for ts in timestamps
+                          if (round(ts['start'], 3), round(ts['end'], 3)) in requested]
+        for interval_index, ts in enumerate(timestamps):
+            start, end = float(ts['start']), float(ts['end'])
+            if progress_callback is not None:
+                progress_callback({
+                    "kind": "start",
+                    "video": remote_video_index,
+                    "videos_total": remote_video_total,
+                    "clip": interval_index + 1,
+                    "clips_total": len(timestamps),
+                    "start": start,
+                    "end": end,
+                    "elapsed": 0.0,
+                    "name": get_source_display_name(source),
+                })
+            extension = "mp4" if is_video else "m4a"
+            output = os.path.join(
+                str(temp_dir), f"remote_{entry_index}_{interval_index}_"
+                f"{stable_source_id(source).replace(':', '_')}.{extension}")
+            try:
+                fetch_kwargs = {}
+                if padding is not None:
+                    fetch_kwargs.update(padding_before=before, padding_after=after)
+                if not is_video:
+                    fetch_kwargs["audio_only"] = True
+                if refresh_func is not None:
+                    fetch_kwargs["refresh_func"] = refresh_func
+                if cache_store is None:
+                    fetched = fetcher(source, start, end, output, **fetch_kwargs)
+                else:
+                    fetched = fetcher(source, start, end, output, cache_store=cache_store,
+                                      **fetch_kwargs)
+            except Exception as exc:
+                message = (
+                    f"Could not fetch {get_source_display_name(source)} "
+                    f"interval {start:g}-{end:g}: {exc}"
+                )
+                if failures is None:
+                    raise RuntimeError(message) from exc
+                failures.append(message)
+                try:
+                    os.remove(output)
+                except OSError:
+                    pass
+                continue
+            if progress_callback is not None:
+                progress_callback({
+                    "kind": "complete",
+                    "video": remote_video_index,
+                    "videos_total": remote_video_total,
+                    "clip": interval_index + 1,
+                    "clips_total": len(timestamps),
+                    "start": start,
+                    "end": end,
+                    "elapsed": 0.0,
+                    "name": get_source_display_name(source),
+                })
+            duration = (end + after) - max(0.0, start - before)
+            materialized.append({
+                'filename': str(fetched),
+                'timestamps': [{'start': 0.0, 'end': duration, 'pred': ts.get('pred', 0)}],
+                'source_url': source.source_url,
+                'source_metadata': {
+                    'platform': source.platform,
+                    'source_id': source.source_id,
+                    'display_name': source.display_name or source.source_url,
+                    'materialized_remote_segment': True,
+                },
+            })
+    return materialized
+
 def convert_seconds_to_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -106,7 +747,7 @@ def _save_selected_txt(dict_list, txt_path):
         selected_path = txt_path.rsplit('.', 1)[0] + '_selected.txt'
         with open(selected_path, 'w', encoding='utf-8') as f:
             for entry in dict_list:
-                f.write(f"{entry['filename']}\n")
+                f.write(f"{get_source_persistence_name(entry['filename'])}\n")
                 for ts in entry['timestamps']:
                     s = convert_seconds_to_timestamp(ts['start'])
                     e = convert_seconds_to_timestamp(ts['end'])
@@ -151,192 +792,242 @@ def _parse_timestamps_txt(txt_path):
 
 
 
+def _scan_reverify_audio(raw, scan_windows, precision, focus_idx, threshold,
+                         ort_session, verify_block_size, direct_accept,
+                         logger=None, timestamp_offset=0):
+    """Scan PCM samples and return accepted new timestamps."""
+    import numpy as _np
+    from sound_reader import compute_timestamps as _compute_ts
+
+    sample_rate = 32000
+    checked = dskip = confirmed = rejected = 0
+    if logger:
+        windows_iter = proglog.default_bar_logger(logger).iter_bar(block=scan_windows)
+    else:
+        windows_iter = scan_windows
+    found = []
+    for ws, we in windows_iter:
+        checked += 1
+        si = max(0, int(ws * sample_rate))
+        ei = min(len(raw), int(we * sample_rate))
+        if ei - si < sample_rate:
+            continue
+        slice_audio = raw[si:ei].astype(_np.float32) / 32767.0
+        frame_count = sample_rate * verify_block_size
+        if len(slice_audio) < frame_count:
+            continue
+        num_blocks = len(slice_audio) // frame_count
+        blocks = slice_audio[:num_blocks * frame_count].reshape(num_blocks, frame_count)
+        for b_idx in range(num_blocks):
+            block = blocks[b_idx]
+            rms = _np.sqrt(_np.mean(block ** 2))
+            if rms > 0.005:
+                block = block.copy() * min(2.5, 0.25 / rms)
+            preds = ort_session.run(["output"], {
+                "input": block.reshape(1, -1).astype(_np.float32)
+            })[0]
+            block_offset = b_idx * verify_block_size + timestamp_offset
+            for ts in _compute_ts(preds[0], precision, threshold, focus_idx, block_offset):
+                if ts['pred'] > direct_accept:
+                    ts['source'] = 'new'
+                    found.append(ts)
+                    dskip += 1
+                elif not ts['suspect']:
+                    ts['source'] = 'new'
+                    found.append(ts)
+                    confirmed += 1
+                else:
+                    rejected += 1
+    return found, checked, dskip, confirmed, rejected
+
+
+def _merge_reverify_timestamps(timestamps):
+    def merge_group(group):
+        if not group:
+            return []
+        group.sort(key=lambda item: item['start'])
+        merged = [group[0]]
+        for ts in group[1:]:
+            if ts['start'] <= merged[-1]['end'] + 2.0:
+                merged[-1]['end'] = max(merged[-1]['end'], ts['end'])
+                merged[-1]['pred'] = max(merged[-1]['pred'], ts['pred'])
+            else:
+                merged.append(ts)
+        return merged
+
+    originals = merge_group([t for t in timestamps if t.get('source') == 'original'])
+    news = merge_group([t for t in timestamps if t.get('source') == 'new'])
+    result = originals + news
+    result.sort(key=lambda item: item['start'])
+    for i in range(len(result) - 2, -1, -1):
+        if result[i]['end'] > result[i + 1]['start']:
+            duration_i = result[i]['end'] - result[i]['start']
+            duration_j = result[i + 1]['end'] - result[i + 1]['start']
+            result.pop(i + 1 if duration_i >= duration_j else i)
+    return [t for t in result if t['end'] - t['start'] > 0.5]
+
+
+def _read_wav_pcm(path):
+    import wave
+    import numpy as _np
+
+    with wave.open(str(path), 'rb') as audio:
+        channels = audio.getnchannels()
+        width = audio.getsampwidth()
+        if width != 2:
+            raise ValueError(f"remote reverify requires 16-bit WAV, got {width * 8}-bit")
+        samples = _np.frombuffer(audio.readframes(audio.getnframes()), dtype=_np.int16)
+    if channels > 1:
+        samples = samples[:len(samples) - (len(samples) % channels)]
+        samples = samples.reshape(-1, channels).mean(axis=1).astype(_np.int16)
+    return samples
+
+
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
                        focus_idx=58, threshold=0.30, ort_session=None,
                        verify_block_size=10, direct_accept=0.75,
-                       use_gpu=True):
-    """对每个已检测片段周围 N 秒做低阈值重扫描，补充漏掉的声音片段。
-
-    P0: 加简易 DRC 压缩（最多 +8dB），把被音乐盖住的 burp 拉回来
-    P1: 每文件提取完整音频一次（消除 N 次 FFmpeg 调用的磁盘 I/O）
-    P3: 双阈值：>direct_accept 直收；中段分数须过 argmax 门——
-        burp 必须是 527 类预测向量的最高分。怪声音（尖叫/说话/唱歌）
-        在 burp 中等分时通常有竞争类更高，被否决；小声真 burp 仍为 argmax，保留。
-    新片段标记 source='new'，原始片段标记 source='original'。
-    """
+                       use_gpu=True, cache_store=None, refresh_func=None,
+                       audio_cache_paths=None):
+    """Reverify local files and remote sources without downloading remote video."""
     if not dict_list:
         return dict_list
-
-    import numpy as _np
-    from sound_reader import compute_timestamps as _compute_ts
+    ensure_temp_dir()
 
     if ort_session is None:
         import onnxruntime as ort
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if use_gpu:
-            try:
-                ort_session = ort.InferenceSession(selected_model, sess_options,
-                                                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            except Exception:
-                ort_session = ort.InferenceSession(selected_model, sess_options,
-                                                    providers=['CPUExecutionProvider'])
-        else:
-            ort_session = ort.InferenceSession(selected_model, sess_options,
-                                                providers=['CPUExecutionProvider'])
-    SAMPLE_RATE = 32000
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_gpu else ['CPUExecutionProvider']
+        try:
+            ort_session = ort.InferenceSession(selected_model, sess_options, providers=providers)
+        except Exception:
+            ort_session = ort.InferenceSession(selected_model, sess_options, providers=['CPUExecutionProvider'])
 
-    checked = 0
-    dskip = confirmed = rejected = 0
-
+    sample_rate = 32000
+    checked = dskip = confirmed = rejected = 0
     for entry in dict_list:
         filename = entry['filename']
-        original_ts = entry['timestamps']
+        cached_audio = None
+        if isinstance(filename, MediaSource) and audio_cache_paths:
+            cached_audio = audio_cache_paths.get(stable_source_id(filename))
+            if cached_audio is not None and not Path(cached_audio).is_file():
+                cached_audio = None
+        scan_filename = cached_audio or filename
+        original_ts = entry.get('timestamps', [])
         if not original_ts:
             continue
-
         for ts in original_ts:
             ts.setdefault('source', 'original')
 
-        # --- P1: 提取完整音频一次 --------------------------------------------------
-        full_audio = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
-        full_audio.close()
         try:
-            extract_cmd = [
-                os.environ.get('FFMPEG_BINARY', 'ffmpeg'),
-                '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', filename,
-                '-vn', '-f', 's16le', '-acodec', 'pcm_s16le',
-                '-ar', str(SAMPLE_RATE), '-ac', '1',
-                full_audio.name
-            ]
-            run_tracked(extract_cmd)
-
-            # memmap：12h 流全文 PCM 有 2.7GB，读进 RAM 再转 float32 峰值 ~14GB 会卡死机
-            # 改用内存映射，只把命中的扫描窗口转 float32（窗口级 ~10MB）
-            if os.path.getsize(full_audio.name) == 0:
-                continue
-            raw = _np.memmap(full_audio.name, dtype=_np.int16, mode='r')
-            if len(raw) == 0:
-                continue
-
-            # --- P2: 自适应扫描窗口 （确保不超出音频边界） ---------------
-            max_dur = len(raw) / SAMPLE_RATE
-            scan_windows = []
-            for ts in original_ts:
-                ws = max(0, ts['start'] - window)
-                we = min(ts['end'] + window, max_dur - 0.1)  # 不超出音频末端
-                if we <= ws:
-                    continue
-                if scan_windows and ws <= scan_windows[-1][1] + 1:
-                    scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
-                else:
-                    scan_windows.append((ws, we))
-
-            # --- P0 + P3: 逐窗口 DRC 扫描 + 双阈值确认 ----------------------------
-            merged_timestamps = list(original_ts)
-            _bar = None
-            if logger:
-                _bar = proglog.default_bar_logger(logger)
-                _windows_iter = _bar.iter_bar(block=scan_windows)
-            else:
-                _windows_iter = scan_windows
-            for ws, we in _windows_iter:
-                checked += 1
-                if we <= ws:
-                    continue
-                si = max(0, int(ws * SAMPLE_RATE))
-                ei = min(len(raw), int(we * SAMPLE_RATE))
-                if ei - si < SAMPLE_RATE:
-                    continue
-
-                slice_audio = raw[si:ei].astype(_np.float32) / 32767.0
-                total_samples = len(slice_audio)
-                frame_count = SAMPLE_RATE * verify_block_size
-                if total_samples < frame_count:
-                    continue
-
-                # P0: 简易 DRC — 按块做增益缩放（不引入伪影的轻量压缩）
-                num_blocks = total_samples // frame_count
-                slice_audio = slice_audio[:num_blocks * frame_count]
-                blocks = slice_audio.reshape(num_blocks, frame_count)
-                for b_idx in range(num_blocks):
-                    block = blocks[b_idx]
-                    rms = _np.sqrt(_np.mean(block ** 2))
-                    if rms > 0.005:  # 避免静默块 blow up
-                        gain = min(2.5, 0.25 / rms)  # 最多 +8dB 增益
-                        block = block.copy() * gain
-                    block = block.reshape(1, -1).astype(_np.float32)
-                    preds = ort_session.run(["output"], {"input": block})[0]
-                    block_offset = b_idx * verify_block_size + ws
-                    # P3: 双阈值 — >direct_accept 直收；中段分数须非 suspect
-                    # （argmax 门在 compute_timestamps 内统一计算：burp 必须是
-                    # 命中峰值帧上 527 类的最高分，否则否决）。
-                    for ts in _compute_ts(preds[0], precision, threshold, focus_idx, block_offset):
-                        if ts['pred'] > direct_accept:
-                            ts['source'] = 'new'
-                            merged_timestamps.append(ts)
-                            dskip += 1
-                        elif not ts['suspect']:
-                            ts['source'] = 'new'
-                            merged_timestamps.append(ts)
-                            confirmed += 1
-                        else:
-                            rejected += 1
-
-            # --- 合并：new 片段独立，同类合并 -----------------------------
-            def _merge_ts(timestamps):
-                if not timestamps:
-                    return []
-                timestamps.sort(key=lambda x: x['start'])
-                deduped = [timestamps[0]]
-                for ts in timestamps[1:]:
-                    if ts['start'] <= deduped[-1]['end'] + 2.0:
-                        deduped[-1]['end'] = max(deduped[-1]['end'], ts['end'])
-                        deduped[-1]['pred'] = max(deduped[-1]['pred'], ts['pred'])
+            if isinstance(filename, MediaSource) and cached_audio is None:
+                if not filename.audio_url:
+                    raise ValueError("MediaSource has no audio_url")
+                scan_windows = []
+                for ts in original_ts:
+                    ws = max(0.0, float(ts['start']) - window)
+                    we = float(ts['end']) + window
+                    if filename.duration is not None:
+                        we = min(we, float(filename.duration))
+                    if we <= ws:
+                        continue
+                    if scan_windows and ws <= scan_windows[-1][1] + 1:
+                        scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
                     else:
-                        deduped.append(ts)
-                return deduped
+                        scan_windows.append((ws, we))
 
-            originals = [t for t in merged_timestamps if t.get('source') == 'original']
-            news = [t for t in merged_timestamps if t.get('source') == 'new']
-            entry['timestamps'] = _merge_ts(originals) + _merge_ts(news)
+                new_timestamps = []
+                for ws, we in scan_windows:
+                    temporary = tempfile.NamedTemporaryFile(
+                        suffix='.wav', prefix='reverify-', dir=TEMP_DIR, delete=False)
+                    temporary.close()
+                    try:
+                        audio_path = fetch_segment(
+                            filename, ws, we, temporary.name,
+                            cache_store=cache_store, audio_only=True, codec='pcm_s16le',
+                            refresh_func=refresh_func, logger=print)
+                        raw = _read_wav_pcm(audio_path)
+                        duration = len(raw) / sample_rate
+                        found, scans, skipped, accepted, refused = _scan_reverify_audio(
+                            raw, [(0.0, duration)], precision, focus_idx, threshold,
+                            ort_session, verify_block_size, direct_accept, logger)
+                        for ts in found:
+                            ts['start'] += ws
+                            ts['end'] += ws
+                        new_timestamps.extend(found)
+                        checked += scans
+                        dskip += skipped
+                        confirmed += accepted
+                        rejected += refused
+                    finally:
+                        try:
+                            os.remove(temporary.name)
+                        except OSError:
+                            pass
+                entry['timestamps'] = _merge_reverify_timestamps(original_ts + new_timestamps)
+                continue
 
-            # --- 修剪所有 clip 的重叠 --------------------
-            if len(entry['timestamps']) > 1:
-                deduped = entry['timestamps']
-                deduped.sort(key=lambda x: x['start'])
-                for i in range(len(deduped) - 2, -1, -1):
-                    if deduped[i]['end'] > deduped[i + 1]['start']:
-                        # 重叠：保留更长的 clip，去掉短的
-                        dur_i = deduped[i]['end'] - deduped[i]['start']
-                        dur_j = deduped[i + 1]['end'] - deduped[i + 1]['start']
-                        if dur_i >= dur_j:
-                            deduped.pop(i + 1)
-                        else:
-                            deduped.pop(i)
-
-            # 过滤过短 clip（必须在 overlap trim 之后）
-            entry['timestamps'] = [t for t in entry['timestamps'] if t['end'] - t['start'] > 0.5]
-
-        except Exception as e:
-            print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {e}")
-        finally:
-            # memmap 持有文件句柄，Windows 下须先释放才能删临时文件
+            full_audio = tempfile.NamedTemporaryFile(
+                suffix='.pcm', prefix='reverify-', dir=TEMP_DIR, delete=False)
+            full_audio.close()
             try:
-                del raw
-            except Exception:
-                pass
-            try:
-                os.remove(full_audio.name)
-            except Exception:
-                pass
+                extract_cmd = [
+                    os.environ.get('FFMPEG_BINARY', 'ffmpeg'), '-y', '-hide_banner', '-loglevel', 'error',
+                    '-i', str(scan_filename), '-vn', '-f', 's16le', '-acodec', 'pcm_s16le',
+                    '-ar', str(sample_rate), '-ac', '1', full_audio.name]
+                run_tracked(extract_cmd)
+                if os.path.getsize(full_audio.name) == 0:
+                    continue
+                raw = __import__('numpy').memmap(full_audio.name, dtype='int16', mode='r')
+                if len(raw) == 0:
+                    continue
+                max_dur = len(raw) / sample_rate
+                scan_windows = []
+                for ts in original_ts:
+                    ws = max(0, ts['start'] - window)
+                    we = min(ts['end'] + window, max_dur - 0.1)
+                    if we <= ws:
+                        continue
+                    if scan_windows and ws <= scan_windows[-1][1] + 1:
+                        scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
+                    else:
+                        scan_windows.append((ws, we))
+                new_timestamps = []
+                for ws, we in scan_windows:
+                    found, scans, skipped, accepted, refused = _scan_reverify_audio(
+                        raw, [(ws, we)], precision, focus_idx, threshold,
+                        ort_session, verify_block_size, direct_accept, logger,
+                        timestamp_offset=ws)
+                    new_timestamps.extend(found)
+                    checked += scans
+                    dskip += skipped
+                    confirmed += accepted
+                    rejected += refused
+                entry['timestamps'] = _merge_reverify_timestamps(original_ts + new_timestamps)
+                if cached_audio is not None:
+                    preserved = preserve_remote_result(entry, filename)
+                    entry.clear()
+                    entry.update(preserved)
+            finally:
+                try:
+                    del raw
+                except (NameError, UnboundLocalError):
+                    pass
+                try:
+                    os.remove(full_audio.name)
+                except OSError:
+                    pass
+        except Exception as exc:
+            if isinstance(filename, MediaSource):
+                print(f"{Fore.YELLOW}  Verify scan failed for remote source "
+                      f"{get_source_display_name(filename)}: {exc}")
+            else:
+                print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {exc}")
 
     if checked > 0:
         print(f"{Fore.CYAN}Verification: scanned {checked} window(s), "
               f"confirmed {confirmed} new, DRC-skip {dskip}, rejected {rejected}.")
-
     return dict_list
 
 
@@ -394,18 +1085,29 @@ def _smart_sort_key(filepath):
     return (fkey, 2, tuple(int(p) if p.isdigit() else p.lower() for p in parts))
 
 
+def preview_playable_path(fetch_result, fallback_path):
+    """Return the fetched preview path, or the generated fallback path."""
+    if fetch_result is None:
+        return str(fallback_path)
+    if os.fspath(fetch_result) == os.fspath(fallback_path):
+        return str(fallback_path)
+    return str(fetch_result)
+
+
 class ReviewDialog:
     """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消。"""
 
     def __init__(self, parent, dict_list, padding, output_path,
-                 use_verify=False, txt_path=None):
+                 use_verify=False, txt_path=None, cache_store=None):
         self.parent = parent
         self.dict_list = dict_list
         self.padding = padding or (0, 0)
         self.output_path = output_path
         self.txt_path = txt_path
+        self.cache_store = cache_store or CacheStore()
         self.result = None
         self.checks = []
+        self._preview_paths = []
 
         self.flat = []
         for entry in dict_list:
@@ -480,7 +1182,7 @@ class ReviewDialog:
             self.checks.append(cv)
             s_str = self._fmt(f['start'])
             e_str = self._fmt(f['end'])
-            bn = os.path.basename(f['filename'])
+            bn = get_source_display_name(f['filename'])
             if suspect:
                 st = 'Suspect'
             else:
@@ -640,10 +1342,40 @@ class ReviewDialog:
         bf, af = self.padding
         ss = max(0, f['start'] - bf)
         dur = (f['end'] + af) - ss
+        self._preview_paths = getattr(self, '_preview_paths', [])
+        tmp_path = None
         try:
             suf = '.mp4' if video else '.wav'
-            tmp = tempfile.NamedTemporaryFile(suffix=suf, delete=False)
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=suf, prefix='preview-', dir=TEMP_DIR, delete=False)
             tmp.close()
+            tmp_path = tmp.name
+            if isinstance(f['filename'], MediaSource):
+                cache_store = getattr(self, 'cache_store', None) or CacheStore()
+                fetch_result = fetch_segment(
+                    f['filename'], ss, ss + dur, tmp.name,
+                    cache_store=cache_store, allow_covering_cache=False,
+                    audio_only=not video,
+                    codec='pcm_s16le' if not video else None,
+                    refresh_func=lambda source: refresh_remote_source(
+                        source,
+                        browser_cookies=browser_cookie_setting_value(
+                            self.remote_browser_cookies.get()
+                        ),
+                    ),
+                    logger=print)
+                playable = preview_playable_path(fetch_result, tmp.name)
+                if sys.platform == 'win32':
+                    os.startfile(playable)
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', playable])
+                else:
+                    subprocess.Popen(['xdg-open', playable])
+                if playable == tmp.name:
+                    getattr(self, '_preview_paths', []).append(tmp.name)
+                else:
+                    Path(tmp.name).unlink(missing_ok=True)
+                return
             ff = os.environ.get('FFMPEG_BINARY', 'ffmpeg')
             if video:
                 cmd = ([ff, '-y', '-hide_banner', '-loglevel', 'error',
@@ -662,8 +1394,19 @@ class ReviewDialog:
                 subprocess.Popen(['open', tmp.name])
             else:
                 subprocess.Popen(['xdg-open', tmp.name])
+            getattr(self, '_preview_paths', []).append(tmp.name)
         except Exception as e:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
             print(f"{Fore.YELLOW}Preview failed: {e}")
+
+    def cleanup_preview_files(self):
+        for path in getattr(self, '_preview_paths', []):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._preview_paths = []
 
     def _sel_all(self):
         for i, cv in enumerate(self.checks):
@@ -700,6 +1443,13 @@ class ReviewDialog:
                         break
             if kept:
                 result.append({'filename': fn, 'timestamps': kept})
+                if isinstance(fn, MediaSource):
+                    result[-1]['source_url'] = fn.source_url
+                    result[-1]['source_metadata'] = {
+                        'platform': fn.platform,
+                        'source_id': fn.source_id,
+                        'display_name': get_source_display_name(fn),
+                    }
         self.result = result
 
         # 保存勾选的 timestamps 到 _selected.txt
@@ -707,7 +1457,7 @@ class ReviewDialog:
             selected_path = self.txt_path.rsplit('.txt', 1)[0] + '_selected.txt'
             lines = []
             for entry in result:
-                lines.append(entry['filename'])
+                lines.append(get_source_persistence_name(entry['filename']))
                 for ts in entry['timestamps']:
                     s = ts['start']
                     e = ts['end']
@@ -720,10 +1470,12 @@ class ReviewDialog:
                     f.write('\n'.join(lines))
                 print(f"{Fore.GREEN}Saved selected timestamps to {selected_path}")
 
+        self.cleanup_preview_files()
         self.win.destroy()
 
     def _on_cancel(self):
         self.result = None
+        self.cleanup_preview_files()
         self.win.destroy()
 
 
@@ -735,17 +1487,18 @@ class VideoProcessorApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # Set initial window size
-        self.root.geometry('1000x800')
+        self.root.geometry('1150x800')
 
         # Enforce minimum window size
         self.root.resizable(True, True)
         
-        self.root.wm_minsize(875, 675)
+        self.root.wm_minsize(1050, 760)
 
         # Create a grid layout
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=3)
-        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_columnconfigure(1, weight=0)
+        self.root.grid_columnconfigure(2, weight=0, minsize=400)
 
         # Left Column Widgets
         self.left_frame = ttk.Frame(root)
@@ -783,6 +1536,21 @@ class VideoProcessorApp:
         self.merge_clips = tk.BooleanVar(value=True)
         self.combine_vids = tk.BooleanVar(value=True)
         self.normalize_audio = tk.BooleanVar()
+        self.remote_mode = tk.StringVar(value="Remote Stream")
+        self.remote_browser_cookies = tk.StringVar(value="Auto")
+        configured_cache_path = self.preferences.get(
+            "Settings", "remote_cache_path", fallback=str(CacheStore().root))
+        self.remote_cache_store = CacheStore(configured_cache_path)
+        try:
+            self.remote_cache_store.ensure_ready()
+        except OSError as exc:
+            messagebox.showwarning(
+                "Remote Cache",
+                f"Saved remote cache location is unavailable:\n{exc}\n\nUsing the default cache location.")
+            self.remote_cache_store = CacheStore()
+            self.remote_cache_store.ensure_ready()
+        self.remote_cache_path = tk.StringVar(value=str(self.remote_cache_store.root))
+        self.remote_cache_size = tk.StringVar()
 
         self.keep_downloaded_vids = tk.BooleanVar(value=False)
         self.download_video_path = tk.StringVar()
@@ -939,7 +1707,102 @@ class VideoProcessorApp:
         ttk.Separator(self.left_frame, orient="horizontal").pack(
             fill=tk.X, pady=15)
 
-        self.text_options_frame = ttk.Frame(self.left_frame)
+        self.options_viewport = ttk.Frame(self.left_frame)
+        self.options_viewport.pack(fill=tk.BOTH, expand=True)
+        self.options_canvas = tk.Canvas(
+            self.options_viewport, highlightthickness=0, borderwidth=0)
+        self.options_scrollbar = ttk.Scrollbar(
+            self.options_viewport, orient=tk.VERTICAL,
+            command=self.options_canvas.yview)
+        self.options_canvas.configure(
+            yscrollcommand=self.options_scrollbar.set)
+        self.options_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.options_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.options_row = ttk.Frame(self.options_canvas)
+        self.options_canvas_window = self.options_canvas.create_window(
+            (0, 0), window=self.options_row, anchor="nw")
+
+        def update_options_scrollregion(event=None):
+            self.options_canvas.configure(
+                scrollregion=self.options_canvas.bbox("all"))
+
+        def resize_options_window(event):
+            self.options_canvas.itemconfigure(
+                self.options_canvas_window, width=event.width)
+            update_options_scrollregion()
+
+        self.options_row.bind("<Configure>", update_options_scrollregion)
+        self.options_canvas.bind("<Configure>", resize_options_window)
+        self.options_row.grid_columnconfigure(0, weight=1)
+        self.options_row.grid_columnconfigure(1, weight=1)
+        self.options_row.grid_columnconfigure(2, weight=1)
+        self.options_row.grid_rowconfigure(0, weight=1)
+
+        self.remote_settings_frame = ttk.LabelFrame(self.options_row, text="Remote Settings")
+        self.remote_settings_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(10, 8))
+
+        ttk.Label(self.remote_settings_frame, text="Remote Processing:").pack()
+        self.remote_mode_dropdown = ttk.Combobox(
+            self.remote_settings_frame, textvariable=self.remote_mode,
+            values=["Remote Stream", "Audio Cache", "Full Download"],
+            state="readonly", width=27)
+        self.remote_mode_dropdown.pack(pady=(0, 8))
+
+        ttk.Label(self.remote_settings_frame, text="Remote Browser Cookies:").pack()
+        self.remote_browser_cookies_dropdown = ttk.Combobox(
+            self.remote_settings_frame,
+            textvariable=self.remote_browser_cookies,
+            values=["Auto", "None", "Firefox", "Chrome", "Edge"],
+            state="readonly",
+            width=27,
+        )
+        self.remote_browser_cookies_dropdown.pack(pady=(0, 8))
+        self.remote_mode_tooltip = CustomHovertip(
+            self.remote_mode_dropdown, REMOTE_MODE_TOOLTIP_TEXT
+        )
+        self.remote_browser_cookies_tooltip = CustomHovertip(
+            self.remote_browser_cookies_dropdown, REMOTE_BROWSER_COOKIES_TOOLTIP_TEXT
+        )
+
+        self.remote_cache_frame = ttk.LabelFrame(self.remote_settings_frame, text="Remote Cache")
+        self.remote_cache_frame.pack(fill=tk.X, padx=4, pady=(0, 8))
+        ttk.Label(self.remote_cache_frame, text="Cache Location:").pack(anchor="w", padx=6, pady=(5, 0))
+        self.remote_cache_path_entry = ttk.Entry(
+            self.remote_cache_frame, textvariable=self.remote_cache_path,
+            state="readonly", width=32)
+        self.remote_cache_path_entry.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(
+            self.remote_cache_frame, textvariable=self.remote_cache_size).pack(
+                anchor="w", padx=6, pady=(0, 4))
+        remote_cache_buttons = ttk.Frame(self.remote_cache_frame)
+        remote_cache_buttons.pack(fill=tk.X, pady=(0, 6))
+        remote_cache_first_row = ttk.Frame(remote_cache_buttons)
+        remote_cache_first_row.pack()
+        self.remote_cache_choose_button = ttk.Button(
+            remote_cache_first_row, text="Choose Cache Folder", command=self.choose_remote_cache)
+        self.remote_cache_choose_button.pack(side=tk.LEFT, padx=2)
+        self.remote_cache_open_button = ttk.Button(
+            remote_cache_first_row, text="Open Cache Folder", command=self.open_remote_cache)
+        self.remote_cache_open_button.pack(side=tk.LEFT, padx=2)
+        remote_cache_import_row = ttk.Frame(remote_cache_buttons)
+        remote_cache_import_row.pack()
+        self.import_external_audio_button = ttk.Button(
+            remote_cache_import_row, text="Import External Audio",
+            command=self.import_external_audio)
+        self.import_external_audio_button.pack(padx=2)
+        self.external_audio_tooltip = CustomHovertip(
+            self.import_external_audio_button, EXTERNAL_AUDIO_TOOLTIP_TEXT)
+        remote_cache_clear_row = ttk.Frame(remote_cache_buttons)
+        remote_cache_clear_row.pack()
+        self.remote_cache_clear_button = ttk.Button(
+            remote_cache_clear_row, text="Clear Cache", command=self.clear_remote_cache)
+        self.remote_cache_clear_button.pack(padx=2)
+        self.remote_cache_tooltip = CustomHovertip(
+            self.remote_cache_frame, REMOTE_CACHE_TOOLTIP_TEXT)
+        self.refresh_remote_cache_size()
+
+        self.text_options_frame = ttk.Frame(self.options_row)
+        self.text_options_frame.grid(row=0, column=1, sticky="nsew", padx=4, pady=(10, 8))
 
         ttk.Label(self.text_options_frame, text="Model Options:",
                   font=(None, 11, "bold")).pack(pady=(10, 10))
@@ -1009,12 +1872,10 @@ class VideoProcessorApp:
         self.preset_combo.pack(side=tk.LEFT)
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
-        self.text_options_frame.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        self.video_options_frame = ttk.Frame(self.options_row)
+        self.video_options_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 0), pady=(10, 8))
 
-        separator = ttk.Separator(self.left_frame, orient='vertical')
-        separator.pack(side='left', fill='y', padx=(0, 15), pady=0)
-
-        self.checkbox_frame = ttk.Frame(self.left_frame)
+        self.checkbox_frame = ttk.Frame(self.video_options_frame)
         self.checkbox_frame.pack(anchor=tk.W)
 
         ttk.Label(self.checkbox_frame, text="Video/Audio Options:",
@@ -1065,7 +1926,7 @@ class VideoProcessorApp:
         self.custom_padding_after = tk.IntVar()
         self.custom_padding_after.set(0)
 
-        self.checkbox_frame_three = ttk.Frame(self.left_frame)
+        self.checkbox_frame_three = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_three.pack(anchor=tk.W)
         self.custom_resolution_checkbox = ttk.Checkbutton(
             self.checkbox_frame_three, text="Use Custom Output Resolution", variable=self.use_custom_resolution, command=self.toggle_text_boxes)
@@ -1087,7 +1948,7 @@ class VideoProcessorApp:
         self.res_height_label.pack(side=tk.LEFT)
         self.res_height_entry.pack(side=tk.LEFT)
 
-        self.checkbox_frame_four = ttk.Frame(self.left_frame)
+        self.checkbox_frame_four = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_four.pack(anchor=tk.W)
         self.use_clip_padding_checkbox = ttk.Checkbutton(
             self.checkbox_frame_four, text="Add Padding Time (Seconds)", variable=self.use_custom_padding, command=self.toggle_padding_text_boxes)
@@ -1112,7 +1973,7 @@ class VideoProcessorApp:
         self.padding_after_entry.pack(side=tk.LEFT)
 
         # 二次验证 checkbox
-        self.checkbox_frame_five = ttk.Frame(self.left_frame)
+        self.checkbox_frame_five = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_five.pack(anchor=tk.W)
         self.use_verify = tk.BooleanVar()
         self.verify_window_var = tk.DoubleVar(value=30.0)
@@ -1122,7 +1983,7 @@ class VideoProcessorApp:
         self.verify_checkbox.pack(anchor=tk.W)
 
         # 审核 checkbox
-        self.checkbox_frame_six = ttk.Frame(self.left_frame)
+        self.checkbox_frame_six = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_six.pack(anchor=tk.W)
         self.use_review = tk.BooleanVar()
         self.review_checkbox = ttk.Checkbutton(
@@ -1131,7 +1992,7 @@ class VideoProcessorApp:
         self.review_checkbox.pack(anchor=tk.W)
 
         # 严格假阳过滤 checkbox（argmax 门，默认关）
-        self.checkbox_frame_seven = ttk.Frame(self.left_frame)
+        self.checkbox_frame_seven = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_seven.pack(anchor=tk.W)
         self.use_strict_fp = tk.BooleanVar()
         self.strict_fp_checkbox = ttk.Checkbutton(
@@ -1141,8 +2002,9 @@ class VideoProcessorApp:
         self.strict_fp_checkbox.pack(anchor=tk.W)
 
         # Right Column Widgets
-        right_frame = ttk.Frame(root, width=300)
+        right_frame = ttk.Frame(root, width=400)
         right_frame.grid(row=0, column=2, padx=10, pady=30, sticky="nsew")
+        right_frame.grid_propagate(False)
         right_frame.pack_propagate(False)
 
         self.output_video_path = tk.StringVar()
@@ -1184,11 +2046,23 @@ class VideoProcessorApp:
 
         self.cancel_button["state"] = tk.DISABLED
 
-        # Progress bar for final render
+        # Progress bar for final render and remote transfers
         self.ui_bar = ttk.Progressbar(right_frame, orient='horizontal')
-        self.ui_bar.pack(fill=tk.X, padx=10, pady=10)
+        self.ui_bar.pack(fill=tk.X, padx=10, pady=(4, 4))
 
-        self.final_bar = FinalRenderBar(ui=self.ui_bar)
+        self.remote_progress_frame = ttk.Frame(right_frame, height=120)
+        self.remote_progress_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
+        self.remote_progress_frame.pack_propagate(False)
+        self.remote_progress_text = tk.StringVar(value="")
+        self.remote_progress_label = ttk.Label(
+            self.remote_progress_frame, textvariable=self.remote_progress_text,
+            anchor="nw", justify="left")
+        self.remote_progress_label.pack(fill=tk.BOTH, expand=True)
+        self.transfer_progress = ProgressWidgetAdapter(
+            self.root, self.ui_bar, self.remote_progress_text)
+
+        self.final_bar = FinalRenderBar(
+            ui=self.ui_bar, progress_callback=self._queue_transfer_progress)
 
         self.stdout_frame = ttk.Frame(right_frame, width=200, height=100)
 
@@ -1208,6 +2082,7 @@ class VideoProcessorApp:
         self.stdout_frame.grid_columnconfigure(0, weight=1)
 
         self.stdout_frame.pack(fill=tk.BOTH, expand=True)
+        self.stdout_frame.pack_propagate(False)
 
         # Redirect stdout to the Text widget
         sys.stdout = StdoutRedirector(self.stdout_text, self.root)
@@ -1285,6 +2160,11 @@ class VideoProcessorApp:
             self.preset_combo,
             self.save_preset_btn,
             self.use_gpu_checkbox,
+            self.remote_mode_dropdown,
+            self.remote_browser_cookies_dropdown,
+            self.remote_cache_open_button,
+            self.remote_cache_clear_button,
+            self.remote_cache_choose_button,
         ]
         
         self.enable_while_processing = [
@@ -1292,6 +2172,36 @@ class VideoProcessorApp:
         ]
 
         self._refresh_preset_combo()
+
+    def _queue_transfer_progress(self, sample, label_prefix=""):
+        if not hasattr(self, "transfer_progress"):
+            return
+        display = dict(sample)
+        prefix = str(label_prefix or "").strip()
+        if prefix:
+            display["text"] = f"{prefix}: {display.get('text', '')}"
+            display["title"] = prefix
+        text = display.get("text", "").lower()
+        is_compile = prefix.lower() == "compile"
+        self.transfer_progress.submit(
+            display, force=is_compile or ("completed" in text or "failed" in text or "cancelled" in text)
+        )
+
+    def clear_transfer_progress(self, text=""):
+        if hasattr(self, "remote_progress_text"):
+            self.root.after(0, self.remote_progress_text.set, text)
+        if hasattr(self, "ui_bar"):
+            self.root.after(0, self.ui_bar.__setitem__, "value", 0)
+
+    def _show_remote_clip_progress(self, event):
+        state = str(event.get("kind", "")).capitalize()
+        label = (
+            f"Preparing clips: video {event.get('video')}/{event.get('videos_total')}, "
+            f"clip {event.get('clip')}/{event.get('clips_total')}\n"
+            f"Range: {event.get('start', 0):g}-{event.get('end', 0):g}s\n"
+            f"Status: {state}"
+        )
+        self.clear_transfer_progress(label)
 
     def disable_objects(self):
         for elt in self.disable_while_processing:
@@ -1403,6 +2313,193 @@ class VideoProcessorApp:
                     file, 'video' if self.is_video else 'audio'))
             self.update_listbox(scroll_to_bottom=True)
 
+    def _pick_playlist_sources(self, descriptor):
+        """Show a lazy paged playlist review and return confirmed entries."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Review Playlist Entries")
+        dialog.transient(self.root)
+        dialog.geometry("900x600")
+        dialog.minsize(900, 600)
+        dialog.resizable(True, True)
+
+        selected_ids = set()
+        selected_order = []
+        page_index = [0]
+        generation = [0]
+        closed = [False]
+        sort_status = [""]
+        hydration_pending = set()
+        hydration_executor = ThreadPoolExecutor(max_workers=4)
+        page_label = ttk.Label(dialog)
+        page_label.pack(pady=(10, 4))
+        entries_frame = ttk.Frame(dialog)
+        entries_frame.pack(fill="both", expand=True, padx=12)
+        tree = ttk.Treeview(
+            entries_frame,
+            columns=("order", "select", "title", "part", "duration", "date", "status"),
+            show="headings",
+            selectmode="browse",
+        )
+        tree.heading("order", text="Order")
+        tree.heading("select", text="Select")
+        tree.heading("title", text="Title")
+        tree.heading("part", text="Part")
+        tree.heading("duration", text="Duration")
+        tree.heading("date", text="Date")
+        tree.heading("status", text="Status")
+        tree.column("order", width=55, anchor="center", stretch=False)
+        tree.column("select", width=70, anchor="center", stretch=False)
+        tree.column("title", width=470, anchor="w")
+        tree.column("part", width=55, anchor="center", stretch=False)
+        tree.column("duration", width=90, anchor="e", stretch=False)
+        tree.column("date", width=110, anchor="center", stretch=False)
+        tree.column("status", width=110, anchor="center", stretch=False)
+        scrollbar = ttk.Scrollbar(entries_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        controls = ttk.Frame(dialog)
+        controls.pack(pady=(8, 4))
+        actions = ttk.Frame(dialog)
+        actions.pack(pady=(2, 10))
+
+        def render_page():
+            generation[0] += 1
+            render_generation = generation[0]
+            for item in tree.get_children():
+                tree.delete(item)
+            current_page = page_index[0]
+            page = descriptor.load_page(current_page, hydrate=False)
+            visible_ids = {entry.entry_id for entry in page}
+            page_label.config(
+                text=(f"{descriptor.title}  |  Page {current_page + 1} of "
+                      f"{max(1, (descriptor.total_count + descriptor.page_size - 1) // descriptor.page_size)}"
+                      f"  |  Selected: {len(selected_ids)}{sort_status[0]}")
+            )
+            for entry in page:
+                needs_hydration = descriptor.needs_hydration(entry)
+                if needs_hydration:
+                    entry.metadata["hydration_pending"] = True
+                tree.insert("", "end", iid=entry.entry_id,
+                            values=playlist_tree_values(entry, selected_ids, selected_order))
+                if needs_hydration and entry.entry_id not in hydration_pending:
+                    hydration_pending.add(entry.entry_id)
+                    hydration_executor.submit(
+                        hydrate_page_entry, entry, current_page, render_generation, visible_ids
+                    )
+            previous_button.config(state=tk.NORMAL if page_index[0] else tk.DISABLED)
+            next_button.config(
+                state=(tk.NORMAL if (page_index[0] + 1) * descriptor.page_size < descriptor.total_count
+                       else tk.DISABLED)
+            )
+
+        def hydrate_page_entry(entry, render_page_index, render_generation, visible_ids):
+            try:
+                descriptor.hydrate_entry(entry)
+            finally:
+                hydration_pending.discard(entry.entry_id)
+            if closed[0]:
+                return
+            try:
+                self.root.after(0, lambda: apply_hydration_update(
+                    entry, render_page_index, render_generation, visible_ids))
+            except tk.TclError:
+                pass
+
+        def apply_hydration_update(entry, render_page_index, render_generation, visible_ids):
+            entry.metadata["hydration_pending"] = False
+            if closed[0] or not hydration_update_is_current(
+                    entry.entry_id, render_page_index, render_generation,
+                    page_index[0], generation[0], visible_ids):
+                return
+            if tree.exists(entry.entry_id):
+                tree.item(entry.entry_id, values=playlist_tree_values(
+                    entry, selected_ids, selected_order))
+
+        def select_page(value):
+            for entry in descriptor.load_page(page_index[0], hydrate=False):
+                if value:
+                    selected_ids.add(entry.entry_id)
+                    if entry.entry_id not in selected_order:
+                        selected_order.append(entry.entry_id)
+                else:
+                    selected_ids.discard(entry.entry_id)
+                    if entry.entry_id in selected_order:
+                        selected_order.remove(entry.entry_id)
+            render_page()
+
+        def toggle_entry(event):
+            row = tree.identify_row(event.y)
+            column = tree.identify_column(event.x)
+            if not row or column != "#2":
+                return
+            if row in selected_ids:
+                selected_ids.remove(row)
+                selected_order.remove(row)
+            else:
+                selected_ids.add(row)
+                selected_order.append(row)
+            render_page()
+
+        def confirm():
+            selected = selected_playlist_entries(descriptor, selected_ids, selected_order)
+            if not selected:
+                messagebox.showwarning(
+                    "Nothing selected", "Select at least one playlist entry.", parent=dialog
+                )
+                return
+            result["sources"] = selected
+            closed[0] = True
+            generation[0] += 1
+            hydration_executor.shutdown(wait=False, cancel_futures=True)
+            dialog.destroy()
+
+        def cancel():
+            closed[0] = True
+            generation[0] += 1
+            hydration_executor.shutdown(wait=False, cancel_futures=True)
+            dialog.destroy()
+
+        previous_button = ttk.Button(
+            controls, text="Previous", command=lambda: move_page(-1)
+        )
+        previous_button.pack(side="left", padx=2)
+        next_button = ttk.Button(
+            controls, text="Next", command=lambda: move_page(1)
+        )
+        next_button.pack(side="left", padx=2)
+        ttk.Button(
+            controls, text="Select Page", command=lambda: select_page(True)
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            controls, text="Deselect Page", command=lambda: select_page(False)
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            controls, text="Sort Selected",
+            command=lambda: sort_selected(),
+        ).pack(side="left", padx=2)
+        ttk.Button(actions, text="Confirm Selected", command=confirm).pack(side="left", padx=4)
+        ttk.Button(actions, text="Cancel", command=cancel).pack(side="left", padx=4)
+
+        result = {"sources": None}
+
+        def move_page(delta):
+            page_index[0] = max(0, page_index[0] + delta)
+            render_page()
+
+        def sort_selected():
+            selected_entries = selected_playlist_entries(descriptor, selected_ids, selected_order)
+            selected_order[:] = [entry.entry_id for entry in sort_playlist_entries(selected_entries)]
+            sort_status[0] = f"  |  Sorted {len(selected_order)} selected entries"
+            render_page()
+
+        tree.bind("<Button-1>", toggle_entry)
+        render_page()
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return result["sources"]
+
     def add_video_url(self):
         self.root.grab_set()
         self.entry_window = tk.Toplevel(self.root)
@@ -1427,74 +2524,72 @@ class VideoProcessorApp:
         self.thread_active = False
 
         def check_url():
-            self.thread_active = True
-            number_vids_label = ttk.Label(
-                self.entry_window, font=(None, 10), text="Getting info...")
-            number_vids_label.pack(pady=(5, 10))
-
-            url_entry["state"] = tk.DISABLED
-            self.entry_window.update_idletasks()
             url = url_entry.get()
-
             try:
-                n_videos = get_number_of_vids_in_playlist(url)
-            except Exception as e:
-                number_vids_label.pack_forget()
-                messagebox.showerror(
-                    "Error",  f"Invalid URL: {url}\nError: {str(e)}")
-                url_entry["state"] = tk.NORMAL
-                self.thread_active = False
+                described = describe_input(
+                    url,
+                    browser_cookies=browser_cookie_setting_value(
+                        self.remote_browser_cookies.get()
+                    ),
+                )
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Error", f"Invalid URL: {url}\nError: {exc}"
+                ))
+                self.root.after(0, lambda: url_entry.config(state=tk.NORMAL))
+                self.root.after(0, lambda: setattr(self, "thread_active", False))
                 return
 
-            valid_videos = []
-            errors = []
-            for i, vid_details in enumerate(is_valid_yt_dlp_url(url, self.max_quality.get())):
-                number_vids_label.config(
-                    text=f"Parsing video {i + 1}/{n_videos}")
-                if isinstance(vid_details, Exception):
-                    if not self.dont_show_again_var.get():
-                        result = self.custom_warning_dialog(
-                            self.entry_window, "Warning", f"Unable to add a video from the playlist: {str(vid_details)}\nContinue anyway?")
-                        if result['action'] == 'cancel':
-                            errors = [
-                                "Cancelled by user" for _ in range(n_videos)]
-                            self.thread_active = False
-                            break
-                    errors.append(str(vid_details))
+            def finish_description():
+                if isinstance(described, PlaylistDescriptor):
+                    selected_entries = self._pick_playlist_sources(described)
                 else:
-                    valid_videos.append(vid_details)
-                    title = vid_details.get('title', 'unknown title')
-                    uploader = vid_details.get(
-                        'uploader', 'unknown uploader')
-                    url = vid_details.get('url')
-                    if not url:
-                        errors.append("URL not found")
-                        continue
+                    selected_entries = [described]
+                if selected_entries is None:
+                    self.entry_window.destroy()
+                    self.thread_active = False
+                    return
+                failures = []
+                expansion_stats = {}
+                cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
 
-                    cleaned_uploader = clean_filename(uploader, "")
-                    cleaned_title = clean_filename(title, "")
-                    # just in case an uploader uses the same title twice
-                    cleaned_title += f" [{vid_details.get('id', 'unknown ID')}]"
-                    media_obj = MediaUpload(
-                        f"{cleaned_uploader} - {cleaned_title}", 'video' if self.is_video else 'audio', True, url)
-                    self.uploaded_videos.append(media_obj)
-                    self.update_listbox_add_video(scroll_to_bottom=True)
+                def resolve_selected():
+                    sources = resolve_playlist_entries(
+                        selected_entries,
+                        {entry.entry_id for entry in selected_entries},
+                        browser_cookies=cookies,
+                        failure_logger=failures.append,
+                        status_logger=print,
+                        expansion_stats=expansion_stats,
+                    )
 
-            if len(errors) == n_videos:
-                number_vids_label.pack_forget()
-                messagebox.showerror(
-                    "Error",  f"Invalid URL: {errors[0] if errors else 'Unknown error'}")
-                url_entry["state"] = tk.NORMAL
-                return
-            elif len(errors) > 0:
-                messagebox.showwarning(
-                    "Warning", f"Unable to add {len(errors)}/{n_videos} videos from the playlist.\n\nCommon issues include:\n- The playlist contains deleted or private videos\n- The max allowable quality is too low\n- The playlist contains TikTok photo slideshows or other non-video media\n- If you've used this tool frequently, you may be flagged as a bot. Wait a few minutes and try again")
-            elif len(errors) == 0:
-                message = f"Successfully imported {n_videos} videos." if n_videos != 1 else "Successfully imported 1 video."
-                messagebox.showinfo(
-                    "Success", message)
-            self.entry_window.destroy()
-            self.thread_active = False
+                    def finish_import():
+                        for media_obj in media_uploads_for_sources(
+                            sources, "video" if self.is_video else "audio"
+                        ):
+                            self.uploaded_videos.append(media_obj)
+                            self.update_listbox_add_video(scroll_to_bottom=True)
+                        count = len(sources)
+                        message = f"Successfully imported {count} video" + ("." if count == 1 else "s.")
+                        if expansion_stats.get("expanded_parts"):
+                            message += f" Expanded {expansion_stats['expanded_parts']} parts."
+                        if failures:
+                            messagebox.showwarning(
+                                "Import completed",
+                                f"{message}\nSkipped {len(failures)} item(s).",
+                            )
+                        elif count:
+                            messagebox.showinfo("Success", message)
+                        else:
+                            messagebox.showwarning("Import failed", "No selected entries could be resolved.")
+                        self.entry_window.destroy()
+                        self.thread_active = False
+
+                    self.root.after(0, finish_import)
+
+                threading.Thread(target=resolve_selected).start()
+
+            self.root.after(0, finish_description)
 
         def close_add_url(event=None):
             if self.thread_active:
@@ -1506,6 +2601,8 @@ class VideoProcessorApp:
                 self.entry_window.destroy()
 
         def check_url_threaded(event=None):
+            self.thread_active = True
+            url_entry["state"] = tk.DISABLED
             thread = threading.Thread(target=check_url)
             thread.start()
 
@@ -1667,14 +2764,17 @@ class VideoProcessorApp:
             elif isinstance(v, tk.StringVar):
                 preset[attr] = v.get()
         # remove transient/state vars
-        for k in ['active_thread', 'thread_active']:
+        for k in ['active_thread', 'thread_active', 'remote_cache_size']:
             preset.pop(k, None)
         return preset
 
     def _apply_all_vars(self, data):
         """Restore tkinter variable values from a dict."""
         import tkinter as tk
+        data = normalize_remote_settings(data)
         for attr, val in data.items():
+            if attr == "remote_cache_path":
+                continue
             try:
                 v = getattr(self, attr)
             except Exception:
@@ -1684,6 +2784,12 @@ class VideoProcessorApp:
                     v.set(val)
                 except Exception:
                     pass
+        if "remote_cache_path" in data:
+            restore_remote_cache_path(
+                self,
+                data["remote_cache_path"],
+                lambda warning: messagebox.showwarning("Remote Cache", warning),
+            )
 
     def save_preset(self):
         """Save current settings to autocomper_presets.json with a custom name."""
@@ -1737,6 +2843,160 @@ class VideoProcessorApp:
         # sync padding UI with loaded values
         self.toggle_padding_text_boxes()
         print(f"{Fore.GREEN}Preset '{name}' loaded.")
+
+    def refresh_remote_cache_size(self):
+        self.remote_cache_size.set(
+            f"Current size: {format_cache_size(self.remote_cache_store.get_cache_size())}")
+
+    def choose_remote_cache(self):
+        selected_path = filedialog.askdirectory(title="Choose Cache Folder")
+        if not selected_path:
+            return
+        try:
+            store = select_remote_cache_store(self.remote_cache_store, selected_path)
+        except OSError as exc:
+            messagebox.showerror("Remote Cache", f"Could not use cache folder:\n{exc}")
+            return
+        self.remote_cache_store = store
+        self.remote_cache_path.set(str(store.root))
+        self.save_settings()
+        self.refresh_remote_cache_size()
+
+    def import_external_audio(self):
+        selected = self.video_listbox.selection()
+        if len(selected) != 1:
+            messagebox.showwarning(
+                "Import External Audio",
+                "Select exactly one remote VOD in the main list first.",
+            )
+            return
+        try:
+            upload = self.uploaded_videos[int(selected[0])]
+        except (ValueError, IndexError):
+            messagebox.showerror("Import External Audio", "Could not identify the selected VOD.")
+            return
+        if not upload.get_is_url():
+            messagebox.showwarning(
+                "Import External Audio",
+                "The selected item is a local file. Select a YouTube, Twitch, or Bilibili URL.",
+            )
+            return
+
+        audio_path = filedialog.askopenfilename(
+            title="Select External Audio or Container",
+            filetypes=[
+                ("Audio and Media Files", "*.m4a *.m4s *.mp4 *.webm *.opus *.mp3 *.wav *.flac"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not audio_path:
+            return
+        self.import_external_audio_button.configure(state=tk.DISABLED)
+        self.clear_transfer_progress("Inspecting external media...")
+        threading.Thread(
+            target=self._import_external_audio_worker,
+            args=(upload.get_source(), upload.get_url() or upload.get_path(), audio_path,
+                  self.remote_browser_cookies.get()),
+            daemon=True,
+        ).start()
+
+    def _import_external_audio_worker(self, existing_source, source_url, audio_path, cookies):
+        temporary_path = None
+        try:
+            source = existing_source if isinstance(existing_source, MediaSource) else resolve_source(
+                source_url, browser_cookies=cookies)
+            if not source.audio_url:
+                raise ValueError("The selected VOD has no audio stream.")
+            source_duration = float(source.duration) if source.duration else None
+            audio_duration = _get_video_duration(audio_path)
+            audio_codec = _get_external_audio_codec(audio_path)
+            if not audio_codec:
+                raise ValueError("The selected file does not contain a readable audio stream.")
+            if source_duration and audio_duration:
+                tolerance = max(5.0, source_duration * 0.01)
+                if abs(source_duration - audio_duration) > tolerance:
+                    raise ValueError(
+                        f"Audio duration ({audio_duration:.1f}s) does not match "
+                        f"VOD duration ({source_duration:.1f}s)."
+                    )
+
+            fd, temporary = tempfile.mkstemp(
+                prefix="external-audio-", suffix=".m4a", dir=str(TEMP_DIR)
+            )
+            os.close(fd)
+            temporary_path = Path(temporary)
+
+            def report(current, total, elapsed):
+                sample = format_compile_progress(
+                    current, total, elapsed, "Converting external audio"
+                )
+                self.root.after(0, self._queue_transfer_progress, sample, "Import")
+
+            codec_args = ["-c:a", "copy"] if audio_codec in {"aac", "mp4a"} else [
+                "-c:a", "aac", "-b:a", "192k"
+            ]
+            result = run_tracked_progress([
+                FFMPEG_PATH, "-hide_banner", "-loglevel", "warning", "-y",
+                "-i", str(audio_path), "-vn", *codec_args,
+                "-movflags", "+faststart", str(temporary_path),
+            ], duration=audio_duration, timeout=600, progress_callback=report)
+            if result.returncode != 0 and codec_args == ["-c:a", "copy"]:
+                temporary_path.unlink(missing_ok=True)
+                result = run_tracked_progress([
+                    FFMPEG_PATH, "-hide_banner", "-loglevel", "warning", "-y",
+                    "-i", str(audio_path), "-vn", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart", str(temporary_path),
+                ], duration=audio_duration, timeout=600, progress_callback=report)
+            if result.returncode != 0 or not temporary_path.is_file():
+                detail = getattr(result, "stdout", "") or getattr(result, "stderr", "")
+                raise RuntimeError(f"Audio conversion failed: {detail}")
+            metadata = _audio_cache_format_identity(source)
+            self.remote_cache_store.save_audio_cache_file(
+                stable_source_id(source), source.audio_url, "m4a", temporary_path,
+                metadata=metadata,
+            )
+            temporary_path = None
+            self.root.after(0, self._finish_external_audio_import,
+                            source.display_name or source.source_id)
+        except Exception as exc:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            self.root.after(0, self._fail_external_audio_import, str(exc))
+
+    def _finish_external_audio_import(self, display_name):
+        self.import_external_audio_button.configure(state=tk.NORMAL)
+        self.refresh_remote_cache_size()
+        self.clear_transfer_progress("External audio imported.")
+        messagebox.showinfo(
+            "Import External Audio",
+            f"External audio registered for:\n{display_name}",
+        )
+
+    def _fail_external_audio_import(self, error):
+        self.import_external_audio_button.configure(state=tk.NORMAL)
+        self.clear_transfer_progress("External audio import failed.")
+        messagebox.showerror("Import External Audio", error)
+
+    def open_remote_cache(self):
+        path = str(self.remote_cache_store.root)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            else:
+                subprocess.Popen(cache_open_command(sys.platform, path))
+        except (OSError, AttributeError, subprocess.SubprocessError) as exc:
+            messagebox.showerror("Open Cache Folder", f"Could not open cache folder: {exc}")
+
+    def clear_remote_cache(self):
+        if not messagebox.askyesno(
+                "Clear Remote Cache",
+                "Clear all remote cache files? The next run may need to download or detect media again."):
+            return
+        try:
+            self.remote_cache_store.clear()
+            self.refresh_remote_cache_size()
+        except OSError as exc:
+            messagebox.showerror("Clear Remote Cache", f"Could not clear cache: {exc}")
 
     def remove_urls_from_list(self):
         self.uploaded_videos = [
@@ -1801,6 +3061,8 @@ class VideoProcessorApp:
                 finally:
                     print(
                         f"\n{Fore.RED}FAILURE: Operation cancelled by user.")
+                    cleanup_temp_children()
+                    self.clear_transfer_progress("Cancelled")
                     self.reenable_disabled_objects()
                     return True
             return False
@@ -1823,6 +3085,8 @@ class VideoProcessorApp:
             "Settings", "max_download_speed", str(self.max_download_speed.get()))
         self.preferences.set(
             "Settings", "output_text_path", self.output_text_path.get())
+        self.preferences.set(
+            "Settings", "remote_cache_path", str(self.remote_cache_store.root))
 
         with open(self.preferences_file, 'w') as configfile:
             self.preferences.write(configfile)
@@ -1848,7 +3112,6 @@ class VideoProcessorApp:
         ))
 
     def open_settings_modal(self):
-        self.root.grab_set()
         modal = tk.Toplevel(self.root)
         modal.title("Settings")
         modal.geometry("640x480")
@@ -1869,8 +3132,8 @@ class VideoProcessorApp:
             on_close()
 
         def on_close(event=None):
+            modal.grab_release()
             modal.destroy()
-            self.root.grab_release()
 
         modal.protocol("WM_DELETE_WINDOW", on_close_no_save)
 
@@ -2052,6 +3315,7 @@ class VideoProcessorApp:
     def handle_url_downloads(self):
         keep_downloaded_vids = self.keep_downloaded_vids.get()
         download_path = self.download_video_path.get()
+        browser_cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
 
         # 防御：如果配置的下载目录不存在，回退到 TEMP_DIR
         if download_path and download_path != "No location selected!":
@@ -2080,6 +3344,13 @@ class VideoProcessorApp:
                 print(f"{Fore.YELLOW}Not a URL, skipping...")
                 continue
 
+            if video.get_source() is None:
+                try:
+                    video.set_source(resolve_source(media_url, browser_cookies=browser_cookies))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not resolve remote source {media_url}: {exc}") from exc
+
             output_path = os.path.join(
                 download_path,
                 str(media_path) +
@@ -2097,7 +3368,8 @@ class VideoProcessorApp:
 
             if media_type == 'video':
                 success, result = download_video(
-                    media_url, media_path, download_path, self.max_quality.get(), self.max_download_speed.get(), self.final_bar)
+                    media_url, media_path, download_path, self.max_quality.get(), self.max_download_speed.get(), self.final_bar,
+                    browser_cookies=browser_cookies)
                 if success:
                     if result:
                         self.uploaded_videos[i].set_path(result)
@@ -2110,7 +3382,8 @@ class VideoProcessorApp:
                         f"Failed to download {media_path}: {result}\nPress 'Process' again and it should start from where you left off.")
             elif media_type == 'audio':
                 success, result = download_audio(
-                    media_url, media_path, download_path, self.max_download_speed.get(), self.final_bar)
+                    media_url, media_path, download_path, self.max_download_speed.get(), self.final_bar,
+                    browser_cookies=browser_cookies)
                 if success:
                     self.uploaded_videos[i].set_path(result)
                     self.uploaded_videos[i].set_is_url(False)
@@ -2125,8 +3398,10 @@ class VideoProcessorApp:
         self.update_listbox()
 
     def process_videos(self):
+        self.clear_transfer_progress()
         self.disable_objects()
         self.final_bar.reset_total_progress(1)
+        cleanup_temp_children()
 
         self.reset_preferences_to_file()
 
@@ -2151,11 +3426,15 @@ class VideoProcessorApp:
 
             # Get model location if in a compiled app
             selected_model = get_bundle_filepath(selected_model)
+            use_gpu = self.use_gpu.get()
+            cache_store = prepare_remote_cache_store(self.remote_cache_store)
+            shared_session = create_inference_session(selected_model, use_gpu=use_gpu)
 
             self.stdout_text["state"] = tk.NORMAL
             self.stdout_text.delete("1.0", tk.END)
             self.stdout_text["state"] = tk.DISABLED
             self.root.update_idletasks()
+            log_shared_session_providers(shared_session)
 
 
 
@@ -2169,6 +3448,7 @@ class VideoProcessorApp:
             output_video_path = self.output_video_path.get()
 
             dict_list = []
+            incomplete_failures = []
             # filename -> [(s,e)]：被排除的片段（Review 取消勾选 / Strict FP 丢弃），
             # 传给 compile_vid 防止 merge 桥接把已删片段带回成片
             excluded = {}
@@ -2190,8 +3470,53 @@ class VideoProcessorApp:
                                                    f"Output file \'{video}\' already exists and will be overwritten. Would you like to continue?"):
                             raise (Exception("Operation cancelled."))
 
-            if any(x.get_is_url() for x in self.uploaded_videos):
+            resolve_remote, audio_cache, full_download = remote_mode_actions(self.remote_mode.get())
+            detection_size = detection_block_size(self.remote_mode.get(), block_size)
+            if self.remote_mode.get() == "Remote Stream":
+                print(f"Remote Stream block size: {detection_size}s")
+            browser_cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
+            refresh_func = lambda source: refresh_remote_source(
+                source, browser_cookies=browser_cookies
+            )
+            audio_cache_paths = {}
+            resolved_local_entries = []
+            remote_entries = []
+            remote_failures = []
+            if any(x.get_is_url() for x in self.uploaded_videos) and full_download:
                 self.handle_url_downloads()
+            elif any(x.get_is_url() for x in self.uploaded_videos) and resolve_remote and not audio_cache:
+                resolved_local_entries, remote_entries = resolve_remote_uploads(
+                    self.uploaded_videos, browser_cookies=browser_cookies
+                )
+                select_remote_stream_audio(remote_entries, logger=print)
+            elif any(x.get_is_url() for x in self.uploaded_videos) and audio_cache:
+                resolved_local_entries, remote_entries = resolve_remote_uploads(
+                    self.uploaded_videos, browser_cookies=browser_cookies
+                )
+                select_remote_stream_audio(remote_entries, logger=print)
+                failed_remote_ids = set()
+                for cache_index, (upload, source) in enumerate(remote_entries):
+                    try:
+                        audio_cache_paths[stable_source_id(source)] = fetch_audio_cache(
+                            source, cache_store, log_func=print, refresh_func=refresh_func,
+                            progress_callback=lambda sample, source=source, cache_index=cache_index:
+                                self._queue_transfer_progress(
+                                    sample,
+                                    f"Audio Cache [{cache_index + 1}/{len(remote_entries)}] "
+                                    f"{get_source_display_name(source)}",
+                                ),
+                        )
+                    except Exception as exc:
+                        message = (
+                            f"Could not cache audio for {get_source_display_name(source)}: {exc}"
+                        )
+                        remote_failures.append(message)
+                        failed_remote_ids.add(stable_source_id(source))
+                        print(f"{Fore.YELLOW}Remote VOD skipped: {message}")
+                remote_entries = [
+                    (upload, source) for upload, source in remote_entries
+                    if stable_source_id(source) not in failed_remote_ids
+                ]
 
             res = ()
             if self.use_custom_resolution.get():
@@ -2210,6 +3535,8 @@ class VideoProcessorApp:
                 )
             else:
                 padding = None
+
+            self.clear_transfer_progress("Transfers complete; getting timestamps...")
 
             # --- Check for existing timestamps.txt ---
             # 候选路径与保存逻辑一致：设置里的路径优先，其次是默认位置
@@ -2235,13 +3562,22 @@ class VideoProcessorApp:
 
                     # Build basename -> [paths] map (handle duplicates)
                     basename_map = {}
+                    remote_name_map = {}
                     for v in self.uploaded_videos:
+                        if v.get_source() is not None:
+                            remote_name_map[v.get_source().source_url] = v.get_source()
+                            continue
                         base = os.path.basename(v.get_path())
                         basename_map.setdefault(base, []).append(v.get_path())
 
                     dict_list = []
                     loaded = 0
                     for entry in with_videos:
+                        if entry['filename'] in remote_name_map:
+                            entry['filename'] = remote_name_map[entry['filename']]
+                            dict_list.append(entry)
+                            loaded += 1
+                            continue
                         base = os.path.basename(entry['filename'])
                         candidates = basename_map.get(base, [])
                         if len(candidates) == 1:
@@ -2285,7 +3621,9 @@ class VideoProcessorApp:
                             focus_idx=focus_idx,
                             logger=self.final_bar,
                             threshold=threshold * 0.6,
-                            use_gpu=self.use_gpu.get())
+                            use_gpu=use_gpu, ort_session=shared_session,
+                            cache_store=cache_store, refresh_func=refresh_func,
+                            audio_cache_paths=audio_cache_paths)
                     # auto-deselect originals fully covered by new reverify clips
                     for entry in dict_list:
                         ts = entry.get('timestamps', [])
@@ -2300,13 +3638,14 @@ class VideoProcessorApp:
                                     continue
                             filtered.append(t)
                         entry['timestamps'] = filtered
-                    pre_review = {e['filename']: [(t['start'], t['end']) for t in e.get('timestamps', [])]
+                    pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                                   for e in dict_list}
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
                                           use_verify=self.use_verify.get(),
-                                          txt_path=self.output_text_path.get())
+                                          txt_path=self.output_text_path.get(),
+                                          cache_store=cache_store)
                         if dlg.result is None:
                             print(f"{Fore.YELLOW}Review cancelled.")
                             self.reenable_disabled_objects()
@@ -2317,12 +3656,34 @@ class VideoProcessorApp:
                         for entry in dict_list:
                             fn = entry['filename']
                             sel = {(round(t['start'], 3), round(t['end'], 3)) for t in entry['timestamps']}
-                            removed = [iv for iv in pre_review.get(fn, [])
+                            removed = [iv for iv in pre_review.get(source_key(fn), [])
                                        if (round(iv[0], 3), round(iv[1], 3)) not in sel]
                             if removed:
-                                excluded.setdefault(fn, []).extend(removed)
+                                excluded.setdefault(source_key(fn), []).extend(removed)
                         _save_selected_txt(dict_list, txt_path)
-                    compile_vid(dict_list, output_video_path, merge_clips, combine, res, self.final_bar, normalize, self.is_video, padding, excluded=excluded)
+                    ensure_temp_dir()
+                    remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
+                    remote_failures = []
+                    try:
+                        self.clear_transfer_progress("Preparing remote clips...")
+                        compile_entries = materialize_remote_entries(
+                            dict_list, remote_temp, cache_store=cache_store, padding=padding,
+                            is_video=self.is_video, failures=remote_failures,
+                            progress_callback=self._show_remote_clip_progress)
+                        for failure in remote_failures:
+                            print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+                        if not compile_entries:
+                            raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
+                        self.clear_transfer_progress("Starting compile...")
+                        compile_vid(compile_entries, output_video_path, merge_clips,
+                                    combine, res, self.final_bar, normalize,
+                                    self.is_video, None, excluded=excluded,
+                                    progress_callback=lambda sample: self._queue_transfer_progress(
+                                        sample, "Compile"))
+                    except Exception as exc:
+                        raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
+                    finally:
+                        shutil.rmtree(remote_temp, ignore_errors=True)
                     print(f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                     messagebox.showinfo("Info", f"Video(s) exported to {output_video_path}. Enjoy!")
                     print(f"{Fore.GREEN}SUCCESS!")
@@ -2334,20 +3695,49 @@ class VideoProcessorApp:
                 self.final_bar.reset_total_progress(
                     (len(self.uploaded_videos) * 100 * 2))
 
-                for i, input_video_path in enumerate(self.uploaded_videos):
-                    input_video_path = input_video_path.get_path()
+                if resolve_remote:
+                    processing_uploads = processing_uploads_for_batch(
+                        self.uploaded_videos, resolved_local_entries, remote_entries)
+                else:
+                    processing_uploads = list(self.uploaded_videos)
+                for i, upload in enumerate(processing_uploads):
+                    input_video_path = remote_detection_input(
+                        upload, self.remote_mode.get(), audio_cache_paths
+                    )
+                    current_block_size = detection_block_size(
+                        self.remote_mode.get(), block_size,
+                        isinstance(input_video_path, MediaSource),
+                    )
                     print(
-                        f"{Fore.GREEN}[{i + 1}/{len(self.uploaded_videos)}]{Style.RESET_ALL} Getting timestamps for {os.path.basename(input_video_path)}")
-                    timestamps, used_existing_data = get_timestamps(
-                        input_video_path, precision, block_size, threshold, focus_idx, selected_model, self.final_bar,
-                        use_gpu=self.use_gpu.get())
+                        f"{Fore.GREEN}[{i + 1}/{len(processing_uploads)}]{Style.RESET_ALL} Getting timestamps for "
+                        f"{get_source_display_name(input_video_path)}")
+                    try:
+                        timestamps, used_existing_data = get_timestamps(
+                            input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
+                            use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
+                            refresh_func=refresh_func,
+                            progress_callback=lambda sample, upload=upload, i=i:
+                                self._queue_transfer_progress(
+                                    sample,
+                                    f"Remote Stream [{i + 1}/{len(processing_uploads)}] "
+                                    f"{get_source_display_name(upload)}",
+                                ),
+                        )
+                    except RemoteAudioIncompleteError as exc:
+                        failure = f"{get_source_display_name(input_video_path)}: {exc}"
+                        incomplete_failures.append(failure)
+                        print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+                        continue
                     timestamps = {'filename': timestamps['filename'],
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
+                    source_for_result = upload.get_source() if audio_cache and upload.get_is_url() else input_video_path
+                    if isinstance(source_for_result, MediaSource):
+                        timestamps = preserve_remote_result(timestamps, source_for_result)
                     if self.use_strict_fp.get():
                         before = len(timestamps['timestamps'])
                         dropped_ts = [t for t in timestamps['timestamps'] if t.get('suspect')]
                         if dropped_ts:
-                            excluded.setdefault(timestamps['filename'], []).extend(
+                            excluded.setdefault(source_key(timestamps['filename']), []).extend(
                                 (t['start'], t['end']) for t in dropped_ts)
                         timestamps['timestamps'] = [
                             t for t in timestamps['timestamps'] if not t.get('suspect')]
@@ -2368,6 +3758,15 @@ class VideoProcessorApp:
                     else:
                         print(
                             f"{Fore.YELLOW}Could not find any clips.")
+
+                if incomplete_failures:
+                    print(
+                        f"{Fore.YELLOW}Detection incomplete; keeping {len(dict_list)} completed VOD result(s) "
+                        "and skipping verification, review, and compile."
+                    )
+                    cleanup_temp_children()
+                    self.reenable_disabled_objects()
+                    return
 
                 # Set values for progress bar
                 # If saving individually, or there is only one video
@@ -2407,7 +3806,7 @@ class VideoProcessorApp:
                         timestamps_text = ""
                         found_timestamps = False
                         for file in dict_list:
-                            timestamps_text += f"{file['filename']}\n"
+                            timestamps_text += f"{get_source_persistence_name(file['filename'])}\n"
 
                             for ts in file['timestamps']:
                                 timestamps_text += f"{convert_seconds_to_timestamp(ts['start'])} - {convert_seconds_to_timestamp(ts['end'])}, confidence: {ts['pred']}\n"
@@ -2432,7 +3831,9 @@ class VideoProcessorApp:
                         focus_idx=focus_idx,
                         logger=self.final_bar,
                         threshold=threshold * 0.6,
-                        use_gpu=self.use_gpu.get())
+                        use_gpu=use_gpu, ort_session=shared_session,
+                        cache_store=cache_store, refresh_func=refresh_func,
+                        audio_cache_paths=audio_cache_paths)
                 # auto-deselect originals fully covered by new reverify clips
                 for entry in dict_list:
                     ts = entry.get('timestamps', [])
@@ -2447,13 +3848,14 @@ class VideoProcessorApp:
                                 continue
                         filtered.append(t)
                     entry['timestamps'] = filtered
-                pre_review = {e['filename']: [(t['start'], t['end']) for t in e.get('timestamps', [])]
+                pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                               for e in dict_list}
                 if self.use_review.get():
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
                                       use_verify=self.use_verify.get(),
-                                      txt_path=txt_path)
+                                      txt_path=txt_path,
+                                      cache_store=cache_store)
                     if dlg.result is None:
                         print(f"{Fore.YELLOW}Review cancelled.")
                         self.reenable_disabled_objects()
@@ -2464,18 +3866,38 @@ class VideoProcessorApp:
                     for entry in dict_list:
                         fn = entry['filename']
                         sel = {(round(t['start'], 3), round(t['end'], 3)) for t in entry['timestamps']}
-                        removed = [iv for iv in pre_review.get(fn, [])
+                        removed = [iv for iv in pre_review.get(source_key(fn), [])
                                    if (round(iv[0], 3), round(iv[1], 3)) not in sel]
                         if removed:
-                            excluded.setdefault(fn, []).extend(removed)
+                            excluded.setdefault(source_key(fn), []).extend(removed)
                     # 保存 _selected.txt（仅勾选的片段）
                     _save_selected_txt(dict_list, txt_path)
 
                 print(
                     f"Compiling and writing to {output_video_path.split('/')[-1]}...")
-                compile_vid(dict_list, output_video_path, merge_clips,
-                            combine, res, self.final_bar, normalize, self.is_video, padding,
-                            excluded=excluded)
+                ensure_temp_dir()
+                remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
+                remote_failures = []
+                try:
+                    self.clear_transfer_progress("Preparing remote clips...")
+                    compile_entries = materialize_remote_entries(
+                            dict_list, remote_temp, cache_store=cache_store, padding=padding,
+                            is_video=self.is_video, failures=remote_failures,
+                            progress_callback=self._show_remote_clip_progress)
+                    for failure in remote_failures:
+                        print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+                    if not compile_entries:
+                        raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
+                    self.clear_transfer_progress("Starting compile...")
+                    compile_vid(compile_entries, output_video_path, merge_clips,
+                                combine, res, self.final_bar, normalize,
+                                self.is_video, None, excluded=excluded,
+                                progress_callback=lambda sample: self._queue_transfer_progress(
+                                    sample, "Compile"))
+                except Exception as exc:
+                    raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
+                finally:
+                    shutil.rmtree(remote_temp, ignore_errors=True)
                 print(
                     f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                 messagebox.showinfo(
@@ -2487,7 +3909,7 @@ class VideoProcessorApp:
             print(f"{Fore.GREEN}SUCCESS!")
 
             try:
-                shutil.rmtree(TEMP_DIR)
+                cleanup_temp_children()
             except:
                 # Sometimes deleting the temp dir can fail
                 # OSes will auto-delete this directory anyway
@@ -2498,11 +3920,14 @@ class VideoProcessorApp:
                 self.remove_urls_from_list()
 
             self.root.update_idletasks()
+            self.clear_transfer_progress("Completed")
             self.reenable_disabled_objects()
 
         except Exception as e:
             messagebox.showerror("Error", e)
             print(f"\n{Fore.RED}FAILURE: " + str(e))
+            cleanup_temp_children()
+            self.clear_transfer_progress("Failed")
             self.reenable_disabled_objects()
             return
 
@@ -2583,8 +4008,11 @@ class StdoutRedirector:
 
 
 class FinalRenderBar(ProgressBarLogger):
-    def __init__(self, ui, init_state=None, bars=None, ignored_bars=None, logged_bars='all', min_time_interval=0, ignore_bars_under=0):
+    def __init__(self, ui, init_state=None, bars=None, ignored_bars=None,
+                 logged_bars='all', min_time_interval=0, ignore_bars_under=0,
+                 progress_callback=None):
         self.ui = ui
+        self.progress_callback = progress_callback
         self.reset_total_progress(100)
 
         super().__init__(init_state, bars, ignored_bars,
@@ -2627,11 +4055,29 @@ class FinalRenderBar(ProgressBarLogger):
         pass
 
     def hook(self, d):
-        if d['status'] == 'downloading':
-            percent_str = re.sub(r'\x1b\[[0-9;]*m', '', d['_percent_str'])
-            percent = float(percent_str.strip('%'))
-            self.current_progress = percent
-        self.ui['value'] = self.current_progress
+        if d.get('status') == 'downloading':
+            current = d.get('downloaded_bytes') or 0
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            elapsed = d.get('elapsed') or 0
+            if total:
+                self.current_progress = min(100.0, float(current) / float(total) * 100)
+            else:
+                percent_str = re.sub(r'\x1b\[[0-9;]*m', '', d.get('_percent_str', ''))
+                try:
+                    self.current_progress = float(percent_str.strip('%'))
+                except ValueError:
+                    pass
+            if self.progress_callback is not None:
+                sample = format_transfer_progress(current, total, elapsed)
+                self.progress_callback(sample, "Full Download")
+            else:
+                self.ui['value'] = self.current_progress
+        elif d.get('status') in ('finished', 'error') and self.progress_callback is not None:
+            self.progress_callback({
+                "current": 1 if d.get('status') == 'finished' else 0, "total": 1,
+                "percent": 100 if d.get('status') == 'finished' else 0,
+                "text": "Full Download completed" if d.get('status') == 'finished' else "Full Download failed",
+            })
 
 
 def main():

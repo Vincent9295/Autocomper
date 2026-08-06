@@ -167,15 +167,23 @@ class CustomHovertip(Hovertip):
             return
         tw.update_idletasks()
         w, h = tw.winfo_reqwidth(), tw.winfo_reqheight()
-        x, y = tw.winfo_x(), tw.winfo_y()
+        x, y = tw.winfo_rootx(), tw.winfo_rooty()
         sw, sh = tw.winfo_screenwidth(), tw.winfo_screenheight()
+        anchor_x = self.anchor_widget.winfo_rootx()
+        anchor_y = self.anchor_widget.winfo_rooty()
+        anchor_h = self.anchor_widget.winfo_height()
         if x + w > sw:
-            x = self.anchor_widget.winfo_rootx() - w - 2
+            x = anchor_x - w - 2
         if y + h > sh:
-            y = self.anchor_widget.winfo_rooty() - h - 2
+            y = anchor_y - h - 2
+        if y < 0:
+            y = anchor_y + anchor_h + 1
+        if y + h > sh:
+            y = sh - h
         tw.wm_geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def showcontents(self):
         label = ttk.Label(self.tipwindow, text=self.text, justify=LEFT,
-                      background="#ffffe0", foreground="black", relief=SOLID, borderwidth=1)
+                      wraplength=420, background="#ffffe0", foreground="black",
+                      relief=SOLID, borderwidth=1)
         label.pack()

@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 import hashlib
+import logging
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import numpy as np
 import onnxruntime as ort
 from typing import Generator, Any, Dict, Tuple
@@ -12,9 +16,22 @@ from collections import OrderedDict
 
 from utils import FFMPEG_PATH, run_tracked, register_proc, unregister_proc
 from proglog import default_bar_logger
+from remote_media import MediaSource, stable_source_id
+from remote_prefetch import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CONCURRENCY,
+    RangePrefetchError,
+    iter_range_bytes,
+    supports_range_prefetch,
+)
+from progress import format_block_progress, format_transfer_progress
 
 SAMPLE_RATE = 32000
 is_windows = sys.platform.startswith('win')
+
+
+class RemoteAudioIncompleteError(Exception):
+    """Remote audio ended before all blocks implied by its known duration."""
 
 
 def subsample(frame: np.ndarray, scale_factor: int) -> np.ndarray:
@@ -81,16 +98,92 @@ def pad_array_if_needed(arr, desired_size, pad_value=0):
     return arr
 
 
-def load_audio(file: str, sr: int, frame_count: int):
-    cmd = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'warning', '-i', file,
+def _source_input(source_or_file):
+    if isinstance(source_or_file, MediaSource):
+        if not source_or_file.audio_url:
+            raise ValueError("MediaSource has no audio_url")
+        return source_or_file.audio_url, source_or_file.audio_headers or source_or_file.http_headers
+    return source_or_file, {}
+
+
+def _format_http_headers(headers):
+    values = []
+    for key, value in headers.items():
+        key = str(key)
+        value = str(value)
+        if any(char in key or char in value for char in ('\r', '\n')):
+            raise ValueError("HTTP headers must not contain newline characters")
+        values.append(f"{key}: {value}")
+    return "\r\n".join(values) + ("\r\n" if values else "")
+
+
+def build_audio_command(source_or_file, sample_rate, frame_count, output_pipe=True,
+                        input_source=None, input_headers=None,
+                        start_time=None, duration=None):
+    """Build an FFmpeg argv list for local or remote audio input."""
+    source, headers = _source_input(source_or_file)
+    if input_source is not None:
+        source = input_source
+        headers = input_headers or {}
+    command = [FFMPEG_PATH, '-hide_banner', '-loglevel', 'warning']
+    if headers:
+        command.extend(['-headers', _format_http_headers(headers)])
+    if start_time is not None:
+        command.extend(['-ss', str(start_time)])
+    if duration is not None:
+        command.extend(['-t', str(duration)])
+    command.extend(['-i', source])
+    if output_pipe:
+        command.extend([
             '-filter_complex', '[0:a]aresample=32000:async=1,asetpts=PTS-STARTPTS,atempo=1,aformat=channel_layouts=stereo,pan=mono|c0=0.5*c0+0.5*c1[audio]',
-           '-map', '[audio]', '-f', 's16le', '-acodec', 'pcm_s16le',
-           '-ar', str(sr), '-ac', '1', '-bufsize', '128k', '-']
+            '-map', '[audio]', '-f', 's16le', '-acodec', 'pcm_s16le',
+            '-ar', str(sample_rate), '-ac', '1', '-bufsize', '128k', '-'
+        ])
+    return command
+
+
+def load_audio(file: str | MediaSource, sr: int, frame_count: int,
+               prefetch_chunk_size=DEFAULT_CHUNK_SIZE,
+               prefetch_concurrency=DEFAULT_CONCURRENCY, progress_callback=None,
+               refresh_func=None):
+    # Bilibili range responses can fail after earlier PCM has already been
+    # yielded. Use the restartable direct FFmpeg path for Remote Stream.
+    if (isinstance(file, MediaSource)
+            and str(file.platform).lower() == "youtube"
+            and supports_range_prefetch(file)):
+        try:
+            yield from _load_audio_prefetched(
+                file, sr, frame_count, prefetch_chunk_size, prefetch_concurrency,
+                progress_callback
+            )
+            return
+        except RangePrefetchError as exc:
+            if not getattr(exc, "can_fallback", True):
+                raise
+            logging.getLogger(__name__).warning("Remote memory prefetch fallback: %s", str(exc))
+    if isinstance(file, MediaSource) and str(file.platform).lower() == "bilibili":
+        duration = _get_audio_duration(file)
+        if duration is not None and duration > 0:
+            yield from _load_audio_bilibili_blocks(
+                file, sr, frame_count, duration, progress_callback, refresh_func
+            )
+            return
+    yield from _load_audio_direct(file, sr, frame_count)
+
+
+def _subprocess_options():
     subprocess_options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
     if is_windows:
         subprocess_options['creationflags'] = subprocess.CREATE_NO_WINDOW
+    return subprocess_options
+
+
+def _load_audio_direct(file, sr, frame_count, start_time=None, duration=None):
+    cmd = build_audio_command(
+        file, sr, frame_count, start_time=start_time, duration=duration
+    )
     chunk_size = frame_count * 2
-    process = subprocess.Popen(cmd, bufsize=1, **subprocess_options)
+    process = subprocess.Popen(cmd, bufsize=1, **_subprocess_options())
     register_proc(process)
     try:
         try:
@@ -113,6 +206,110 @@ def load_audio(file: str, sr: int, frame_count: int):
         unregister_proc(process)
 
 
+def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
+                                progress_callback=None, refresh_func=None):
+    block_duration = frame_count / sr
+    block_count = _duration_block_count(duration, block_duration)
+    for index in range(block_count):
+        start_time = index * block_duration
+        segment_duration = min(block_duration, max(0, duration - start_time))
+        if segment_duration <= 0:
+            break
+        last_error = None
+        for attempt in range(5):
+            try:
+                block = bytearray()
+                for chunk in _load_audio_direct(
+                    source, sr, frame_count,
+                    start_time=start_time, duration=segment_duration,
+                ):
+                    block.extend(chunk)
+                for chunk_start in range(0, len(block), frame_count * 2):
+                    yield bytes(block[chunk_start:chunk_start + frame_count * 2])
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= 4:
+                    raise
+                time.sleep((2, 5, 10, 20, 40)[attempt])
+                if refresh_func is not None:
+                    updated = refresh_func(source)
+                    if isinstance(updated, MediaSource) and updated is not source:
+                        source.__dict__.update(updated.__dict__)
+        if last_error is not None:
+            raise last_error
+
+
+def _load_audio_prefetched(source, sr, frame_count, prefetch_chunk_size,
+                           prefetch_concurrency, progress_callback=None):
+    cmd = build_audio_command(source, sr, frame_count, input_source="pipe:0")
+    chunk_size = frame_count * 2
+    process = subprocess.Popen(cmd, bufsize=1, stdin=subprocess.PIPE, **_subprocess_options())
+    register_proc(process)
+    writer_error = []
+
+    def writer():
+        try:
+            for compressed in iter_range_bytes(
+                source, chunk_size=prefetch_chunk_size, concurrency=prefetch_concurrency,
+                progress_callback=progress_callback
+            ):
+                process.stdin.write(compressed)
+        except Exception as exc:
+            writer_error.append(exc)
+        finally:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=writer, name="youtube-memory-prefetch", daemon=True)
+    thread.start()
+    yielded = False
+    try:
+        while True:
+            chunk = process.stdout.read(chunk_size)
+            if not chunk:
+                break
+            yielded = True
+            yield chunk
+        thread.join(timeout=1)
+        if thread.is_alive():
+            process.terminate()
+            thread.join(timeout=1)
+        process.stdout.close()
+        return_code = process.wait()
+        if writer_error:
+            error = RangePrefetchError("prefetch writer failed")
+            error.can_fallback = not yielded
+            raise error
+        if return_code:
+            error = RangePrefetchError("prefetch ffmpeg failed")
+            error.can_fallback = not yielded
+            raise error
+    except GeneratorExit:
+        process.terminate()
+        process.wait()
+        thread.join(timeout=1)
+        return
+    except Exception as exc:
+        process.terminate()
+        process.wait()
+        thread.join(timeout=1)
+        if not yielded:
+            if isinstance(exc, RangePrefetchError):
+                raise exc
+            error = RangePrefetchError("prefetch reader failed")
+            error.can_fallback = True
+            raise error from exc
+        error = RangePrefetchError("prefetch stream failed")
+        error.can_fallback = False
+        raise error from exc
+    finally:
+        unregister_proc(process)
+
+
 def hash_file(file_path, algorithm='sha256', chunk_size=8192) -> str:
     hash_obj = hashlib.new(algorithm)
     with open(file_path, 'rb') as f:
@@ -126,8 +323,15 @@ def hash_file(file_path, algorithm='sha256', chunk_size=8192) -> str:
 
 def _get_audio_duration(file):
     """用 ffmpeg（非 ffprobe）快速探测时长。"""
+    if isinstance(file, MediaSource):
+        try:
+            duration = float(file.duration)
+            if math.isfinite(duration) and duration >= 0:
+                return duration
+        except (TypeError, ValueError):
+            pass
     try:
-        cmd = [FFMPEG_PATH, '-hide_banner', '-i', file]
+        cmd = build_audio_command(file, SAMPLE_RATE, 0, output_pipe=False)
         out = run_tracked(cmd, timeout=10, text=True)
         m = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', out.stderr or '')
         if m:
@@ -136,6 +340,23 @@ def _get_audio_duration(file):
     except Exception:
         pass
     return None
+
+
+def _duration_block_count(duration, block_size):
+    if duration is None:
+        return 1
+    return max(1, math.ceil(float(duration) / block_size))
+
+
+def _log_remote_progress(logger, duration, block_size):
+    block_count = _duration_block_count(duration, block_size)
+    message = f"Remote Stream blocks: {block_count} (block size: {block_size}s)"
+    print(message)
+    if hasattr(logger, "log"):
+        logger.log(message)
+    elif callable(logger):
+        logger(message)
+    return block_count
 
 
 class _SizedIterable:
@@ -151,9 +372,23 @@ class _SizedIterable:
 MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
+def _detection_cache_args(source, model, precision, block_size, threshold, focus_idx):
+    return (
+        source.platform,
+        source.source_id,
+        model,
+        str(precision),
+        block_size,
+        threshold,
+        focus_idx,
+        {},
+    )
+
+
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
-                   use_gpu=True):
+                   use_gpu=True, cache_store=None, progress_callback=None,
+                   refresh_func=None):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -161,17 +396,35 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     if block_size < 0:
         raise Exception("Block size must be a positive number!")
 
-    file_hash = hash_file(file)
-    cache_key = (file_hash, precision, block_size, threshold, model, focus_idx)
+    is_remote = isinstance(file, MediaSource)
+    if is_remote:
+        cache_key = (stable_source_id(file), precision, block_size, threshold, model, focus_idx)
+        if cache_store is not None:
+            cached = cache_store.load_detection_result(
+                *_detection_cache_args(file, model, precision, block_size, threshold, focus_idx)
+            )
+            if cached is not None:
+                cached['filename'] = file
+                return cached, True
+    else:
+        file_hash = hash_file(file)
+        cache_key = (file_hash, precision, block_size, threshold, model, focus_idx)
+
     if ort_session is None and cache_key in timestamps_dict:
         previous_data = timestamps_dict[cache_key]
         previous_data['filename'] = file
         if logger:
             bar_logger = default_bar_logger(logger)
             _dur = _get_audio_duration(file)
-            block_count = max(1, int(_dur / block_size) + 1) if _dur is not None else 1
+            block_count = (_duration_block_count(_dur, block_size)
+                           if is_remote else
+                           (max(1, int(_dur / block_size) + 1) if _dur is not None else 1))
+            if is_remote and _dur is not None:
+                _log_remote_progress(logger, _dur, block_size)
             for _ in bar_logger.iter_bar(block=range(block_count)):
-                pass
+                if progress_callback is not None and is_remote:
+                    progress_callback(format_transfer_progress(
+                        _ + 1, block_count, 0, source_duration=_dur))
         return previous_data, True
 
     if ort_session is None:
@@ -189,21 +442,46 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                                                providers=['CPUExecutionProvider'])
 
     offset = 0
-    blocks = load_audio(file, SAMPLE_RATE, SAMPLE_RATE * block_size)
+    blocks = load_audio(
+        file, SAMPLE_RATE, SAMPLE_RATE * block_size,
+        progress_callback=progress_callback if is_remote else None,
+        refresh_func=refresh_func if is_remote else None,
+    )
     _dur = _get_audio_duration(file)
+    block_count = 1
     if _dur is not None:
-        blocks = _SizedIterable(blocks, max(1, int(_dur / block_size) + 1))
+        block_count = (_duration_block_count(_dur, block_size)
+                       if is_remote else max(1, int(_dur / block_size) + 1))
+        if is_remote:
+            _log_remote_progress(logger, _dur, block_size)
+        blocks = _SizedIterable(blocks, block_count)
     else:
         blocks = _SizedIterable(blocks, 1)
 
     info = {'filename': file, 'timestamps': []}
     frame_count = SAMPLE_RATE * block_size
+    processed_blocks = 0
+    started_at = time.monotonic()
 
     if logger:
         bar_logger = default_bar_logger(logger)
         blocks = bar_logger.iter_bar(block=blocks)
 
-    for block in blocks:
+    for block_index, block in enumerate(blocks, 1):
+        processed_blocks = block_index
+        if is_remote:
+            if progress_callback is not None:
+                progress_callback(
+                    format_block_progress(
+                        block_index, block_count, time.monotonic() - started_at,
+                        source_duration=_dur,
+                    )
+                    if str(getattr(file, "platform", "")).lower() == "bilibili"
+                    else format_transfer_progress(
+                        block_index, block_count, time.monotonic() - started_at,
+                        source_duration=_dur,
+                    )
+                )
         samples = np.frombuffer(block, dtype=np.int16)
         samples = pad_array_if_needed(samples, frame_count)
         samples = samples.reshape(1, -1)
@@ -214,6 +492,24 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         preds = framewise_output[0]
         info["timestamps"].extend(compute_timestamps(preds, precision, threshold, focus_idx, offset))
         offset += block_size
+
+    if is_remote and _dur is not None:
+        if processed_blocks < block_count:
+            message = (
+                f"Remote Stream incomplete: processed {processed_blocks}/{block_count} blocks "
+                f"({file.display_name or file.source_id or 'remote source'})"
+            )
+            print(f"Remote Stream incomplete: processed {processed_blocks}/{block_count} blocks")
+            raise RemoteAudioIncompleteError(message)
+        print(f"Remote Stream completed: {processed_blocks}/{block_count} blocks")
+
+    if is_remote and cache_store is not None:
+        cache_result = dict(info)
+        cache_result['filename'] = file.source_url
+        cache_store.save_detection_result(
+            *_detection_cache_args(file, model, precision, block_size, threshold, focus_idx),
+            cache_result,
+        )
 
     if len(timestamps_dict) >= MAX_CACHE_SIZE:
         timestamps_dict.popitem(last=False)

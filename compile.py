@@ -11,11 +11,19 @@ import tempfile
 
 from colorama import Fore, Style
 
-from utils import FFMPEG_PATH, run_tracked
+from progress import format_compile_progress
+from utils import FFMPEG_PATH, run_tracked, run_tracked_progress
 import sys
 import os
 
 MERGE_THRESHOLD = 2  # seconds
+
+
+def _source_key(filename, entry=None):
+    metadata = (entry or {}).get("source_metadata") or {}
+    if metadata.get("source_id"):
+        return f"{str(metadata.get('platform') or 'unknown').lower()}:{metadata['source_id']}"
+    return os.path.normcase(os.path.normpath(str(filename)))
 
 # 输入 -ss 在 MPEG-TS（尤其直播录像，PTS 不连续）上按字节估算落点，
 # 视频可能落在目标数秒之外（实测 +3.5s），而音频落点正确。
@@ -23,6 +31,26 @@ MERGE_THRESHOLD = 2  # seconds
 # 导致整段 clip 画面冻结（用户报"corrupted"）。
 # 对策：输入多回退 _SEEK_PAD 秒，再用输出 -ss/-to 精确定位（PTS 相对值不变）。
 _SEEK_PAD = 10.0  # seconds
+
+
+def _run_ffmpeg(command, timeout, progress_callback=None, duration=None, stage="FFmpeg"):
+    if progress_callback is None:
+        return run_tracked(command, timeout=timeout, text=True)
+
+    def report(current, total, elapsed):
+        progress_callback(format_compile_progress(current, total, elapsed, stage))
+
+    return run_tracked_progress(
+        command, duration=duration, timeout=timeout, progress_callback=report
+    )
+
+
+def clip_safe_end(duration, entry=None):
+    """Return the usable end time without shortening generated remote clips."""
+    metadata = (entry or {}).get('source_metadata') or {}
+    if metadata.get('materialized_remote_segment'):
+        return duration
+    return max(0, duration - 0.5)
 
 
 def _ffprobe(input_file: str):
@@ -107,13 +135,13 @@ def _fallback_to_x264():
 
 
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
-                fps=None):
+                fps=None, preserve_duration=False, progress_callback=None):
     if not timestamps:
         return False
 
     duration = _get_video_duration(input_file)
     if duration:
-        safe_end = max(0, duration - 0.5)
+        safe_end = duration if preserve_duration else max(0, duration - 0.5)
         timestamps = [(max(0, s), min(e, safe_end)) for s, e in timestamps
                        if s < safe_end and (min(e, safe_end) - max(0, s)) >= 1.0]
     else:
@@ -154,13 +182,17 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             c.append(output_file)
             return c
 
-        result = run_tracked(build_cmd(video_codec), timeout=600, text=True)
+        result = _run_ffmpeg(build_cmd(video_codec), timeout=600,
+                             progress_callback=progress_callback, duration=dur,
+                             stage="Encoding clip")
         if result.returncode != 0 and 'h264_nvenc' in video_codec:
             _fallback_to_x264()
             codec = list(_X264_CODEC)
             if fps and fps > 0:
                 codec += ['-r', str(int(fps))]
-            result = run_tracked(build_cmd(codec), timeout=600, text=True)
+            result = _run_ffmpeg(build_cmd(codec), timeout=600,
+                                 progress_callback=progress_callback, duration=dur,
+                                 stage="Encoding clip")
         if result.returncode != 0:
             raise Exception(f"FFmpeg cut failed for {os.path.basename(input_file)}"
                             f"\n  rc={result.returncode}\n  stderr: {result.stderr}\n  stdout: {result.stdout}")
@@ -172,10 +204,14 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         for i, (s, e) in enumerate(timestamps):
             seg_file = os.path.join(seg_dir, f"_seg{i}.mp4")
             seg_files.append(seg_file)
-            _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None, normalize=normalize, fps=fps)
+            _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None,
+                        normalize=normalize, fps=fps,
+                        preserve_duration=preserve_duration,
+                        progress_callback=progress_callback)
         # 必须走 batched：单视频上千 segment 时 _ffmpeg_concat 会把所有 -i
         # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206
-        _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize, fps=fps)
+        _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
+                               fps=fps, progress_callback=progress_callback)
     finally:
         for sf in seg_files:
             try:
@@ -185,7 +221,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     return True
 
 
-def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
+def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
+                    progress_callback=None):
     """Concatenate using concat FILTER (frame-level, not demuxer)."""
     if not file_list:
         return False
@@ -263,7 +300,9 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
 
     video_codec = get_video_codec()
     try:
-        result = run_tracked(build_cmd(video_codec), timeout=concat_timeout, text=True)
+        result = _run_ffmpeg(build_cmd(video_codec), timeout=concat_timeout,
+                             progress_callback=progress_callback, duration=total_dur,
+                             stage="Final merge")
     except subprocess.TimeoutExpired:
         if 'h264_nvenc' not in video_codec:
             raise
@@ -271,7 +310,9 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
         result = None
     if result is None or (result.returncode != 0 and 'h264_nvenc' in video_codec):
         _fallback_to_x264()
-        result = run_tracked(build_cmd(list(_X264_CODEC)), timeout=concat_timeout, text=True)
+        result = _run_ffmpeg(build_cmd(list(_X264_CODEC)), timeout=concat_timeout,
+                             progress_callback=progress_callback, duration=total_dur,
+                             stage="Final merge")
     if result.returncode != 0:
         missing = [fp for fp in file_list if not os.path.exists(fp)]
         no_video = []
@@ -289,7 +330,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None):
     return True
 
 
-def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6, fps=None, _lvl=0):
+def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6,
+                           fps=None, _lvl=0, progress_callback=None):
     """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
     保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。"""
     if not file_list:
@@ -317,7 +359,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                 print(f"  Target resolution: {res[0]}x{res[1]}")
 
     if len(file_list) <= batch_size:
-        return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize, fps=fps)
+        return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize, fps=fps,
+                              progress_callback=progress_callback)
 
     temp_dir = os.path.dirname(output_file) or os.path.dirname(file_list[0])
     batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
@@ -327,16 +370,25 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
             batch_out = os.path.join(temp_dir, f"_batchL{_lvl}_{bi}.mp4")
             batch_files.append(batch_out)
             print(f"  Batch {bi + 1}/{len(batches)} ({len(batch)} files)...")
-            ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps)
+            if progress_callback is not None:
+                progress_callback(format_compile_progress(
+                    0, None, 0, f"Batch {bi + 1}/{len(batches)}: starting"
+                ))
+            ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps,
+                                progress_callback=progress_callback)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
         print(f"  Final merge ({len(batch_files)} files)...")
+        if progress_callback is not None:
+            progress_callback(format_compile_progress(0, None, 0, "Final merge: starting"))
         if len(batch_files) > batch_size:
             # 批数仍过多，继续递归分批（层级文件名避免覆盖同层）
             return _ffmpeg_concat_batched(batch_files, output_file, res=res,
                                           normalize=normalize, batch_size=batch_size,
-                                          fps=fps, _lvl=_lvl + 1)
-        _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps)
+                                          fps=fps, _lvl=_lvl + 1,
+                                          progress_callback=progress_callback)
+        _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps,
+                        progress_callback=progress_callback)
     finally:
         for bf in batch_files:
             try:
@@ -348,7 +400,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
 
 # ═══ AUDIO cut / concat ═══════════════════════════════════════════════
 
-def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
+def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False,
+                      progress_callback=None):
     if not timestamps:
         return False
 
@@ -375,7 +428,8 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
         if normalize:
             cmd.extend(['-af', 'loudnorm'])
         cmd.append(output_file)
-        result = run_tracked(cmd, timeout=600, text=True)
+        result = _run_ffmpeg(cmd, timeout=600, progress_callback=progress_callback,
+                             duration=e - s, stage="Encoding audio clip")
         if result.returncode != 0:
             raise Exception(f"FFmpeg audio cut failed for {os.path.basename(input_file)}:\n{result.stderr}")
         return True
@@ -386,8 +440,10 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
         for i, (s, e) in enumerate(timestamps):
             seg_file = os.path.join(seg_dir, f"_aseg{i}.mp3")
             seg_files.append(seg_file)
-            _ffmpeg_cut_audio(input_file, [(s, e)], seg_file, normalize=normalize)
-        _ffmpeg_concat_audio(seg_files, output_file, normalize=normalize)
+            _ffmpeg_cut_audio(input_file, [(s, e)], seg_file, normalize=normalize,
+                              progress_callback=progress_callback)
+        _ffmpeg_concat_audio(seg_files, output_file, normalize=normalize,
+                             progress_callback=progress_callback)
     finally:
         for sf in seg_files:
             try:
@@ -397,7 +453,7 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False):
     return True
 
 
-def _ffmpeg_concat_audio(file_list, output_file, normalize=False):
+def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callback=None):
     if not file_list:
         return False
     if len(file_list) == 1:
@@ -427,7 +483,9 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False):
         cmd += ['-c:a', 'copy']
     cmd.append(output_file)
 
-    result = run_tracked(cmd, timeout=600, text=True)
+    total_duration = sum((duration or 0) for duration in durations)
+    result = _run_ffmpeg(cmd, timeout=600, progress_callback=progress_callback,
+                         duration=total_duration, stage="Final audio merge")
     try:
         os.remove(list_path)
     except OSError:
@@ -445,7 +503,7 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False):
 
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
-                excluded=None):
+                excluded=None, progress_callback=None):
     output_format = ".mp4" if is_video else ".mp3"
 
     # 清理上次崩溃/强杀残留的中间文件（只删我们自己的命名模式，不碰用户文件）
@@ -492,7 +550,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 # 区间桥接，否则被删片段的内容会随桥接重新出现在成片里（~1s 残影）。
                 blocked = []
                 if excluded:
-                    blocked = [(s, e) for s, e in excluded.get(filename, []) if e > s]
+                    blocked = [(s, e) for s, e in excluded.get(_source_key(filename, elt), []) if e > s]
                     # 与保留片段重叠的排除段不是用户删除（如 reverify 新增 clip
                     # 覆盖后被 auto-deselect 的 original），不能当禁区
                     blocked = [r for r in blocked
@@ -515,7 +573,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
 
                 dur = _get_video_duration(filename)
                 if dur:
-                    safe_end = max(0, dur - 0.5)
+                    safe_end = clip_safe_end(dur, elt)
                     orig_count = len(timestamps)
                     timestamps = [(max(0, s), min(e, safe_end)) for s, e in timestamps
                                    if s < safe_end and (min(e, safe_end) - max(0, s)) >= 1.0]
@@ -555,17 +613,29 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     temp = os.path.join(output, f"{base}_comped{output_format}")
 
                 cut_res = res if (is_video and not combine_vids and res is not None) else None
-                tasks.append((n, filename, filename_stripped, timestamps, temp, cut_res))
+                preserve_duration = bool(
+                    (elt.get('source_metadata') or {}).get(
+                        'materialized_remote_segment'))
+                tasks.append((n, filename, filename_stripped, timestamps, temp,
+                              cut_res, preserve_duration))
 
             if not tasks:
                 raise Exception("No timestamps found for any input media!")
+            if progress_callback is not None:
+                progress_callback(format_compile_progress(0, None, 0, "Compile: preparing"))
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), max_parallel)) as executor:
                 running = {}
                 for task in tasks:
-                    n, fn, fn_stripped, ts, tmp, cr = task
+                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration = task
                     f = executor.submit(cut_func, fn, ts, tmp,
-                                       **({'res': cr, 'fps': fps} if is_video else {}), normalize=normalize)
+                                        **({'res': cr, 'fps': fps,
+                                            'preserve_duration': preserve_duration,
+                                            'progress_callback': progress_callback}
+                                            if is_video else {}),
+                                       normalize=normalize,
+                                       **({'progress_callback': progress_callback}
+                                          if not is_video else {}))
                     running[f] = (n, fn_stripped)
 
                 for future in concurrent.futures.as_completed(running):
@@ -581,9 +651,13 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 tempfiles = [t for t in [task[4] for task in tasks] if os.path.exists(t)]
                 print("Combining individual media, please do not close the program...", end="")
                 if is_video:
-                    _ffmpeg_concat_batched(tempfiles, output, res=res, normalize=normalize, fps=fps)
+                    _ffmpeg_concat_batched(
+                        tempfiles, output, res=res, normalize=normalize, fps=fps,
+                        progress_callback=progress_callback,
+                    )
                 else:
-                    concat_func(tempfiles, output, normalize=normalize)
+                    concat_func(tempfiles, output, normalize=normalize,
+                                progress_callback=progress_callback)
                 print(f"{Fore.GREEN}Done combining media.")
 
     except Exception:

@@ -1,0 +1,296 @@
+"""Bounded in-memory HTTP range prefetching for YouTube audio streams."""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+
+from progress import format_transfer_progress
+
+
+DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
+DEFAULT_CONCURRENCY = 4
+DEFAULT_TIMEOUT = 30
+DEFAULT_RANGE_ATTEMPTS = 5
+DEFAULT_RETRY_DELAYS = (2, 5, 10, 20, 40)
+
+
+class SpeedMonitor:
+    """Detect sustained low throughput after an initial connection warmup."""
+
+    def __init__(self, threshold=1.0, warmup_samples=2, slow_samples=2):
+        self.threshold = float(threshold)
+        self.warmup_samples = int(warmup_samples)
+        self.slow_samples = int(slow_samples)
+        self.samples = 0
+        self.slow_streak = 0
+
+    def observe(self, megabytes_per_second):
+        self.samples += 1
+        if self.samples <= self.warmup_samples:
+            return False
+        if float(megabytes_per_second) < self.threshold:
+            self.slow_streak += 1
+        else:
+            self.slow_streak = 0
+        return self.slow_streak >= self.slow_samples
+
+    def reset(self):
+        self.samples = 0
+        self.slow_streak = 0
+
+
+class RangePrefetchError(Exception):
+    """A range request could not safely provide the compressed stream."""
+
+
+def _size_from(source):
+    metadata = getattr(source, "metadata", {}) or {}
+    candidate = getattr(source, "audio_candidates", []) or []
+    active = next((item for item in candidate
+                   if str(item.get("url") or "") == str(getattr(source, "audio_url", ""))), None)
+    for item in ((active,) if active is not None else (metadata,)):
+        for key in ("filesize", "filesize_approx", "clen"):
+            value = item.get(key)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return None
+
+
+def supports_range_prefetch(source):
+    platform = str(getattr(source, "platform", "")).lower()
+    url = str(getattr(source, "audio_url", ""))
+    return platform in {"youtube", "bilibili"} and url.startswith(("http://", "https://")) and _size_from(source) is not None
+
+
+def supports_hls_prefetch(source):
+    platform = str(getattr(source, "platform", "")).lower()
+    url = str(getattr(source, "audio_url", ""))
+    return platform == "twitch" and url.startswith(("http://", "https://"))
+
+
+def _default_request(url, start, end, headers, timeout):
+    request_headers = dict(headers or {})
+    request_headers["Range"] = f"bytes={start}-{end}"
+    request = Request(url, headers=request_headers)
+    with urlopen(request, timeout=timeout) as response:
+        response_headers = {str(key): str(value) for key, value in response.headers.items()}
+        return response.read(), int(getattr(response, "status", response.getcode())), response_headers
+
+
+def _default_hls_request(url, headers, timeout):
+    request = Request(url, headers=dict(headers or {}))
+    with urlopen(request, timeout=timeout) as response:
+        return response.read(), int(getattr(response, "status", response.getcode()))
+
+
+def _log(logger, message):
+    if logger is None:
+        return
+    if hasattr(logger, "log"):
+        logger.log(message)
+    elif callable(logger):
+        logger(message)
+
+
+def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_CONCURRENCY,
+                     request_func=None, logger=None, progress_callback=None,
+                     max_attempts=DEFAULT_RANGE_ATTEMPTS,
+                     retry_delays=DEFAULT_RETRY_DELAYS, sleep_func=time.sleep,
+                     speed_monitor=None, slow_callback=None, start_offset=0):
+    """Yield a known-size YouTube audio stream in byte order with bounded prefetch."""
+    try:
+        chunk_size = int(chunk_size)
+        concurrency = int(concurrency)
+    except (TypeError, ValueError) as exc:
+        raise RangePrefetchError("invalid prefetch parameters") from exc
+    size = _size_from(source)
+    if chunk_size <= 0 or concurrency <= 0 or size is None:
+        raise RangePrefetchError("range prefetch requires a positive known audio size")
+    if not supports_range_prefetch(source):
+        raise RangePrefetchError("source does not support range prefetch")
+    try:
+        start_offset = int(start_offset)
+    except (TypeError, ValueError) as exc:
+        raise RangePrefetchError("invalid range resume offset") from exc
+    if start_offset < 0 or start_offset > size:
+        raise RangePrefetchError("range resume offset is outside the source")
+
+    platform = str(getattr(source, "platform", "")).lower()
+    platform_label = "YouTube" if platform == "youtube" else "Bilibili"
+    _log(logger, f"{platform_label} memory prefetch: {concurrency} workers, {chunk_size // (1024 * 1024)}MiB chunks")
+    request = request_func or _default_request
+    headers = dict(getattr(source, "audio_headers", {}) or {})
+    ranges = [(start, min(size - 1, start + chunk_size - 1))
+              for start in range(start_offset, size, chunk_size)]
+    worker_concurrency = 1 if platform == "bilibili" else concurrency
+    window = max(1, worker_concurrency * 2)
+
+    def fetch(index, start, end):
+        last_error = None
+        started_at = time.monotonic()
+        for attempt in range(max(1, int(max_attempts))):
+            try:
+                result = request(source.audio_url, start, end, dict(headers), DEFAULT_TIMEOUT)
+                response_headers = {}
+                if not isinstance(result, tuple) or len(result) not in (2, 3):
+                    raise RangePrefetchError("invalid range response")
+                data, status = result[:2]
+                if len(result) == 3 and result[2]:
+                    response_headers = {str(key).lower(): str(value) for key, value in result[2].items()}
+                if int(status) != 206:
+                    raise RangePrefetchError("range server returned a non-partial response")
+                expected_length = end - start + 1
+                short_final = platform == "bilibili" and index == len(ranges) - 1 and len(data) < expected_length
+                if len(data) != expected_length and not short_final:
+                    raise RangePrefetchError("range response length mismatch")
+                if short_final:
+                    content_range = response_headers.get("content-range", "")
+                    if content_range and not content_range.lower().startswith(f"bytes {start}-{start + len(data) - 1}/"):
+                        raise RangePrefetchError("range response Content-Range mismatch")
+                elapsed = max(time.monotonic() - started_at, 0.001)
+                speed = len(data) / elapsed / (1024 * 1024)
+                return index, bytes(data), speed
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < max(1, int(max_attempts)):
+                    delay = retry_delays[min(attempt, len(retry_delays) - 1)] if retry_delays else 0
+                    if delay:
+                        sleep_func(delay)
+        raise RangePrefetchError("range request failed after retry") from last_error
+
+    executor = ThreadPoolExecutor(max_workers=worker_concurrency)
+    futures = {}
+    pending_index = 0
+    next_index = 0
+    buffered = {}
+    started_at = time.monotonic()
+    completed_bytes = start_offset
+    try:
+        while pending_index < len(ranges) and len(futures) < window:
+            start, end = ranges[pending_index]
+            futures[executor.submit(fetch, pending_index, start, end)] = pending_index
+            pending_index += 1
+        while futures:
+            completed = next(as_completed(tuple(futures)))
+            index = futures.pop(completed)
+            result_index, data, speed = completed.result()
+            buffered[result_index] = data
+            if speed_monitor is not None and speed_monitor.observe(speed):
+                if slow_callback is not None:
+                    slow_callback(source, speed)
+                speed_monitor.reset()
+            while next_index in buffered:
+                data = buffered.pop(next_index)
+                completed_bytes += len(data)
+                if progress_callback is not None:
+                    progress_callback(format_transfer_progress(
+                        completed_bytes, size, time.monotonic() - started_at))
+                yield data
+                next_index += 1
+            while pending_index < len(ranges) and len(futures) < window:
+                start, end = ranges[pending_index]
+                futures[executor.submit(fetch, pending_index, start, end)] = pending_index
+                pending_index += 1
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _hls_attribute(line, name):
+    prefix = name + '="'
+    start = line.find(prefix)
+    if start < 0:
+        return ""
+    start += len(prefix)
+    end = line.find('"', start)
+    return line[start:end] if end >= 0 else ""
+
+
+def iter_hls_bytes(source, concurrency=DEFAULT_CONCURRENCY, request_func=None, logger=None,
+                   progress_callback=None):
+    """Yield Twitch HLS init and media fragments in playlist order."""
+    try:
+        concurrency = int(concurrency)
+    except (TypeError, ValueError) as exc:
+        raise RangePrefetchError("invalid HLS concurrency") from exc
+    if concurrency <= 0 or not supports_hls_prefetch(source):
+        raise RangePrefetchError("source does not support HLS prefetch")
+    request = request_func or _default_hls_request
+    headers = dict(getattr(source, "audio_headers", {}) or {})
+
+    def fetch(url):
+        try:
+            result = request(url, dict(headers), DEFAULT_TIMEOUT)
+            if not isinstance(result, tuple) or len(result) < 2 or int(result[1]) < 200 or int(result[1]) >= 300:
+                raise RangePrefetchError("HLS request returned an invalid response")
+            return bytes(result[0])
+        except Exception as exc:
+            raise RangePrefetchError("HLS request failed") from exc
+
+    try:
+        manifest = fetch(source.audio_url).decode("utf-8")
+        playlist_urls = _parse_hls_playlist(manifest, source.audio_url, fetch)
+        _log(logger, f"Twitch HLS prefetch: {len(playlist_urls)} fragments")
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        futures = {}
+        next_submit = 0
+        next_yield = 0
+        buffered = {}
+        completed = 0
+        window = max(1, concurrency * 2)
+        try:
+            while next_submit < len(playlist_urls) and len(futures) < window:
+                future = executor.submit(fetch, playlist_urls[next_submit])
+                futures[future] = next_submit
+                next_submit += 1
+            while futures:
+                completed_future = next(as_completed(tuple(futures)))
+                index = futures.pop(completed_future)
+                buffered[index] = completed_future.result()
+                while next_yield in buffered:
+                    data = buffered.pop(next_yield)
+                    completed += len(data)
+                    if progress_callback is not None:
+                        progress_callback(format_transfer_progress(completed, None, 0))
+                    yield data
+                    next_yield += 1
+                while next_submit < len(playlist_urls) and len(futures) < window:
+                    future = executor.submit(fetch, playlist_urls[next_submit])
+                    futures[future] = next_submit
+                    next_submit += 1
+        finally:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+    except RangePrefetchError:
+        raise
+    except Exception as exc:
+        raise RangePrefetchError("HLS manifest processing failed") from exc
+
+
+def _parse_hls_playlist(manifest, base_url, fetch):
+    lines = [line.strip() for line in manifest.splitlines() if line.strip()]
+    variants = [(line, lines[index + 1]) for index, line in enumerate(lines[:-1])
+                if line.startswith("#EXT-X-STREAM-INF:") and not lines[index + 1].startswith("#")]
+    if variants:
+        audio = [item for item in variants if "AUDIO=" in item[0].upper()]
+        uri = max(audio or variants, key=lambda item: item[0].count("BANDWIDTH="))[1]
+        child_url = urljoin(base_url, uri)
+        return _parse_hls_playlist(fetch(child_url).decode("utf-8"), child_url, fetch)
+    result = []
+    for line in lines:
+        if line.startswith("#EXT-X-MAP:"):
+            uri = _hls_attribute(line, "URI")
+            if uri:
+                result.append(urljoin(base_url, uri))
+        elif not line.startswith("#"):
+            result.append(urljoin(base_url, line))
+    if not result:
+        raise RangePrefetchError("HLS manifest contains no media segments")
+    return result
