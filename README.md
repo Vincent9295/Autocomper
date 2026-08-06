@@ -1,6 +1,6 @@
-# AutoComper (Enhanced)
+# AutoComper Enhanced
 
-> Forked from [wz-bff/AutoComper](https://github.com/wz-bff/AutoComper) — a GUI frontend for AI-powered sound detection video clipping.
+> Original [wz-bff/AutoComper](https://github.com/wz-bff/AutoComper) — the foundation.
 
 This enhanced version adds **clip review, re-verification, editing, batch processing**, and a **native FFmpeg GPU pipeline** — improving both speed and usability.
 
@@ -20,8 +20,12 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Save Selected** | Review dialog exports checked clips to `{original}_selected.txt` for future re-use. |
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat. |
 | **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
+| **Remote VOD Processing** | Process Bilibili, YouTube, and Twitch VODs from remote audio; fetch only selected video segments. |
+| **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
 
-### Technical Improvements
+### Technical Improvements vs. the Original
+
+The following are improvements in this Enhanced version compared with the original project:
 
 | Area | Original | Enhanced |
 |------|----------|----------|
@@ -93,13 +97,94 @@ If CUDA isn't installed, the app falls back to CPU automatically.
 
 ## 📖 Usage
 
-1. **Add Videos** — pick files or use **Add Folder** to scan a directory
+1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist.
 2. **Configure** — set Precision / Block Size / Threshold. Use tooltips for guidance.
-3. **Optional: Add Padding** — extend each clip by N seconds before/after detection
-4. **Optional: Re-verify** — rescan near detected clips to catch missed sounds
-5. **Optional: Review** — preview each clip, check/uncheck, double-click to edit times
-6. **Select Output File** — choose where to save the compiled video(s)
-7. **Process Videos** — compile!
+3. **Choose Remote Processing** for URL inputs:
+   - **Remote Stream** reads remote audio directly and fetches video only for previews/selected clips.
+   - **Audio Cache** downloads only compressed audio, then detects locally; useful on unstable networks.
+   - **Full Download** uses the existing complete-download workflow.
+4. **Optional: Add Padding** — extend each clip by N seconds before/after detection.
+5. **Optional: Re-verify** — rescan near detected clips to catch missed sounds.
+6. **Optional: Review** — preview and check/uncheck every clip before compiling. Remote video previews are fetched on demand.
+7. **Select Output File** — choose where to save the compiled video(s).
+8. **Process Videos** — compile!
+
+### Remote VOD Notes
+
+Remote processing lets AutoComper analyze a VOD without first downloading the complete video. It still has to read the compressed audio for the full VOD, because the detector must search the entire timeline.
+
+#### Which Remote Processing Mode Should I Use?
+
+| Mode | What it does | Best for | Trade-offs |
+|------|--------------|----------|------------|
+| **Remote Stream** | Reads remote audio directly while ONNX analyzes it in blocks. Video is fetched only for previews and selected clips. | A first pass when disk space is limited | Sensitive to CDN interruptions and network speed; a failed block is retried before the VOD is skipped. |
+| **Audio Cache** | Downloads only compressed audio into the persistent cache, then runs detection locally from that file. | Repeated runs, reverify, or unstable networks | The first run still depends on the remote CDN; later runs reuse the cached audio. |
+| **Full Download** | Downloads the complete video using the normal yt-dlp workflow, then processes the local file. | Sources that do not work reliably with streaming, or users who need a local copy | Requires the most disk space and the longest initial download. |
+
+Remote Stream reports the current detection block, for example `Block: 6 / 13`. Audio Cache reports 4 MiB download chunks and the current transfer speed. A slow transfer does not necessarily mean that AutoComper is frozen: Bilibili, YouTube, and Twitch can change CDN throughput during a long request.
+
+#### Remote Settings
+
+The **Remote Settings** panel controls how URL inputs are resolved and cached:
+
+- **Remote Processing** selects `Remote Stream`, `Audio Cache`, or `Full Download`.
+- **Remote Browser Cookies** selects how yt-dlp authenticates when a platform requires a browser session:
+  - **Auto** starts without cookies and tries browser cookies when the platform reports that they may help.
+  - **None** never reads browser cookies. Use this for public videos when you do not want browser access.
+  - **Firefox**, **Chrome**, or **Edge** explicitly reads cookies from that browser.
+- **Cache Location** shows where persistent remote data is stored. The default Windows location is `%LOCALAPPDATA%\AutoComper\cache`.
+- **Choose Cache Folder** changes the cache root. A removable drive is supported when it is mounted and writable.
+- **Open Cache Folder** opens the current cache location in File Explorer.
+- **Clear Cache** removes AutoComper's detection, audio, and segment cache entries. It does not delete the original videos or ordinary user files.
+
+#### Import External Audio
+
+**Import External Audio** is available in the Remote Cache button group. It lets you use audio downloaded outside AutoComper as the Audio Cache for a selected remote VOD.
+
+Use it as follows:
+
+1. Select exactly one YouTube, Twitch, or Bilibili remote URL in the main media list.
+2. Click **Import External Audio**.
+3. Choose one local media file.
+4. Let AutoComper inspect the file, verify its audio stream and duration, and register it for the selected VOD.
+
+Supported input containers include `.m4s`, `.mp4`, `.m4a`, `.webm`, `.opus`, `.mp3`, `.wav`, and `.flac`. An `.mp4` is accepted only when it contains an audio stream; its video stream is ignored. A fragmented `.m4s` file must contain enough initialization data for FFmpeg to read it.
+
+Only one audio file is imported at a time. This is intentional: automatic multi-file ordering can silently create the wrong timeline or audio overlap. Bilibili multi-part videos must be imported one part at a time, with the matching part selected in the media list.
+
+AutoComper converts non-AAC audio to AAC in an `.m4a` cache file. If the input already contains AAC/MP4A audio, it uses a direct copy/remux path instead of re-encoding, which is substantially faster. The original file is not moved, deleted, or uploaded. The imported audio must cover the same timeline as the selected VOD; a filename alone cannot identify its source.
+
+#### Why Browser Cookies May Be Needed
+
+Browser cookies are not required for every public VOD. They can help when a platform requires a signed-in session for:
+
+- age-restricted, private, members-only, or region-limited videos;
+- higher-quality formats that are hidden from anonymous requests;
+- Bilibili requests that return HTTP 412 or reject an anonymous CDN request;
+- playlist or channel metadata that is incomplete without a session.
+
+Cookies are read locally through yt-dlp and are not written into AutoComper's cache metadata or normal logs. If a browser reports a DPAPI decryption error, AutoComper tries another configured source when using **Auto**, and the user can select a specific browser that is open, installed, and logged in. A browser must already be signed in; AutoComper does not log in for the user.
+
+#### Why Remote Downloads Can Be Slow
+
+Remote speed depends on more than the local internet connection. Common causes include:
+
+- CDN throttling after a connection has transferred for a while;
+- the route chosen by the ISP, VPN, proxy, or region;
+- an expired or refreshed signed URL;
+- a temporary HTTP error or interrupted range request;
+- a platform selecting a slower audio CDN or format.
+
+AutoComper mitigates transient failures by retrying remote chunks, monitoring throughput, refreshing signed URLs when sustained speed drops, resuming Audio Cache downloads from the completed byte offset, and retrying Bilibili Remote Stream blocks independently. These measures cannot remove a persistent ISP/CDN speed cap. If a source remains slow, try another network route, disable or change the VPN, use **Audio Cache** so later runs do not redownload audio, or use **Full Download**.
+
+#### Cookies, GPU, and Network Responsibilities
+
+- **Remote Browser Cookies** affect source access and available formats; they do not speed up ONNX inference.
+- **Use GPU (CUDA)** controls ONNX inference only. It does not control CDN download speed, remote audio decoding, or FFmpeg encoding.
+- **Remote Stream** and **Audio Cache** need the full remote audio timeline for detection, even though they avoid downloading the full video.
+- Remote **Re-verify** downloads only audio windows around detected candidates, reuses the same ONNX/DRC logic, and maps new timestamps back to the original VOD timeline.
+
+Active live streams, DRM-protected media, and every private or region-restricted source are not guaranteed to work.
 
 ### Re-verify Details
 
