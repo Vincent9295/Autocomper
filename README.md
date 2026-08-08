@@ -22,6 +22,9 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
 | **Remote VOD Processing** | Process Bilibili, YouTube, and Twitch VODs from remote audio; fetch only selected video segments. |
 | **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
+| **Compile Progress Monitoring** | Live remote clip preparation, FFmpeg encoding progress, merge progress, speed, and ETA. |
+| **Max Download Concurrency** | Control how many remote clips are fetched at once while preparing a compilation (default 5). |
+| **Improved UI** | Scrollable settings panel, stable Settings layout, clearer remote clip progress, and repositioned tooltips. |
 
 ### Technical Improvements vs. the Original
 
@@ -123,6 +126,8 @@ Remote processing lets AutoComper analyze a VOD without first downloading the co
 
 Remote Stream reports the current detection block, for example `Block: 6 / 13`. Audio Cache reports 4 MiB download chunks and the current transfer speed. A slow transfer does not necessarily mean that AutoComper is frozen: Bilibili, YouTube, and Twitch can change CDN throughput during a long request.
 
+While a compilation is being prepared, the UI reports `Preparing clips: N / total` together with the current VOD, clip number, time range, and live download speed/ETA. During the FFmpeg compile the same panel shows encoding progress, speed, and ETA, and the log lists each clip as it is written and each concat batch as it is merged. The UI stays responsive even for large compilations.
+
 #### Remote Settings
 
 The **Remote Settings** panel controls how URL inputs are resolved and cached:
@@ -136,6 +141,7 @@ The **Remote Settings** panel controls how URL inputs are resolved and cached:
 - **Choose Cache Folder** changes the cache root. A removable drive is supported when it is mounted and writable.
 - **Open Cache Folder** opens the current cache location in File Explorer.
 - **Clear Cache** removes AutoComper's detection, audio, and segment cache entries. It does not delete the original videos or ordinary user files.
+- **Max Download Concurrency** sets how many remote video clips are fetched at once while preparing a compilation (default 5). Each worker runs its own FFmpeg process, so higher values finish faster on fast connections but use more CPU/disk; lower this to 1-2 if the PC feels sluggish during "Preparing clips". The control is disabled while a run is in progress.
 
 #### Import External Audio
 

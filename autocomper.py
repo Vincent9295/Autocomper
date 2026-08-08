@@ -53,7 +53,9 @@ from colorama import Fore, Style
 from kthread import KThread
 from PIL import Image, ImageTk
 from proglog import ProgressBarLogger
-from progress import ProgressWidgetAdapter, format_compile_progress, format_transfer_progress
+from progress import (ProgressWidgetAdapter, compose_progress_title,
+                      format_compile_progress, format_fetch_progress,
+                      format_transfer_progress)
 
 from compile import _get_video_duration, compile_vid, get_video_codec
 from config import VERSION, REPO_URL
@@ -62,12 +64,14 @@ from sound_reader import RemoteAudioIncompleteError, get_timestamps
 from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            PlaylistDescriptor, PlaylistEntry, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
-                     stable_source_id, SourceResolveError,
-                     _audio_cache_format_identity)
+                           stable_source_id, SourceResolveError,
+                           apply_video_quality_limit,
+                           _audio_cache_format_identity)
 from remote_cache import CacheStore
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
-                     download_audio, download_video, get_bundle_filepath,
-                     kill_tracked_procs, run_tracked, run_tracked_progress)
+                     convert_quality_str_to_int, download_audio, download_video,
+                     get_bundle_filepath, kill_tracked_procs, run_tracked,
+                     run_tracked_progress)
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
 VIDEO_OUTPUT = [("Video Files", "*.mp4"), ("All Files", "*.*")]
@@ -98,6 +102,17 @@ REMOTE_BROWSER_COOKIES_TOOLTIP_TEXT = (
     "Firefox, Chrome, or Edge: read cookies from that browser. The browser must be\n"
     "installed and logged in to the account that can access the remote media."
 )
+REMOTE_CONCURRENCY_TOOLTIP_TEXT = (
+    "How many remote video clips to download at once while preparing clips.\n"
+    "Each worker runs its own FFmpeg process, so higher values use more CPU/disk\n"
+    "and can make the whole PC feel sluggish. On a busy or weaker machine, lower\n"
+    "this to 1-2 if you notice lag during 'Preparing clips'.\n"
+    "Higher values finish faster on fast connections; lower values save bandwidth.\n"
+    "Default: 5. Disabled while a run is in progress."
+)
+REMOTE_CONCURRENCY_DEFAULT = 5
+REMOTE_CONCURRENCY_MIN = 1
+REMOTE_CONCURRENCY_MAX = 16
 REMOTE_CACHE_TOOLTIP_TEXT = (
     "Remote Stream, Audio Cache, reverify, and downloaded segment files are stored here.\n"
     "Full Download does not necessarily use this cache. The cache can be cleared, but\n"
@@ -355,6 +370,16 @@ def normalize_remote_settings(data):
     normalized["remote_browser_cookies"] = (
         cookies if cookies in REMOTE_BROWSER_COOKIES else "Auto"
     )
+    if "remote_download_concurrency" in normalized:
+        try:
+            concurrency = int(normalized["remote_download_concurrency"])
+        except (TypeError, ValueError):
+            concurrency = REMOTE_CONCURRENCY_DEFAULT
+        if concurrency < REMOTE_CONCURRENCY_MIN:
+            concurrency = REMOTE_CONCURRENCY_DEFAULT
+        elif concurrency > REMOTE_CONCURRENCY_MAX:
+            concurrency = REMOTE_CONCURRENCY_MAX
+        normalized["remote_download_concurrency"] = concurrency
     normalized.pop("remote_cache_size", None)
     return normalized
 
@@ -494,6 +519,11 @@ def detection_block_size(remote_mode, user_block_size, is_remote=True):
 def get_source_display_name(value):
     if isinstance(value, MediaSource):
         return value.display_name or value.source_url or stable_source_id(value)
+    if isinstance(value, MediaUpload):
+        source = value.get_source()
+        if isinstance(source, MediaSource):
+            return source.display_name or source.source_url or stable_source_id(source)
+        return os.path.basename(str(value.get_path() or value.get_url() or value))
     return os.path.basename(str(value))
 
 
@@ -560,6 +590,7 @@ def resolve_remote_uploads(
     resolver=None,
     logger=None,
     browser_cookies=None,
+    max_height=None,
 ):
     """Resolve URL uploads without changing local uploads.
 
@@ -580,9 +611,17 @@ def resolve_remote_uploads(
             if source is None:
                 source_url = upload.get_url() or upload.get_path()
                 if browser_cookies is None:
-                    source = resolver(source_url)
+                    if max_height is not None:
+                        source = resolver(source_url, max_height=max_height)
+                    else:
+                        source = resolver(source_url)
+                elif max_height is not None:
+                    source = resolver(source_url, browser_cookies=browser_cookies,
+                                      max_height=max_height)
                 else:
                     source = resolver(source_url, browser_cookies=browser_cookies)
+            elif max_height is not None and source.max_height != max_height:
+                source = apply_video_quality_limit(source, max_height)
             upload.set_source(source)
             upload.set_path(source.display_name or source.source_url)
             remote_sources.append((upload, source))
@@ -612,7 +651,8 @@ def select_remote_stream_audio(remote_entries, selector=None, logger=None):
 
 def refresh_remote_source(source, browser_cookies=None):
     """Resolve fresh stream URLs without logging signed URL or cookie details."""
-    refreshed = resolve_source(source.source_url, browser_cookies=browser_cookies)
+    refreshed = resolve_source(source.source_url, browser_cookies=browser_cookies,
+                               max_height=source.max_height)
     if refreshed.platform in {"bilibili", "bilibiliweb"}:
         try:
             select_audio_candidate(refreshed, probe_duration=1, log_func=None)
@@ -624,107 +664,245 @@ def refresh_remote_source(source, browser_cookies=None):
 def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                                selected_intervals=None, cache_store=None, padding=None,
                                is_video=True, refresh_func=None, failures=None,
-                               progress_callback=None):
-    """Return compile-ready entries with padding normalized exactly once."""
+                               progress_callback=None, max_parallel=5):
+    """Return compile-ready entries with padding normalized exactly once.
+
+    Remote video/audio clips are downloaded concurrently (``max_parallel``
+    workers) while preserving input order in the returned list. A failed clip
+    is isolated into ``failures`` without blocking the rest of the batch.
+    """
     selected_intervals = selected_intervals or {}
     before, after = (padding or (0, 0))
     before, after = float(before), float(after)
     if before < 0 or after < 0:
         raise ValueError("Clip padding cannot be negative!")
-    materialized = []
+    materialized: list[dict] = []
     remote_video_total = sum(
         1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
     )
+    refresh_lock = threading.Lock()
+    state = {"total": 0, "completed": 0}
+    completed_lock = threading.Lock()
+    in_flight = {}
+    in_flight_lock = threading.Lock()
+
+    def emit(event):
+        if progress_callback is not None:
+            progress_callback(event)
+
+    def fetch_task(task):
+        (entry_index, interval_index, source, start, end, output,
+         clip_index, clips_total, video_index, duration, pred) = task
+        in_flight_key = (entry_index, interval_index)
+
+        def fetch_progress(current, total_value, elapsed):
+            with in_flight_lock:
+                if not in_flight:
+                    return
+                display_key = min(in_flight, key=lambda key: in_flight[key]["order"])
+                meta = in_flight[display_key]
+            sample = format_fetch_progress(current, total_value, elapsed)
+            done = state["completed"]
+            total_count = state["total"]
+            sample["title"] = (
+                f"Preparing clips: {done}/{total_count} "
+                f"({int(done / total_count * 100) if total_count else 0}%)"
+            )
+            sample["current_line"] = (
+                f"Video {meta['video']}/{meta['videos_total']} · "
+                f"clip {meta['clip']}/{meta['clips_total']} · "
+                f"Range {meta['start']:g}-{meta['end']:g}s"
+            )
+            emit({"kind": "progress", **sample})
+
+        with in_flight_lock:
+            in_flight[in_flight_key] = {
+                "video": video_index,
+                "videos_total": remote_video_total,
+                "clip": clip_index,
+                "clips_total": clips_total,
+                "start": start,
+                "end": end,
+                "order": (video_index, clip_index),
+            }
+        emit({
+            "kind": "start",
+            "video": video_index,
+            "videos_total": remote_video_total,
+            "clip": clip_index,
+            "clips_total": clips_total,
+            "start": start,
+            "end": end,
+            "elapsed": 0.0,
+            "name": get_source_display_name(source),
+            "completed": state["completed"],
+            "total": state["total"],
+        })
+        try:
+            fetch_kwargs = {}
+            # 下载区间已在任务构建时按 padding 及相邻 clip 钳制好，
+            # 这里直接以区间本身下载，不再追加 padding。
+            if not is_video:
+                fetch_kwargs["audio_only"] = True
+            if refresh_func is not None:
+                def guarded_refresh(source_arg):
+                    with refresh_lock:
+                        return refresh_func(source_arg)
+                fetch_kwargs["refresh_func"] = guarded_refresh
+            fetch_kwargs["progress_callback"] = fetch_progress
+            if cache_store is None:
+                fetched = fetcher(source, start, end, output, **fetch_kwargs)
+            else:
+                fetched = fetcher(source, start, end, output, cache_store=cache_store,
+                                  **fetch_kwargs)
+        except Exception as exc:
+            with in_flight_lock:
+                in_flight.pop(in_flight_key, None)
+            with completed_lock:
+                state["completed"] += 1
+                current_completed = state["completed"]
+            message = (
+                f"Could not fetch {get_source_display_name(source)} "
+                f"interval {start:g}-{end:g}: {exc}"
+            )
+            if failures is None:
+                raise RuntimeError(message) from exc
+            failures.append(message)
+            try:
+                os.remove(output)
+            except OSError:
+                pass
+            emit({
+                "kind": "complete",
+                "video": video_index,
+                "videos_total": remote_video_total,
+                "clip": clip_index,
+                "clips_total": clips_total,
+                "start": start,
+                "end": end,
+                "elapsed": 0.0,
+                "name": get_source_display_name(source),
+                "completed": current_completed,
+                "total": state["total"],
+                "failed": True,
+            })
+            return None
+        with in_flight_lock:
+            in_flight.pop(in_flight_key, None)
+        with completed_lock:
+            state["completed"] += 1
+            current_completed = state["completed"]
+        emit({
+            "kind": "complete",
+            "video": video_index,
+            "videos_total": remote_video_total,
+            "clip": clip_index,
+            "clips_total": clips_total,
+            "start": start,
+            "end": end,
+            "elapsed": 0.0,
+            "name": get_source_display_name(source),
+            "completed": current_completed,
+            "total": state["total"],
+        })
+        return {
+            'filename': str(fetched),
+            'timestamps': [{'start': 0.0, 'end': duration, 'pred': pred}],
+            'source_url': source.source_url,
+            'source_metadata': {
+                'platform': source.platform,
+                'source_id': source.source_id,
+                'display_name': source.display_name or source.source_url,
+                'materialized_remote_segment': True,
+            },
+            'duration': duration,
+        }
+
+    tasks = []
+    result_plan = []
     remote_video_index = 0
     for entry_index, entry in enumerate(entries):
         source = entry.get('filename')
         if not isinstance(source, MediaSource):
             if padding is None:
-                materialized.append(entry)
+                local_item = entry
             else:
-                local_entry = dict(entry)
-                local_entry['timestamps'] = [
+                local_item = dict(entry)
+                local_item['timestamps'] = [
                     dict(ts, start=float(ts['start']) - before, end=float(ts['end']) + after)
                     for ts in entry.get('timestamps', [])
                 ]
-                materialized.append(local_entry)
+            # 本地 entry 直接参与后续 assemble；远程 entry 等下载完成后才放行。
+            # 必须在这里按原始顺序记录占位，否则本地全被提前、远程全部殿后，
+            # 交错排列（如 [url, local, url]）的列表顺序会被破坏。
+            result_plan.append(("local", local_item))
             continue
         remote_video_index += 1
         identity = stable_source_id(source)
+        if is_video and source.max_height is not None:
+            apply_video_quality_limit(source, source.max_height)
         requested = selected_intervals.get(identity)
         timestamps = entry.get('timestamps', [])
         if requested is not None:
             requested = {(round(start, 3), round(end, 3)) for start, end in requested}
             timestamps = [ts for ts in timestamps
                           if (round(ts['start'], 3), round(ts['end'], 3)) in requested]
+        clips_total = len(timestamps)
+        n_ts = len(timestamps)
+        prev_eff_end = None
         for interval_index, ts in enumerate(timestamps):
             start, end = float(ts['start']), float(ts['end'])
-            if progress_callback is not None:
-                progress_callback({
-                    "kind": "start",
-                    "video": remote_video_index,
-                    "videos_total": remote_video_total,
-                    "clip": interval_index + 1,
-                    "clips_total": len(timestamps),
-                    "start": start,
-                    "end": end,
-                    "elapsed": 0.0,
-                    "name": get_source_display_name(source),
-                })
+            # 计算带 padding 但不会与相邻 clip 重叠的有效区间：
+            # 1) after 最多伸到下一个 clip 的起点；2) before 受上一个
+            # 有效区间终点约束。reverify 的 original/new 跨组不桥接，
+            # 若不加钳制，gap<before+after 时两段 padding 会重叠，
+            # 拼接边界处开头内容会重复播放。
+            next_start = (
+                float(timestamps[interval_index + 1]['start'])
+                if interval_index + 1 < n_ts else None
+            )
+            eff_end = (end + after) if next_start is None else min(end + after, next_start)
+            eff_start = start - before
+            if prev_eff_end is not None:
+                eff_start = max(eff_start, prev_eff_end)
+            prev_eff_end = eff_end
+            duration = eff_end - eff_start
             extension = "mp4" if is_video else "m4a"
             output = os.path.join(
                 str(temp_dir), f"remote_{entry_index}_{interval_index}_"
                 f"{stable_source_id(source).replace(':', '_')}.{extension}")
+            state["total"] += 1
+            tasks.append((entry_index, interval_index, source, eff_start, eff_end,
+                          output, interval_index + 1, clips_total,
+                          remote_video_index, duration, ts.get('pred', 0)))
+            result_plan.append(("task", (entry_index, interval_index)))
+
+    if not tasks:
+        return [item for kind, item in result_plan]
+
+    results_by_task = {}
+    with ThreadPoolExecutor(max_workers=min(len(tasks), max(max_parallel, 1))) as executor:
+        futures = {
+            executor.submit(fetch_task, task): (task[0], task[1])
+            for task in tasks
+        }
+        for future in futures:
+            key = futures[future]
             try:
-                fetch_kwargs = {}
-                if padding is not None:
-                    fetch_kwargs.update(padding_before=before, padding_after=after)
-                if not is_video:
-                    fetch_kwargs["audio_only"] = True
-                if refresh_func is not None:
-                    fetch_kwargs["refresh_func"] = refresh_func
-                if cache_store is None:
-                    fetched = fetcher(source, start, end, output, **fetch_kwargs)
-                else:
-                    fetched = fetcher(source, start, end, output, cache_store=cache_store,
-                                      **fetch_kwargs)
-            except Exception as exc:
-                message = (
-                    f"Could not fetch {get_source_display_name(source)} "
-                    f"interval {start:g}-{end:g}: {exc}"
-                )
-                if failures is None:
-                    raise RuntimeError(message) from exc
-                failures.append(message)
-                try:
-                    os.remove(output)
-                except OSError:
-                    pass
-                continue
-            if progress_callback is not None:
-                progress_callback({
-                    "kind": "complete",
-                    "video": remote_video_index,
-                    "videos_total": remote_video_total,
-                    "clip": interval_index + 1,
-                    "clips_total": len(timestamps),
-                    "start": start,
-                    "end": end,
-                    "elapsed": 0.0,
-                    "name": get_source_display_name(source),
-                })
-            duration = (end + after) - max(0.0, start - before)
-            materialized.append({
-                'filename': str(fetched),
-                'timestamps': [{'start': 0.0, 'end': duration, 'pred': ts.get('pred', 0)}],
-                'source_url': source.source_url,
-                'source_metadata': {
-                    'platform': source.platform,
-                    'source_id': source.source_id,
-                    'display_name': source.display_name or source.source_url,
-                    'materialized_remote_segment': True,
-                },
-            })
+                result = future.result()
+            except Exception:
+                result = None
+            if result is not None:
+                results_by_task[key] = result
+
+    materialized = []
+    for kind, payload in result_plan:
+        if kind == "local":
+            materialized.append(payload)
+        else:
+            result = results_by_task.get(payload)
+            if result is not None:
+                materialized.append(result)
     return materialized
 
 def convert_seconds_to_timestamp(seconds: float) -> str:
@@ -859,11 +1037,24 @@ def _merge_reverify_timestamps(timestamps):
     news = merge_group([t for t in timestamps if t.get('source') == 'new'])
     result = originals + news
     result.sort(key=lambda item: item['start'])
-    for i in range(len(result) - 2, -1, -1):
-        if result[i]['end'] > result[i + 1]['start']:
-            duration_i = result[i]['end'] - result[i]['start']
-            duration_j = result[i + 1]['end'] - result[i + 1]['start']
-            result.pop(i + 1 if duration_i >= duration_j else i)
+    # 反复去重直到没有相邻重叠。删除区间后必须重新检查前一个区间，
+    # 否则一次循环会漏掉删除后新暴露出的重叠（例如长 clip 与内部残留区间）。
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(result) - 1:
+            if result[i]['end'] > result[i + 1]['start']:
+                duration_i = result[i]['end'] - result[i]['start']
+                duration_j = result[i + 1]['end'] - result[i + 1]['start']
+                # 保留更长的区间；等长时保留前一个（与历史行为一致）
+                if duration_i >= duration_j:
+                    result.pop(i + 1)
+                else:
+                    result.pop(i)
+                changed = True
+                continue
+            i += 1
     return [t for t in result if t['end'] - t['start'] > 0.5]
 
 
@@ -888,7 +1079,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                        focus_idx=58, threshold=0.30, ort_session=None,
                        verify_block_size=10, direct_accept=0.75,
                        use_gpu=True, cache_store=None, refresh_func=None,
-                       audio_cache_paths=None):
+                       audio_cache_paths=None, progress_callback=None):
     """Reverify local files and remote sources without downloading remote video."""
     if not dict_list:
         return dict_list
@@ -938,7 +1129,37 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                         scan_windows.append((ws, we))
 
                 new_timestamps = []
-                for ws, we in scan_windows:
+                window_total = len(scan_windows)
+                for window_index, (ws, we) in enumerate(scan_windows):
+                    print(
+                        f"{Fore.CYAN}Verification: fetching audio "
+                        f"[{window_index + 1}/{window_total}] "
+                        f"({ws:g}-{we:g}s) for "
+                        f"{get_source_display_name(filename)}")
+                    if progress_callback is not None:
+                        progress_callback({
+                            "title": "Verification",
+                            "current_line": (
+                                f"Fetching verification audio "
+                                f"[{window_index + 1}/{window_total}]"
+                            ),
+                            "percent_line": (
+                                f"Progress: "
+                                f"{int((window_index + 1) / window_total * 100)}%"
+                            ),
+                            "speed_line": "Speed: --",
+                            "eta_line": "ETA: --",
+                        })
+
+                    def fetch_progress(current, total, elapsed):
+                        if progress_callback is not None:
+                            sample = format_fetch_progress(current, total, elapsed)
+                            sample["title"] = (
+                                f"Verification: audio "
+                                f"[{window_index + 1}/{window_total}]"
+                            )
+                            progress_callback(sample)
+
                     temporary = tempfile.NamedTemporaryFile(
                         suffix='.wav', prefix='reverify-', dir=TEMP_DIR, delete=False)
                     temporary.close()
@@ -946,7 +1167,8 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                         audio_path = fetch_segment(
                             filename, ws, we, temporary.name,
                             cache_store=cache_store, audio_only=True, codec='pcm_s16le',
-                            refresh_func=refresh_func, logger=print)
+                            refresh_func=refresh_func, logger=print,
+                            progress_callback=fetch_progress)
                         raw = _read_wav_pcm(audio_path)
                         duration = len(raw) / sample_rate
                         found, scans, skipped, accepted, refused = _scan_reverify_audio(
@@ -976,6 +1198,19 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     os.environ.get('FFMPEG_BINARY', 'ffmpeg'), '-y', '-hide_banner', '-loglevel', 'error',
                     '-i', str(scan_filename), '-vn', '-f', 's16le', '-acodec', 'pcm_s16le',
                     '-ar', str(sample_rate), '-ac', '1', full_audio.name]
+                source_label = (
+                    get_source_display_name(filename)
+                    if isinstance(filename, MediaSource) else os.path.basename(str(filename))
+                )
+                print(f"{Fore.CYAN}Verification: extracting full audio for {source_label}...")
+                if progress_callback is not None:
+                    progress_callback({
+                        "title": "Verification",
+                        "current_line": f"Extracting full audio for {source_label}...",
+                        "percent_line": "Progress: --",
+                        "speed_line": "Speed: --",
+                        "eta_line": "ETA: --",
+                    })
                 run_tracked(extract_cmd)
                 if os.path.getsize(full_audio.name) == 0:
                     continue
@@ -1092,6 +1327,15 @@ def preview_playable_path(fetch_result, fallback_path):
     if os.fspath(fetch_result) == os.fspath(fallback_path):
         return str(fallback_path)
     return str(fetch_result)
+
+
+def _release_grab(window):
+    """Safely release a Tk grab, tolerating already-destroyed windows."""
+    try:
+        if window is not None and window.winfo_exists():
+            window.grab_release()
+    except tk.TclError:
+        pass
 
 
 class ReviewDialog:
@@ -1486,6 +1730,11 @@ class VideoProcessorApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        # 线程安全 UI 更新通道：后台线程只往队列投递，主线程单点轮询执行，
+        # 避免并发 root.after 直接调用干扰 Tcl 事件循环导致窗口未响应。
+        self._ui_queue = queue.Queue()
+        self.root.after(50, self._poll_ui)
+
         # Set initial window size
         self.root.geometry('1150x800')
 
@@ -1762,6 +2011,18 @@ class VideoProcessorApp:
         )
         self.remote_browser_cookies_tooltip = CustomHovertip(
             self.remote_browser_cookies_dropdown, REMOTE_BROWSER_COOKIES_TOOLTIP_TEXT
+        )
+
+        ttk.Label(self.remote_settings_frame, text="Max Download Concurrency:").pack()
+        self.remote_download_concurrency = tk.IntVar(value=REMOTE_CONCURRENCY_DEFAULT)
+        self.remote_concurrency_spinbox = ttk.Spinbox(
+            self.remote_settings_frame,
+            from_=REMOTE_CONCURRENCY_MIN, to=REMOTE_CONCURRENCY_MAX, width=5,
+            textvariable=self.remote_download_concurrency,
+        )
+        self.remote_concurrency_spinbox.pack(pady=(0, 8))
+        self.remote_concurrency_tooltip = CustomHovertip(
+            self.remote_concurrency_spinbox, REMOTE_CONCURRENCY_TOOLTIP_TEXT
         )
 
         self.remote_cache_frame = ttk.LabelFrame(self.remote_settings_frame, text="Remote Cache")
@@ -2059,7 +2320,8 @@ class VideoProcessorApp:
             anchor="nw", justify="left")
         self.remote_progress_label.pack(fill=tk.BOTH, expand=True)
         self.transfer_progress = ProgressWidgetAdapter(
-            self.root, self.ui_bar, self.remote_progress_text)
+            self.root, self.ui_bar, self.remote_progress_text,
+            ui_queue=self._ui_queue)
 
         self.final_bar = FinalRenderBar(
             ui=self.ui_bar, progress_callback=self._queue_transfer_progress)
@@ -2162,6 +2424,7 @@ class VideoProcessorApp:
             self.use_gpu_checkbox,
             self.remote_mode_dropdown,
             self.remote_browser_cookies_dropdown,
+            self.remote_concurrency_spinbox,
             self.remote_cache_open_button,
             self.remote_cache_clear_button,
             self.remote_cache_choose_button,
@@ -2177,31 +2440,63 @@ class VideoProcessorApp:
         if not hasattr(self, "transfer_progress"):
             return
         display = dict(sample)
-        prefix = str(label_prefix or "").strip()
-        if prefix:
-            display["text"] = f"{prefix}: {display.get('text', '')}"
-            display["title"] = prefix
+        title = compose_progress_title(display, label_prefix)
+        if title:
+            display["text"] = f"{title}: {display.get('text', '')}"
+            display["title"] = title
         text = display.get("text", "").lower()
-        is_compile = prefix.lower() == "compile"
+        is_compile = title.lower() == "compile"
         self.transfer_progress.submit(
             display, force=is_compile or ("completed" in text or "failed" in text or "cancelled" in text)
         )
 
+    def _poll_ui(self):
+        try:
+            while True:
+                func, args = self._ui_queue.get_nowait()
+                try:
+                    func(*args)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_ui)
+
+    def _schedule_ui(self, func, *args):
+        """Run func(*args) on the main thread via the thread-safe UI queue."""
+        if hasattr(self, "_ui_queue"):
+            self._ui_queue.put((func, args))
+        else:
+            func(*args)
+
     def clear_transfer_progress(self, text=""):
         if hasattr(self, "remote_progress_text"):
-            self.root.after(0, self.remote_progress_text.set, text)
+            self._schedule_ui(self.remote_progress_text.set, text)
         if hasattr(self, "ui_bar"):
-            self.root.after(0, self.ui_bar.__setitem__, "value", 0)
+            self._schedule_ui(self.ui_bar.__setitem__, "value", 0)
 
     def _show_remote_clip_progress(self, event):
-        state = str(event.get("kind", "")).capitalize()
-        label = (
-            f"Preparing clips: video {event.get('video')}/{event.get('videos_total')}, "
-            f"clip {event.get('clip')}/{event.get('clips_total')}\n"
-            f"Range: {event.get('start', 0):g}-{event.get('end', 0):g}s\n"
-            f"Status: {state}"
-        )
-        self.clear_transfer_progress(label)
+        kind = event.get("kind", "")
+        completed = int(event.get("completed", 0) or 0)
+        total = int(event.get("total", 0) or 0)
+        percent = int(completed / total * 100) if total else 0
+        if kind == "progress":
+            lines = [
+                event.get("title", ""),
+                event.get("current_line", ""),
+                event.get("speed_line", ""),
+                event.get("eta_line", ""),
+            ]
+        else:
+            state = str(kind).capitalize()
+            lines = [
+                f"Preparing clips: {completed}/{total} ({percent}%)",
+                f"Video {event.get('video')}/{event.get('videos_total')} · "
+                f"clip {event.get('clip')}/{event.get('clips_total')} · "
+                f"Range: {event.get('start', 0):g}-{event.get('end', 0):g}s",
+                f"Status: {state}",
+            ]
+        self.clear_transfer_progress("\n".join(line for line in lines if line))
 
     def disable_objects(self):
         for elt in self.disable_while_processing:
@@ -2452,12 +2747,14 @@ class VideoProcessorApp:
             closed[0] = True
             generation[0] += 1
             hydration_executor.shutdown(wait=False, cancel_futures=True)
+            _release_grab(dialog)
             dialog.destroy()
 
         def cancel():
             closed[0] = True
             generation[0] += 1
             hydration_executor.shutdown(wait=False, cancel_futures=True)
+            _release_grab(dialog)
             dialog.destroy()
 
         previous_button = ttk.Button(
@@ -2496,12 +2793,14 @@ class VideoProcessorApp:
         tree.bind("<Button-1>", toggle_entry)
         render_page()
         dialog.protocol("WM_DELETE_WINDOW", cancel)
+        _release_grab(getattr(self, "entry_window", None))
+        dialog.lift()
+        dialog.focus_force()
         dialog.grab_set()
         self.root.wait_window(dialog)
         return result["sources"]
 
     def add_video_url(self):
-        self.root.grab_set()
         self.entry_window = tk.Toplevel(self.root)
         x = self.root.winfo_x() + 15
         y = self.root.winfo_y() + 15
@@ -2546,6 +2845,7 @@ class VideoProcessorApp:
                 else:
                     selected_entries = [described]
                 if selected_entries is None:
+                    _release_grab(self.entry_window)
                     self.entry_window.destroy()
                     self.thread_active = False
                     return
@@ -2582,6 +2882,7 @@ class VideoProcessorApp:
                             messagebox.showinfo("Success", message)
                         else:
                             messagebox.showwarning("Import failed", "No selected entries could be resolved.")
+                        _release_grab(self.entry_window)
                         self.entry_window.destroy()
                         self.thread_active = False
 
@@ -2596,8 +2897,10 @@ class VideoProcessorApp:
                 confirm = messagebox.askyesno("Confirm Cancellation",
                                               f"The current job will be cancelled, but any previously parsed URLs will be kept. Would you like to cancel?")
                 if confirm:
+                    _release_grab(self.entry_window)
                     self.entry_window.destroy()
             else:
+                _release_grab(self.entry_window)
                 self.entry_window.destroy()
 
         def check_url_threaded(event=None):
@@ -3475,6 +3778,7 @@ class VideoProcessorApp:
             if self.remote_mode.get() == "Remote Stream":
                 print(f"Remote Stream block size: {detection_size}s")
             browser_cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
+            max_height = convert_quality_str_to_int(self.max_quality.get())
             refresh_func = lambda source: refresh_remote_source(
                 source, browser_cookies=browser_cookies
             )
@@ -3486,12 +3790,14 @@ class VideoProcessorApp:
                 self.handle_url_downloads()
             elif any(x.get_is_url() for x in self.uploaded_videos) and resolve_remote and not audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
-                    self.uploaded_videos, browser_cookies=browser_cookies
+                    self.uploaded_videos, browser_cookies=browser_cookies,
+                    max_height=max_height
                 )
                 select_remote_stream_audio(remote_entries, logger=print)
             elif any(x.get_is_url() for x in self.uploaded_videos) and audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
-                    self.uploaded_videos, browser_cookies=browser_cookies
+                    self.uploaded_videos, browser_cookies=browser_cookies,
+                    max_height=max_height
                 )
                 select_remote_stream_audio(remote_entries, logger=print)
                 failed_remote_ids = set()
@@ -3623,7 +3929,8 @@ class VideoProcessorApp:
                             threshold=threshold * 0.6,
                             use_gpu=use_gpu, ort_session=shared_session,
                             cache_store=cache_store, refresh_func=refresh_func,
-                            audio_cache_paths=audio_cache_paths)
+                            audio_cache_paths=audio_cache_paths,
+                            progress_callback=self._queue_transfer_progress)
                     # auto-deselect originals fully covered by new reverify clips
                     for entry in dict_list:
                         ts = entry.get('timestamps', [])
@@ -3669,7 +3976,8 @@ class VideoProcessorApp:
                         compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
-                            progress_callback=self._show_remote_clip_progress)
+                            progress_callback=self._show_remote_clip_progress,
+                            max_parallel=self.remote_download_concurrency.get())
                         for failure in remote_failures:
                             print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
                         if not compile_entries:
@@ -3711,11 +4019,20 @@ class VideoProcessorApp:
                     print(
                         f"{Fore.GREEN}[{i + 1}/{len(processing_uploads)}]{Style.RESET_ALL} Getting timestamps for "
                         f"{get_source_display_name(input_video_path)}")
+                    save_audio_path = None
+                    if (self.use_verify.get()
+                            and self.remote_mode.get() == "Remote Stream"
+                            and isinstance(input_video_path, MediaSource)):
+                        ensure_temp_dir()
+                        _fd, save_audio_path = tempfile.mkstemp(
+                            suffix=".wav", prefix="reverify-stream-", dir=TEMP_DIR)
+                        os.close(_fd)
+                        os.remove(save_audio_path)
                     try:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
                             use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
-                            refresh_func=refresh_func,
+                            refresh_func=refresh_func, save_audio_path=save_audio_path,
                             progress_callback=lambda sample, upload=upload, i=i:
                                 self._queue_transfer_progress(
                                     sample,
@@ -3728,6 +4045,9 @@ class VideoProcessorApp:
                         incomplete_failures.append(failure)
                         print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
                         continue
+                    if (save_audio_path and os.path.isfile(save_audio_path)
+                            and isinstance(input_video_path, MediaSource)):
+                        audio_cache_paths[stable_source_id(input_video_path)] = save_audio_path
                     timestamps = {'filename': timestamps['filename'],
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
                     source_for_result = upload.get_source() if audio_cache and upload.get_is_url() else input_video_path
@@ -3833,7 +4153,8 @@ class VideoProcessorApp:
                         threshold=threshold * 0.6,
                         use_gpu=use_gpu, ort_session=shared_session,
                         cache_store=cache_store, refresh_func=refresh_func,
-                        audio_cache_paths=audio_cache_paths)
+                        audio_cache_paths=audio_cache_paths,
+                        progress_callback=self._queue_transfer_progress)
                 # auto-deselect originals fully covered by new reverify clips
                 for entry in dict_list:
                     ts = entry.get('timestamps', [])
@@ -3883,7 +4204,8 @@ class VideoProcessorApp:
                     compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
-                            progress_callback=self._show_remote_clip_progress)
+                            progress_callback=self._show_remote_clip_progress,
+                            max_parallel=self.remote_download_concurrency.get())
                     for failure in remote_failures:
                         print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
                     if not compile_entries:
@@ -3948,11 +4270,15 @@ class StdoutRedirector:
         return
 
     def _poll(self):
+        # 每轮最多渲染 120 条，突发日志（如 queuing/done 批量打印）分摊到
+        # 多个 poll 周期，避免主线程一次性大插入导致 UI 卡顿。
+        rendered = 0
         try:
-            while True:
+            while rendered < 120:
                 text = self.queue.get_nowait()
                 try:
                     self._render(text)
+                    rendered += 1
                 except Exception:
                     pass
         except queue.Empty:
@@ -3960,6 +4286,8 @@ class StdoutRedirector:
         self.root.after(100, self._poll)
 
     def _render(self, text):
+        # 仅在用户停留在底部时自动滚动，长日志每次渲染不再强制全量重排
+        at_bottom = self.text_widget.yview()[1] >= 0.999
         self.text_widget["state"] = tk.NORMAL
 
         # Check/apply colorama colors
@@ -4003,7 +4331,8 @@ class StdoutRedirector:
         else:
             self.text_widget.insert(tk.END, text)
 
-        self.text_widget.see(tk.END)  # Scroll to the end of the text
+        if at_bottom:
+            self.text_widget.see(tk.END)  # Scroll to the end of the text
         self.text_widget["state"] = tk.DISABLED
 
 

@@ -81,7 +81,12 @@ def validate_target(target):
         for name in RUNTIME_USER_FILES
         if (target / name).exists()
     ]
-    if missing or forbidden or forbidden_user_files:
+    stray_dlls = [
+        str(path)
+        for path in target.glob("*.dll")
+        if path.name.lower() not in {"python3.dll", "python311.dll"}
+    ]
+    if missing or forbidden or forbidden_user_files or stray_dlls:
         details = []
         if missing:
             details.append("missing: " + ", ".join(missing))
@@ -89,6 +94,8 @@ def validate_target(target):
             details.append("forbidden platform artifacts: " + ", ".join(forbidden))
         if forbidden_user_files:
             details.append("runtime user files: " + ", ".join(forbidden_user_files))
+        if stray_dlls:
+            details.append("dlls outside lib: " + ", ".join(stray_dlls))
         raise RuntimeError("Invalid package output (" + "; ".join(details) + ")")
     return True
 

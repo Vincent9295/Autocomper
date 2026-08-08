@@ -31,4 +31,12 @@ AutoComper Enhanced*/
 
 # Sensitive
 *.db
-*.sqlite3SESSION_BRIEF*.md
+*.sqlite3
+
+# Session handoff notes (local only)
+SESSION_BRIEF*.md
+OPEN_ISSUES*.md
+
+# Local test suite (run locally; not part of the release)
+tests/
+

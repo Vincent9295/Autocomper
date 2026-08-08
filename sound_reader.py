@@ -24,7 +24,7 @@ from remote_prefetch import (
     iter_range_bytes,
     supports_range_prefetch,
 )
-from progress import format_block_progress, format_transfer_progress
+from progress import format_block_progress
 
 SAMPLE_RATE = 32000
 is_windows = sys.platform.startswith('win')
@@ -32,6 +32,30 @@ is_windows = sys.platform.startswith('win')
 
 class RemoteAudioIncompleteError(Exception):
     """Remote audio ended before all blocks implied by its known duration."""
+
+
+def _open_wav_writer(path: str, sample_rate: int = SAMPLE_RATE):
+    """Open a WAV file for streaming 16-bit mono PCM appends."""
+    import struct
+    f = open(path, "wb")
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 0, b"WAVE", b"fmt ", 16, 1, 1, sample_rate,
+        sample_rate * 2, 2, 16, b"data", 0,
+    )
+    f.write(header)
+    return f
+
+
+def _finalize_wav(f, data_size: int):
+    """Patch the RIFF/data sizes once all PCM has been appended."""
+    import struct
+    f.seek(4)
+    f.write(struct.pack("<I", 36 + data_size))
+    f.seek(40)
+    f.write(struct.pack("<I", data_size))
+    f.close()
+
 
 
 def subsample(frame: np.ndarray, scale_factor: int) -> np.ndarray:
@@ -154,12 +178,20 @@ def load_audio(file: str | MediaSource, sr: int, frame_count: int,
         try:
             yield from _load_audio_prefetched(
                 file, sr, frame_count, prefetch_chunk_size, prefetch_concurrency,
-                progress_callback
+                progress_callback, refresh_func
             )
             return
         except RangePrefetchError as exc:
             if not getattr(exc, "can_fallback", True):
                 raise
+            # 签名 URL 可能已过期：刷新 source 后再走直接路径，避免拿过期 URL 重试。
+            if refresh_func is not None:
+                try:
+                    updated = refresh_func(file)
+                    if isinstance(updated, MediaSource) and updated is not file:
+                        file.__dict__.update(updated.__dict__)
+                except Exception:
+                    pass
             logging.getLogger(__name__).warning("Remote memory prefetch fallback: %s", str(exc))
     if isinstance(file, MediaSource) and str(file.platform).lower() == "bilibili":
         duration = _get_audio_duration(file)
@@ -242,7 +274,8 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
 
 
 def _load_audio_prefetched(source, sr, frame_count, prefetch_chunk_size,
-                           prefetch_concurrency, progress_callback=None):
+                           prefetch_concurrency, progress_callback=None,
+                           refresh_func=None):
     cmd = build_audio_command(source, sr, frame_count, input_source="pipe:0")
     chunk_size = frame_count * 2
     process = subprocess.Popen(cmd, bufsize=1, stdin=subprocess.PIPE, **_subprocess_options())
@@ -253,7 +286,7 @@ def _load_audio_prefetched(source, sr, frame_count, prefetch_chunk_size,
         try:
             for compressed in iter_range_bytes(
                 source, chunk_size=prefetch_chunk_size, concurrency=prefetch_concurrency,
-                progress_callback=progress_callback
+                progress_callback=progress_callback, refresher=refresh_func
             ):
                 process.stdin.write(compressed)
         except Exception as exc:
@@ -388,7 +421,7 @@ def _detection_cache_args(source, model, precision, block_size, threshold, focus
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_gpu=True, cache_store=None, progress_callback=None,
-                   refresh_func=None):
+                   refresh_func=None, save_audio_path=None):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -423,7 +456,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                 _log_remote_progress(logger, _dur, block_size)
             for _ in bar_logger.iter_bar(block=range(block_count)):
                 if progress_callback is not None and is_remote:
-                    progress_callback(format_transfer_progress(
+                    progress_callback(format_block_progress(
                         _ + 1, block_count, 0, source_duration=_dur))
         return previous_data, True
 
@@ -467,31 +500,38 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         bar_logger = default_bar_logger(logger)
         blocks = bar_logger.iter_bar(block=blocks)
 
-    for block_index, block in enumerate(blocks, 1):
-        processed_blocks = block_index
-        if is_remote:
-            if progress_callback is not None:
-                progress_callback(
-                    format_block_progress(
-                        block_index, block_count, time.monotonic() - started_at,
-                        source_duration=_dur,
+    wav_file = None
+    wav_data_size = 0
+    if is_remote and save_audio_path:
+        wav_file = _open_wav_writer(save_audio_path)
+    try:
+        for block_index, block in enumerate(blocks, 1):
+            processed_blocks = block_index
+            if wav_file is not None:
+                wav_file.write(block)
+                wav_data_size += len(block)
+            if is_remote:
+                if progress_callback is not None:
+                    progress_callback(
+                        format_block_progress(
+                            block_index, block_count, time.monotonic() - started_at,
+                            source_duration=_dur,
+                        )
                     )
-                    if str(getattr(file, "platform", "")).lower() == "bilibili"
-                    else format_transfer_progress(
-                        block_index, block_count, time.monotonic() - started_at,
-                        source_duration=_dur,
-                    )
-                )
-        samples = np.frombuffer(block, dtype=np.int16)
-        samples = pad_array_if_needed(samples, frame_count)
-        samples = samples.reshape(1, -1)
-        samples = samples / (2**15)
-        samples = samples.astype(np.float32)
-        ort_inputs = {"input": samples}
-        framewise_output = ort_session.run(["output"], ort_inputs)[0]
-        preds = framewise_output[0]
-        info["timestamps"].extend(compute_timestamps(preds, precision, threshold, focus_idx, offset))
-        offset += block_size
+            samples = np.frombuffer(block, dtype=np.int16)
+            samples = pad_array_if_needed(samples, frame_count)
+            samples = samples.reshape(1, -1)
+            samples = samples / (2**15)
+            samples = samples.astype(np.float32)
+            ort_inputs = {"input": samples}
+            framewise_output = ort_session.run(["output"], ort_inputs)[0]
+            preds = framewise_output[0]
+            info["timestamps"].extend(compute_timestamps(preds, precision, threshold, focus_idx, offset))
+            offset += block_size
+    finally:
+        if wav_file is not None:
+            _finalize_wav(wav_file, wav_data_size)
+
 
     if is_remote and _dur is not None:
         if processed_blocks < block_count:

@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from utils import FFMPEG_PATH, run_tracked
+from utils import FFMPEG_PATH, run_tracked, run_tracked_progress
 from remote_prefetch import (
     SpeedMonitor,
     iter_hls_bytes,
@@ -66,6 +66,7 @@ class MediaSource:
     metadata: dict[str, Any] = field(default_factory=dict)
     audio_candidates: list[dict[str, Any]] = field(default_factory=list)
     video_candidates: list[dict[str, Any]] = field(default_factory=list)
+    max_height: int | None = None
 
 
 @dataclass
@@ -705,9 +706,34 @@ def build_segment_command(
     command.extend([
         "-avoid_negative_ts", "make_zero",
         "-reset_timestamps", "1",
-        str(output_file),
     ])
+    if Path(output_file).suffix.lower() in {".mp4", ".m4a", ".mov"}:
+        # moov 前置（faststart）：materialized clip 之后的每次 ffmpeg -i
+        # 校验/探测/seek 都只需读文件头，避免大段 clip（moov 在尾部）被
+        # 整段读取，造成 prepare→compile 收尾时数秒卡顿。
+        command.extend(["-movflags", "+faststart"])
+    command.append(str(output_file))
     return command
+
+
+def _segment_has_stream(path, want_video=True):
+    """Return True if the segment file contains a readable video/audio stream.
+
+    ffmpeg exits 0 even for some empty/truncated outputs, so the raw exit code
+    and the file-size check alone are not enough to trust a downloaded segment.
+    """
+    try:
+        out = run_tracked([FFMPEG_PATH, "-hide_banner", "-i", str(path)],
+                          timeout=10, text=True)
+    except Exception:
+        return False
+    stderr = getattr(out, "stderr", None)
+    if stderr is None:
+        return True
+    if not isinstance(stderr, str):
+        stderr = str(stderr)
+    kind = r"Video:" if want_video else r"Audio:"
+    return bool(re.search(r"Stream #\d+:\d+.*" + kind, stderr))
 
 
 def fetch_segment(
@@ -726,6 +752,7 @@ def fetch_segment(
     allow_covering_cache: bool = True,
     refresh_func: Callable[[MediaSource], MediaSource | None] | None = None,
     logger: Callable[[str], Any] | None = None,
+    progress_callback: Callable[..., Any] | None = None,
 ) -> Path:
     """Fetch a requested remote interval, optionally reusing covering cache."""
     if padding_before < 0 or padding_after < 0:
@@ -753,6 +780,20 @@ def fetch_segment(
     Path(temporary).unlink(missing_ok=True)
     temporary_path = Path(temporary)
     runner = run_func or run_tracked
+
+    def run_command(command):
+        if progress_callback is None:
+            return runner(command, timeout=timeout, text=True)
+        expected_duration = max(0.0, (float(end) + float(padding_after)) -
+                                max(0.0, float(start) - float(padding_before)))
+
+        def report(current, total, elapsed):
+            progress_callback(current, total or expected_duration, elapsed)
+
+        return run_tracked_progress(
+            command, duration=expected_duration, timeout=timeout,
+            progress_callback=report,
+        )
     last_error: Exception | None = None
     refreshed = False
     attempt = 0
@@ -767,13 +808,18 @@ def fetch_segment(
                 audio_only=audio_only,
                 codec=codec,
             )
-            result = runner(command, timeout=timeout, text=True)
+            result = run_command(command)
             return_code = getattr(result, "returncode", 0)
             if return_code != 0:
                 detail = getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
                 raise SegmentFetchError(f"FFmpeg segment fetch failed (rc={return_code}): {detail}")
             if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                 raise SegmentFetchError(f"FFmpeg segment fetch completed without output: {temporary_path}")
+            if run_func is None and not _segment_has_stream(
+                    temporary_path, want_video=not audio_only):
+                raise SegmentFetchError(
+                    f"FFmpeg segment fetch produced an unreadable segment "
+                    f"(no {'video' if not audio_only else 'audio'} stream): {temporary_path}")
             data = temporary_path.read_bytes()
             if cache_store is not None:
                 fetched_start = max(0.0, float(start) - float(padding_before))
@@ -1412,7 +1458,7 @@ def normalize_youtube_playlist_url(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "/playlist", f"list={playlist_id}", ""))
 
 
-def _source_from_info(url: str, info: Mapping[str, Any]) -> MediaSource:
+def _source_from_info(url: str, info: Mapping[str, Any], max_height: int | None = None) -> MediaSource:
     if info.get("_type") in ("playlist", "multi_video"):
         raise SourceResolveError(f"Source is a playlist, not a single VOD: {url}")
 
@@ -1440,27 +1486,71 @@ def _source_from_info(url: str, info: Mapping[str, Any]) -> MediaSource:
         for key in ("filesize", "filesize_approx", "clen"):
             if audio_candidates[0].get(key) is not None:
                 metadata[key] = audio_candidates[0][key]
-    return MediaSource(
-        platform=platform,
-        source_url=source_url,
-        source_id=source_id,
-        display_name=str(info.get("title") or source_id or source_url),
-        duration=duration,
-        audio_url=audio_url,
-        video_url=video_url,
-        http_headers=headers,
-        audio_headers=audio_headers,
-        video_headers=video_headers,
-        metadata=metadata,
-        audio_candidates=audio_candidates,
-        video_candidates=video_candidates,
+    return apply_video_quality_limit(
+        MediaSource(
+            platform=platform,
+            source_url=source_url,
+            source_id=source_id,
+            display_name=str(info.get("title") or source_id or source_url),
+            duration=duration,
+            audio_url=audio_url,
+            video_url=video_url,
+            http_headers=headers,
+            audio_headers=audio_headers,
+            video_headers=video_headers,
+            metadata=metadata,
+            audio_candidates=audio_candidates,
+            video_candidates=video_candidates,
+        ),
+        max_height,
     )
+
+
+def apply_video_quality_limit(source: MediaSource, max_height: int | None) -> MediaSource:
+    """Limit remote video segment quality to the configured maximum height.
+
+    Prefers the highest video candidate at or below ``max_height``. If no
+    candidate is at or below the limit, falls back to the lowest available
+    candidate. ``None`` keeps the current highest-quality behavior. Audio
+    candidates are never touched.
+    """
+    source.max_height = max_height
+    candidates = list(source.video_candidates or [])
+    if max_height is None or not candidates:
+        return source
+    try:
+        max_height = int(max_height)
+    except (TypeError, ValueError):
+        return source
+
+    def height_of(candidate):
+        try:
+            value = int(candidate.get("height"))
+            return value if value > 0 else 0
+        except (TypeError, ValueError):
+            return 0
+
+    at_or_below = [
+        candidate for candidate in candidates
+        if height_of(candidate) > 0 and height_of(candidate) <= max_height
+    ]
+    if at_or_below:
+        selected = max(at_or_below, key=height_of)
+    else:
+        with_height = [candidate for candidate in candidates if height_of(candidate) > 0]
+        selected = min(with_height, key=height_of) if with_height else candidates[0]
+    if selected.get("url"):
+        source.video_url = str(selected["url"])
+        if selected.get("http_headers"):
+            source.video_headers = {str(k): str(v) for k, v in selected["http_headers"].items()}
+    return source
 
 
 def resolve_source(
     url: str,
     ydl_factory: Callable[..., Any] | None = None,
     browser_cookies: str | None = None,
+    max_height: int | None = None,
 ) -> MediaSource:
     """Resolve one VOD with yt-dlp metadata extraction only."""
     value = url.strip()
@@ -1470,7 +1560,8 @@ def resolve_source(
         info = _extract_with_cookie_policy(value, ydl_factory, browser_cookies)
     except ValueError as exc:
         raise SourceResolveError(str(exc)) from exc
-    return _source_from_info(value, info)
+    source = _source_from_info(value, info)
+    return apply_video_quality_limit(source, max_height)
 
 
 def _is_url(value: str) -> bool:

@@ -101,7 +101,8 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
                      request_func=None, logger=None, progress_callback=None,
                      max_attempts=DEFAULT_RANGE_ATTEMPTS,
                      retry_delays=DEFAULT_RETRY_DELAYS, sleep_func=time.sleep,
-                     speed_monitor=None, slow_callback=None, start_offset=0):
+                     speed_monitor=None, slow_callback=None, start_offset=0,
+                     refresher=None):
     """Yield a known-size YouTube audio stream in byte order with bounded prefetch."""
     try:
         chunk_size = int(chunk_size)
@@ -158,6 +159,18 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
             except Exception as exc:
                 last_error = exc
                 if attempt + 1 < max(1, int(max_attempts)):
+                    # 签名 URL 过期（403）是 YouTube 批量检测失败的常见原因：
+                    # 先刷新 source（重新解析出新的 audio_url/audio_headers）再重试。
+                    if refresher is not None:
+                        try:
+                            updated = refresher(source)
+                            if updated is not None and updated is not source:
+                                source.__dict__.update(updated.__dict__)
+                            nonlocal_headers = dict(getattr(source, "audio_headers", {}) or {})
+                            headers.clear()
+                            headers.update(nonlocal_headers)
+                        except Exception:
+                            pass
                     delay = retry_delays[min(attempt, len(retry_delays) - 1)] if retry_delays else 0
                     if delay:
                         sleep_func(delay)
