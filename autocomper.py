@@ -7,6 +7,7 @@ import shutil
 import sys
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -53,14 +54,15 @@ from colorama import Fore, Style
 from kthread import KThread
 from PIL import Image, ImageTk
 from proglog import ProgressBarLogger
-from progress import (ProgressWidgetAdapter, compose_progress_title,
-                      format_compile_progress, format_fetch_progress,
-                      format_transfer_progress)
+from progress import (ProgressThrottle, ProgressWidgetAdapter,
+                      compose_progress_title, format_compile_progress,
+                      format_fetch_progress, format_transfer_progress)
 
 from compile import _get_video_duration, compile_vid, get_video_codec
 from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
-from sound_reader import RemoteAudioIncompleteError, get_timestamps
+from sound_reader import (RemoteAudioIncompleteError, RemoteAudioStallError,
+                          get_timestamps)
 from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            PlaylistDescriptor, PlaylistEntry, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
@@ -452,6 +454,10 @@ def _elide_middle(text: str, max_pixels: int, measure) -> str:
 
 _temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
 TEMP_DIR = _temp_dir_obj.name
+
+# 超过该秒数（30 分钟）后，处理某个远程源前会重新解析一次，避免开头一次性
+# 解析的大量 URL 在排到后面时已经过期。
+REMOTE_REFRESH_THRESHOLD = 1800.0
 
 
 def ensure_temp_dir():
@@ -2451,13 +2457,17 @@ class VideoProcessorApp:
         )
 
     def _poll_ui(self):
+        # 单轮最多处理有限条 UI 更新，避免一次性排空大量积压事件
+        # 阻塞主线程事件循环导致窗口假死（与 StdoutRedirector 的渲染上限对齐）。
+        processed = 0
         try:
-            while True:
+            while processed < 100:
                 func, args = self._ui_queue.get_nowait()
                 try:
                     func(*args)
                 except Exception:
                     pass
+                processed += 1
         except queue.Empty:
             pass
         self.root.after(50, self._poll_ui)
@@ -2470,12 +2480,36 @@ class VideoProcessorApp:
             func(*args)
 
     def clear_transfer_progress(self, text=""):
-        if hasattr(self, "remote_progress_text"):
-            self._schedule_ui(self.remote_progress_text.set, text)
-        if hasattr(self, "ui_bar"):
-            self._schedule_ui(self.ui_bar.__setitem__, "value", 0)
+        # 合并写：多次调用只保留最新 text，且同一时刻至多入队 1 条待执行更新，
+        # 防止高频进度事件把 _ui_queue 灌爆。
+        if not hasattr(self, "_progress_pending"):
+            self._progress_pending = None
+        self._progress_pending = text
+        if getattr(self, "_progress_flush_queued", False):
+            return
+        self._progress_flush_queued = True
+
+        def flush():
+            self._progress_flush_queued = False
+            text = self._progress_pending
+            self._progress_pending = None
+            if hasattr(self, "remote_progress_text"):
+                self.remote_progress_text.set(text)
+            if hasattr(self, "ui_bar"):
+                self.ui_bar.__setitem__("value", 0)
+
+        self._schedule_ui(flush)
 
     def _show_remote_clip_progress(self, event):
+        # 材料化期间 FFmpeg 进度事件高频到达，progress 事件节流刷新，
+        # start/complete/failed 等状态事件强制立即展示。
+        if not hasattr(self, "_clip_progress_throttle"):
+            self._clip_progress_throttle = ProgressThrottle(
+                self._render_remote_clip_progress, interval=0.75)
+        forced = event.get("kind", "") != "progress"
+        self._clip_progress_throttle.update(event, force=forced)
+
+    def _render_remote_clip_progress(self, event):
         kind = event.get("kind", "")
         completed = int(event.get("completed", 0) or 0)
         total = int(event.get("total", 0) or 0)
@@ -4028,6 +4062,21 @@ class VideoProcessorApp:
                             suffix=".wav", prefix="reverify-stream-", dir=TEMP_DIR)
                         os.close(_fd)
                         os.remove(save_audio_path)
+                    if isinstance(input_video_path, MediaSource):
+                        # 超大批次在开头一次性解析所有 URL，排到后面的源可能早已过期：
+                        # 检测前若解析已超阈值则重新 resolve 一次新鲜 URL。
+                        source_resolved_at = getattr(input_video_path, "resolved_at", None)
+                        if (source_resolved_at is not None
+                                and time.monotonic() - source_resolved_at > REMOTE_REFRESH_THRESHOLD):
+                            print(
+                                f"{Fore.CYAN}Refreshing stale remote source for "
+                                f"{get_source_display_name(input_video_path)}...")
+                            try:
+                                updated = refresh_func(input_video_path)
+                                if isinstance(updated, MediaSource) and updated is not input_video_path:
+                                    input_video_path.__dict__.update(updated.__dict__)
+                            except Exception as exc:
+                                print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
                     try:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
@@ -4045,6 +4094,18 @@ class VideoProcessorApp:
                         incomplete_failures.append(failure)
                         print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
                         continue
+                    except RemoteAudioStallError as exc:
+                        failure = f"{get_source_display_name(input_video_path)}: {exc}"
+                        incomplete_failures.append(failure)
+                        print(f"{Fore.YELLOW}Remote VOD skipped (stalled): {failure}")
+                        continue
+                    except Exception as exc:
+                        if isinstance(input_video_path, MediaSource):
+                            failure = f"{get_source_display_name(input_video_path)}: {exc}"
+                            incomplete_failures.append(failure)
+                            print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+                            continue
+                        raise
                     if (save_audio_path and os.path.isfile(save_audio_path)
                             and isinstance(input_video_path, MediaSource)):
                         audio_cache_paths[stable_source_id(input_video_path)] = save_audio_path
@@ -4081,12 +4142,16 @@ class VideoProcessorApp:
 
                 if incomplete_failures:
                     print(
-                        f"{Fore.YELLOW}Detection incomplete; keeping {len(dict_list)} completed VOD result(s) "
-                        "and skipping verification, review, and compile."
+                        f"{Fore.YELLOW}{len(incomplete_failures)} remote VOD(s) were skipped:"
                     )
-                    cleanup_temp_children()
-                    self.reenable_disabled_objects()
-                    return
+                    for failure in incomplete_failures:
+                        print(f"{Fore.YELLOW}  - {failure}")
+
+                if not dict_list:
+                    raise Exception(
+                        "No timestamps found for any input media. "
+                        "Every remote source failed to resolve/detect (see the skipped VOD list above)."
+                    )
 
                 # Set values for progress bar
                 # If saving individually, or there is only one video

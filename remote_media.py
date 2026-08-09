@@ -67,6 +67,7 @@ class MediaSource:
     audio_candidates: list[dict[str, Any]] = field(default_factory=list)
     video_candidates: list[dict[str, Any]] = field(default_factory=list)
     max_height: int | None = None
+    resolved_at: float | None = None
 
 
 @dataclass
@@ -410,7 +411,8 @@ def fetch_audio_cache(
                 if isinstance(updated, MediaSource) and updated is not stale_source:
                     stale_source.__dict__.update(updated.__dict__)
 
-            for resume_attempt in range(3):
+            resume_limit = 5
+            for resume_attempt in range(resume_limit):
                 partial_size = temporary_path.stat().st_size if temporary_path.exists() else 0
                 try:
                     with temporary_path.open("ab" if partial_size else "wb") as handle:
@@ -426,11 +428,11 @@ def fetch_audio_cache(
                         os.fsync(handle.fileno())
                     break
                 except Exception:
-                    if resume_attempt >= 2:
+                    if resume_attempt >= resume_limit - 1:
                         raise
                     report(
                         f"{platform_label} audio cache interrupted at {partial_size} bytes; "
-                        f"refreshing and resuming ({resume_attempt + 1}/2)"
+                        f"refreshing and resuming ({resume_attempt + 1}/{resume_limit - 1})"
                     )
                     if refresh_func is not None:
                         updated = refresh_func(source)
@@ -1501,6 +1503,7 @@ def _source_from_info(url: str, info: Mapping[str, Any], max_height: int | None 
             metadata=metadata,
             audio_candidates=audio_candidates,
             video_candidates=video_candidates,
+            resolved_at=time.monotonic(),
         ),
         max_height,
     )

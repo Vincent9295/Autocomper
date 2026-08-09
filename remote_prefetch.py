@@ -12,7 +12,11 @@ DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 DEFAULT_CONCURRENCY = 4
 DEFAULT_TIMEOUT = 30
 DEFAULT_RANGE_ATTEMPTS = 5
-DEFAULT_RETRY_DELAYS = (2, 5, 10, 20, 40)
+# 退避随次数增长，封顶 60s：大文件允许更多重试，但不会无限空等。
+DEFAULT_RETRY_DELAYS = (2, 5, 10, 20, 40, 60, 60, 60, 60, 60, 60, 60)
+# Twitch HLS 单个分片重试：3 次小退避，防单个片段失败毁掉整个缓存下载。
+_HLS_FRAGMENT_ATTEMPTS = 3
+_HLS_FRAGMENT_BACKOFF = (1, 2, 4)
 
 
 class SpeedMonitor:
@@ -97,9 +101,19 @@ def _log(logger, message):
         logger(message)
 
 
+def _scaled_range_attempts(source, base=DEFAULT_RANGE_ATTEMPTS, maximum=12):
+    """Retry budget grows with source duration (base + hours, capped)."""
+    try:
+        duration = float(getattr(source, "duration", 0) or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    hours = max(0.0, duration / 3600.0)
+    return min(maximum, base + int(hours))
+
+
 def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_CONCURRENCY,
                      request_func=None, logger=None, progress_callback=None,
-                     max_attempts=DEFAULT_RANGE_ATTEMPTS,
+                     max_attempts=None,
                      retry_delays=DEFAULT_RETRY_DELAYS, sleep_func=time.sleep,
                      speed_monitor=None, slow_callback=None, start_offset=0,
                      refresher=None):
@@ -120,6 +134,11 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
         raise RangePrefetchError("invalid range resume offset") from exc
     if start_offset < 0 or start_offset > size:
         raise RangePrefetchError("range resume offset is outside the source")
+
+    if max_attempts is None:
+        max_attempts = _scaled_range_attempts(source)
+    max_attempts = max(1, int(max_attempts))
+    retry_delays = tuple(retry_delays or ())
 
     platform = str(getattr(source, "platform", "")).lower()
     platform_label = "YouTube" if platform == "youtube" else "Bilibili"
@@ -238,13 +257,18 @@ def iter_hls_bytes(source, concurrency=DEFAULT_CONCURRENCY, request_func=None, l
     headers = dict(getattr(source, "audio_headers", {}) or {})
 
     def fetch(url):
-        try:
-            result = request(url, dict(headers), DEFAULT_TIMEOUT)
-            if not isinstance(result, tuple) or len(result) < 2 or int(result[1]) < 200 or int(result[1]) >= 300:
-                raise RangePrefetchError("HLS request returned an invalid response")
-            return bytes(result[0])
-        except Exception as exc:
-            raise RangePrefetchError("HLS request failed") from exc
+        last_error = None
+        for attempt in range(_HLS_FRAGMENT_ATTEMPTS):
+            try:
+                result = request(url, dict(headers), DEFAULT_TIMEOUT)
+                if not isinstance(result, tuple) or len(result) < 2 or int(result[1]) < 200 or int(result[1]) >= 300:
+                    raise RangePrefetchError("HLS request returned an invalid response")
+                return bytes(result[0])
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < _HLS_FRAGMENT_ATTEMPTS:
+                    time.sleep(_HLS_FRAGMENT_BACKOFF[attempt])
+        raise RangePrefetchError("HLS request failed") from last_error
 
     try:
         manifest = fetch(source.audio_url).decode("utf-8")
