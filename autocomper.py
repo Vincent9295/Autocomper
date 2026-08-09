@@ -3827,16 +3827,20 @@ class VideoProcessorApp:
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height
                 )
-                select_remote_stream_audio(remote_entries, logger=print)
             elif any(x.get_is_url() for x in self.uploaded_videos) and audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height
                 )
-                select_remote_stream_audio(remote_entries, logger=print)
                 failed_remote_ids = set()
                 for cache_index, (upload, source) in enumerate(remote_entries):
                     try:
+                        # 逐源选择 audio candidate：只在真正缓存该源前探测，
+                        # 避免开跑前对所有源一次性探测导致排尾 URL 过期。
+                        try:
+                            select_audio_candidate(source, log_func=print)
+                        except Exception as exc:
+                            print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
                         audio_cache_paths[stable_source_id(source)] = fetch_audio_cache(
                             source, cache_store, log_func=print, refresh_func=refresh_func,
                             progress_callback=lambda sample, source=source, cache_index=cache_index:
@@ -4005,11 +4009,30 @@ class VideoProcessorApp:
                     ensure_temp_dir()
                     remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
                     remote_failures = []
+                    # 检测可能已耗时 1-3 小时：compile 前对所有远程源做一次前瞻刷新，
+                    # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
+                    for entry in dict_list:
+                        source = entry.get('filename')
+                        if not isinstance(source, MediaSource):
+                            continue
+                        source_resolved_at = getattr(source, "resolved_at", None)
+                        if (source_resolved_at is not None
+                                and time.monotonic() - source_resolved_at > REMOTE_REFRESH_THRESHOLD):
+                            print(
+                                f"{Fore.CYAN}Refreshing stale remote source before compile for "
+                                f"{get_source_display_name(source)}...")
+                            try:
+                                updated = refresh_func(source)
+                                if isinstance(updated, MediaSource) and updated is not source:
+                                    source.__dict__.update(updated.__dict__)
+                            except Exception as exc:
+                                print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
                         compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
+                            refresh_func=refresh_func,
                             progress_callback=self._show_remote_clip_progress,
                             max_parallel=self.remote_download_concurrency.get())
                         for failure in remote_failures:
@@ -4077,6 +4100,12 @@ class VideoProcessorApp:
                                     input_video_path.__dict__.update(updated.__dict__)
                             except Exception as exc:
                                 print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
+                        # 逐源选择 audio candidate：只在真正检测该源前探测，
+                        # 保证用的是最新解析的候选池和当时的网络状况，且 audio_url 只在读取前一刻钉死。
+                        try:
+                            select_audio_candidate(input_video_path, log_func=print)
+                        except Exception as exc:
+                            print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
                     try:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,

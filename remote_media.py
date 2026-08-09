@@ -51,6 +51,10 @@ _BILIBILI_CDN_HOSTS = (
 _REMOTE_SEEK_PAD = 10.0
 
 
+def _segment_is_http(url) -> bool:
+    return str(url).startswith(("http://", "https://"))
+
+
 @dataclass
 class MediaSource:
     platform: str
@@ -662,7 +666,12 @@ def build_segment_command(
     if input_headers:
         command.extend(["-headers", _format_http_headers(input_headers)])
     embedded_audio = not audio_only and source_has_embedded_audio(source)
-    command.extend(["-i", str(source.audio_url if audio_only else source.video_url)])
+    stream_url = str(source.audio_url if audio_only else source.video_url)
+    if _segment_is_http(stream_url):
+        # 签名 URL 过期/CDN 半连接时 FFmpeg 会永久挂起而不退出：
+        # 给远程网络输入加读写超时，让 FFmpeg 自行中止并暴露错误给上层 refresh 重试。
+        command.extend(["-rw_timeout", "60000000"])
+    command.extend(["-i", stream_url])
     if not audio_only and source.audio_url and not embedded_audio:
         audio_headers = source.audio_headers or source.http_headers
         if audio_headers:
