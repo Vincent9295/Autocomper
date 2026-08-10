@@ -182,19 +182,27 @@ FFMPEG_PATH = get_bundle_filepath(ffmpeg_path)
 
 def _download_ydl_options(browser_cookies: str | None = None) -> dict:
     """Return yt-dlp cookie options without ever passing an anonymous Auto value."""
-    value = str(browser_cookies or "").strip().lower()
-    if value == "none":
+    value = str(browser_cookies or "").strip()
+    if value.casefold() == "none":
         value = ""
-    if value == "auto":
+    if value.casefold() == "auto":
         value = "firefox"
-    if value not in {"", "firefox", "chrome", "edge"}:
-        raise ValueError("browser_cookies must be None, firefox, chrome, edge, or auto")
-    return {"cookiesfrombrowser": (value,)} if value else {}
+    if value.startswith("cookiesfile:"):
+        cookies_path = value[len("cookiesfile:"):].strip()
+        if cookies_path:
+            return {"cookies": cookies_path}
+        value = ""
+    lowered = value.casefold()
+    if lowered not in {"", "firefox", "chrome", "edge"}:
+        raise ValueError("browser_cookies must be None, firefox, chrome, edge, auto, or a cookies file")
+    return {"cookiesfrombrowser": (lowered,)} if lowered else {}
 
 
 def _download_cookie_candidates(browser_cookies: str | None) -> list[str | None]:
-    value = str(browser_cookies or "").strip().lower()
-    if value == "auto":
+    value = str(browser_cookies or "").strip()
+    if value.startswith("cookiesfile:"):
+        return [value]
+    if value.casefold() == "auto":
         return ["firefox", "chrome", "edge", None]
     return [browser_cookies]
 

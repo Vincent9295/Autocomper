@@ -143,7 +143,26 @@ The **Remote Settings** panel controls how URL inputs are resolved and cached:
 - **Clear Cache** removes AutoComper's detection, audio, and segment cache entries. It does not delete the original videos or ordinary user files.
 - **Max Download Concurrency** sets how many remote video clips are fetched at once while preparing a compilation (default 5). Each worker runs its own FFmpeg process, so higher values finish faster on fast connections but use more CPU/disk; lower this to 1-2 if the PC feels sluggish during "Preparing clips". The control is disabled while a run is in progress.
 
+#### Playlist Imports and Platform Rate Limits
+
+Importing a large playlist (for example 100+ entries) can hit the platform's API rate limit and show `Metadata failed` in the entry list, or skip items during import. This is a platform limit, not a file or cache problem, and a short wait (typically 10-30 minutes) clears it.
+
+AutoComper already reduces how often it hits the API:
+
+- the review dialog can jump straight to a page instead of paging through every earlier page;
+- an entry whose metadata failed is retried automatically with a backoff instead of being marked failed forever;
+- importing reuses metadata already hydrated in the review dialog instead of re-resolving every selected entry.
+
+To keep imports reliable:
+
+- import in smaller batches (20-30 entries at a time);
+- wait for each page's entries to show `Ready` before confirming;
+- if you still see `Metadata failed`, wait 10-30 minutes for the rate limit to clear, then retry;
+- staying logged in (browser cookies) raises the platform quota.
+
 #### Import External Audio
+
+
 
 **Import External Audio** is available in the Remote Cache button group. It lets you use audio downloaded outside AutoComper as the Audio Cache for a selected remote VOD.
 

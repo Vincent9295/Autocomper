@@ -8,6 +8,7 @@ import sys
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -62,14 +63,17 @@ from compile import _get_video_duration, compile_vid, get_video_codec
 from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
 from sound_reader import (RemoteAudioIncompleteError, RemoteAudioStallError,
-                          get_timestamps)
+                          get_timestamps, _detection_cache_args)
 from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            PlaylistDescriptor, PlaylistEntry, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
                            stable_source_id, SourceResolveError,
                            apply_video_quality_limit,
+                           source_from_hydrated_entry,
+                           preflight_cookie_source,
                            _audio_cache_format_identity)
 from remote_cache import CacheStore
+from remote_rate import LimitedRefresher, ResolveLimiter
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
                      convert_quality_str_to_int, download_audio, download_video,
                      get_bundle_filepath, kill_tracked_procs, run_tracked,
@@ -90,7 +94,7 @@ DEFAULT_SETTINGS = {
 }
 
 REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
-REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge")
+REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge", "Cookies File…")
 PLAYLIST_PAGE_SIZE = 30
 MAX_PLAYLIST_ENTRIES = 1000
 REMOTE_MODE_TOOLTIP_TEXT = (
@@ -102,7 +106,12 @@ REMOTE_BROWSER_COOKIES_TOOLTIP_TEXT = (
     "Auto: try direct access first, then browser cookies when the site requires them.\n"
     "None: never read browser cookies.\n"
     "Firefox, Chrome, or Edge: read cookies from that browser. The browser must be\n"
-    "installed and logged in to the account that can access the remote media."
+    "installed and logged in to the account that can access the remote media.\n"
+    "On Windows, only Firefox is reliable. Chrome 127+ encrypts its cookies\n"
+    "(App-Bound) and Edge locks its database while the browser is open.\n"
+    "Cookies File…: read cookies from a cookies.txt file (exported with the\n"
+    "'Get cookies.txt LOCALLY' browser extension). Works with any browser.\n"
+    "When Cookies File… is selected, a file picker opens to choose the file."
 )
 REMOTE_CONCURRENCY_TOOLTIP_TEXT = (
     "How many remote video clips to download at once while preparing clips.\n"
@@ -305,11 +314,21 @@ def resolve_playlist_entries(
             seen_source_ids.add(source_id)
             sources.append(source)
 
+    def resolve_entry(entry):
+        """Reuse already-hydrated metadata when available; otherwise resolve fresh."""
+        cached_info = (entry.metadata or {}).get("_resolved_info")
+        if isinstance(cached_info, Mapping):
+            try:
+                return source_from_hydrated_entry(entry)
+            except Exception:
+                pass
+        return resolver(entry.webpage_url, browser_cookies=browser_cookies)
+
     for entry in entries:
         if entry.entry_id not in selected_ids:
             continue
         try:
-            add_source(resolver(entry.webpage_url, browser_cookies=browser_cookies))
+            add_source(resolve_entry(entry))
         except Exception as exc:
             is_bilibili_playlist = (
                 isinstance(exc, SourceResolveError)
@@ -370,7 +389,7 @@ def normalize_remote_settings(data):
     cookies = normalized.get("remote_browser_cookies", "Auto")
     normalized["remote_mode"] = mode if mode in REMOTE_MODES else "Remote Stream"
     normalized["remote_browser_cookies"] = (
-        cookies if cookies in REMOTE_BROWSER_COOKIES else "Auto"
+        cookies if _valid_cookie_label(cookies) else "Auto"
     )
     if "remote_download_concurrency" in normalized:
         try:
@@ -384,6 +403,13 @@ def normalize_remote_settings(data):
         normalized["remote_download_concurrency"] = concurrency
     normalized.pop("remote_cache_size", None)
     return normalized
+
+
+def _valid_cookie_label(value):
+    """Return whether a stored cookie label is a known choice or a file label."""
+    if value in REMOTE_BROWSER_COOKIES:
+        return True
+    return str(value).casefold().startswith("cookies file")
 
 
 def select_remote_cache_store(current_store: CacheStore, selected_path) -> CacheStore:
@@ -458,6 +484,9 @@ TEMP_DIR = _temp_dir_obj.name
 # 超过该秒数（30 分钟）后，处理某个远程源前会重新解析一次，避免开头一次性
 # 解析的大量 URL 在排到后面时已经过期。
 REMOTE_REFRESH_THRESHOLD = 1800.0
+# 预览前，若源已超过该秒数（5 分钟）未刷新则主动重新解析，避免用过期的
+# signed URL 拉预览段导致 403。
+PREVIEW_REFRESH_THRESHOLD = 300.0
 
 
 def ensure_temp_dir():
@@ -560,10 +589,18 @@ def remote_mode_actions(mode):
     return mode != "Full Download", mode == "Audio Cache", mode == "Full Download"
 
 
-def browser_cookie_setting_value(label):
+def browser_cookie_setting_value(label, cookies_file=""):
     """Convert the GUI browser-cookie label to the resolver setting."""
-    value = str(label or "Auto").strip().lower()
-    return None if value == "none" else value
+    value = str(label or "Auto").strip()
+    lowered = value.casefold()
+    if lowered == "none":
+        return None
+    if lowered.startswith("cookies file"):
+        cookies_path = str(cookies_file or "").strip()
+        if cookies_path:
+            return f"cookiesfile:{cookies_path}"
+        return None
+    return lowered if lowered else None
 
 
 def remote_detection_input(upload, mode, audio_cache_paths):
@@ -597,6 +634,7 @@ def resolve_remote_uploads(
     logger=None,
     browser_cookies=None,
     max_height=None,
+    limiter=None,
 ):
     """Resolve URL uploads without changing local uploads.
 
@@ -614,6 +652,8 @@ def resolve_remote_uploads(
         remote_count += 1
         source = upload.get_source()
         try:
+            if limiter is not None:
+                limiter.wait()
             if source is None:
                 source_url = upload.get_url() or upload.get_path()
                 if browser_cookies is None:
@@ -653,6 +693,20 @@ def select_remote_stream_audio(remote_entries, selector=None, logger=None):
                 )
         except Exception as exc:
             log(f"Remote Stream audio probe skipped: {type(exc).__name__}")
+
+
+def _mark_detection_failure(cache_store, source, precision, block_size, threshold,
+                            focus_idx, model, reason):
+    """Record a detection failure marker for a remote source so a re-run can retry it."""
+    if not isinstance(source, MediaSource) or cache_store is None:
+        return
+    try:
+        cache_store.save_detection_failure(
+            *_detection_cache_args(source, model, precision, block_size, threshold, focus_idx),
+            {"error": str(reason)[:500], "recorded_at": time.time()},
+        )
+    except Exception:
+        pass
 
 
 def refresh_remote_source(source, browser_cookies=None):
@@ -1602,6 +1656,23 @@ class ReviewDialog:
             tmp_path = tmp.name
             if isinstance(f['filename'], MediaSource):
                 cache_store = getattr(self, 'cache_store', None) or CacheStore()
+                source = f['filename']
+                source_resolved_at = getattr(source, "resolved_at", None)
+                if (source_resolved_at is not None
+                        and time.monotonic() - source_resolved_at > PREVIEW_REFRESH_THRESHOLD):
+                    try:
+                        updated = refresh_remote_source(
+                            source,
+                            browser_cookies=browser_cookie_setting_value(
+                                self.remote_browser_cookies.get(),
+                                cookies_file=self.remote_cookies_file.get(),
+                            ),
+                        )
+                        if updated is not None and updated is not source:
+                            source.__dict__.update(updated.__dict__)
+                        print(f"Preview source refreshed ({source.display_name})")
+                    except Exception as exc:
+                        print(f"{Fore.YELLOW}Preview source refresh failed: {exc}")
                 fetch_result = fetch_segment(
                     f['filename'], ss, ss + dur, tmp.name,
                     cache_store=cache_store, allow_covering_cache=False,
@@ -1610,7 +1681,8 @@ class ReviewDialog:
                     refresh_func=lambda source: refresh_remote_source(
                         source,
                         browser_cookies=browser_cookie_setting_value(
-                            self.remote_browser_cookies.get()
+                            self.remote_browser_cookies.get(),
+                            cookies_file=self.remote_cookies_file.get(),
                         ),
                     ),
                     logger=print)
@@ -1793,6 +1865,7 @@ class VideoProcessorApp:
         self.normalize_audio = tk.BooleanVar()
         self.remote_mode = tk.StringVar(value="Remote Stream")
         self.remote_browser_cookies = tk.StringVar(value="Auto")
+        self.remote_cookies_file = tk.StringVar()
         configured_cache_path = self.preferences.get(
             "Settings", "remote_cache_path", fallback=str(CacheStore().root))
         self.remote_cache_store = CacheStore(configured_cache_path)
@@ -2007,11 +2080,14 @@ class VideoProcessorApp:
         self.remote_browser_cookies_dropdown = ttk.Combobox(
             self.remote_settings_frame,
             textvariable=self.remote_browser_cookies,
-            values=["Auto", "None", "Firefox", "Chrome", "Edge"],
+            values=list(REMOTE_BROWSER_COOKIES),
             state="readonly",
             width=27,
         )
         self.remote_browser_cookies_dropdown.pack(pady=(0, 8))
+        self.remote_browser_cookies_dropdown.bind(
+            "<<ComboboxSelected>>", self._on_cookie_selection
+        )
         self.remote_mode_tooltip = CustomHovertip(
             self.remote_mode_dropdown, REMOTE_MODE_TOOLTIP_TEXT
         )
@@ -2642,6 +2718,25 @@ class VideoProcessorApp:
                     file, 'video' if self.is_video else 'audio'))
             self.update_listbox(scroll_to_bottom=True)
 
+    def _on_cookie_selection(self, event=None):
+        """Handle a browser-cookie dropdown change; open a picker for Cookies File…."""
+        label = str(self.remote_browser_cookies.get() or "").strip()
+        if label.casefold() != "cookies file…" and not label.casefold().startswith("cookies file"):
+            return
+        path = filedialog.askopenfilename(
+            title="Select a cookies.txt file",
+            filetypes=[("Cookie files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            self.remote_cookies_file.set(path)
+            self.remote_browser_cookies.set(
+                f"Cookies File: {os.path.basename(path)}"
+            )
+        else:
+            previous = "Cookies File…" if self.remote_cookies_file.get() else "Auto"
+            self.remote_browser_cookies.set(previous)
+
+
     def _pick_playlist_sources(self, descriptor):
         """Show a lazy paged playlist review and return confirmed entries."""
         dialog = tk.Toplevel(self.root)
@@ -2729,11 +2824,48 @@ class VideoProcessorApp:
                 hydration_pending.discard(entry.entry_id)
             if closed[0]:
                 return
+            if entry.metadata.get("hydration_failed"):
+                retry_count = int(entry.metadata.get("hydration_retries", 0) or 0)
+                if retry_count < 3:
+                    entry.metadata["hydration_retries"] = retry_count + 1
+                    backoff = (5, 15, 45)[retry_count]
+                    if retry_count == 0:
+                        try:
+                            self.root.after(0, lambda: apply_hydration_update(
+                                entry, render_page_index, render_generation, visible_ids))
+                        except tk.TclError:
+                            pass
+                    try:
+                        self.root.after(
+                            int(backoff * 1000),
+                            lambda: schedule_hydration_retry(
+                                entry, render_page_index, render_generation, visible_ids),
+                        )
+                    except tk.TclError:
+                        pass
+                else:
+                    entry.metadata.pop("hydration_retries", None)
+                    try:
+                        self.root.after(0, lambda: apply_hydration_update(
+                            entry, render_page_index, render_generation, visible_ids))
+                    except tk.TclError:
+                        pass
+                return
             try:
                 self.root.after(0, lambda: apply_hydration_update(
                     entry, render_page_index, render_generation, visible_ids))
             except tk.TclError:
                 pass
+
+        def schedule_hydration_retry(entry, render_page_index, render_generation, visible_ids):
+            if closed[0]:
+                return
+            entry.metadata["hydration_failed"] = False
+            if entry.entry_id not in hydration_pending:
+                hydration_pending.add(entry.entry_id)
+                hydration_executor.submit(
+                    hydrate_page_entry, entry, render_page_index, render_generation, visible_ids
+                )
 
         def apply_hydration_update(entry, render_page_index, render_generation, visible_ids):
             entry.metadata["hydration_pending"] = False
@@ -2742,8 +2874,13 @@ class VideoProcessorApp:
                     page_index[0], generation[0], visible_ids):
                 return
             if tree.exists(entry.entry_id):
-                tree.item(entry.entry_id, values=playlist_tree_values(
-                    entry, selected_ids, selected_order))
+                retry_count = int(entry.metadata.get("hydration_retries", 0) or 0)
+                values = playlist_tree_values(entry, selected_ids, selected_order)
+                if entry.metadata.get("hydration_failed") and retry_count and retry_count < 3:
+                    values = list(values)
+                    values[6] = f"Retrying ({retry_count}/3)..."
+                    values = tuple(values)
+                tree.item(entry.entry_id, values=values)
 
         def select_page(value):
             for entry in descriptor.load_page(page_index[0], hydrate=False):
@@ -2809,6 +2946,28 @@ class VideoProcessorApp:
             controls, text="Sort Selected",
             command=lambda: sort_selected(),
         ).pack(side="left", padx=2)
+        ttk.Label(controls, text="Jump to page:").pack(side="left", padx=(10, 2))
+        _total_pages = max(
+            1, (descriptor.total_count + descriptor.page_size - 1) // descriptor.page_size
+        )
+        _jump_page = tk.IntVar(value=1)
+
+        def go_to_page():
+            try:
+                target = int(_jump_page.get())
+            except (TypeError, ValueError, tk.TclError):
+                target = 1
+            target = max(1, min(target, _total_pages))
+            page_index[0] = target - 1
+            render_page()
+
+        jump_spin = ttk.Spinbox(
+            controls, from_=1, to=_total_pages, width=4,
+            textvariable=_jump_page,
+        )
+        jump_spin.pack(side="left", padx=(0, 2))
+        jump_spin.bind("<Return>", lambda event: go_to_page())
+        ttk.Button(controls, text="Go", command=go_to_page).pack(side="left", padx=2)
         ttk.Button(actions, text="Confirm Selected", command=confirm).pack(side="left", padx=4)
         ttk.Button(actions, text="Cancel", command=cancel).pack(side="left", padx=4)
 
@@ -2862,7 +3021,8 @@ class VideoProcessorApp:
                 described = describe_input(
                     url,
                     browser_cookies=browser_cookie_setting_value(
-                        self.remote_browser_cookies.get()
+                        self.remote_browser_cookies.get(),
+                        cookies_file=self.remote_cookies_file.get(),
                     ),
                 )
             except Exception as exc:
@@ -2885,7 +3045,10 @@ class VideoProcessorApp:
                     return
                 failures = []
                 expansion_stats = {}
-                cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
+                cookies = browser_cookie_setting_value(
+                    self.remote_browser_cookies.get(),
+                    cookies_file=self.remote_cookies_file.get(),
+                )
 
                 def resolve_selected():
                     sources = resolve_playlist_entries(
@@ -3652,7 +3815,10 @@ class VideoProcessorApp:
     def handle_url_downloads(self):
         keep_downloaded_vids = self.keep_downloaded_vids.get()
         download_path = self.download_video_path.get()
-        browser_cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
+        browser_cookies = browser_cookie_setting_value(
+            self.remote_browser_cookies.get(),
+            cookies_file=self.remote_cookies_file.get(),
+        )
 
         # 防御：如果配置的下载目录不存在，回退到 TEMP_DIR
         if download_path and download_path != "No location selected!":
@@ -3811,10 +3977,22 @@ class VideoProcessorApp:
             detection_size = detection_block_size(self.remote_mode.get(), block_size)
             if self.remote_mode.get() == "Remote Stream":
                 print(f"Remote Stream block size: {detection_size}s")
-            browser_cookies = browser_cookie_setting_value(self.remote_browser_cookies.get())
+            browser_cookies = browser_cookie_setting_value(
+                self.remote_browser_cookies.get(),
+                cookies_file=self.remote_cookies_file.get(),
+            )
+            preflight_failure = preflight_cookie_source(browser_cookies)
+            if preflight_failure:
+                print(f"{Fore.YELLOW}Cookie preflight warning: {preflight_failure}")
             max_height = convert_quality_str_to_int(self.max_quality.get())
-            refresh_func = lambda source: refresh_remote_source(
-                source, browser_cookies=browser_cookies
+            _resolve_limiter = ResolveLimiter()
+            refresh_func = LimitedRefresher(
+                lambda source: refresh_remote_source(
+                    source, browser_cookies=browser_cookies
+                ),
+                limiter=_resolve_limiter,
+                retries=3,
+                logger=print,
             )
             audio_cache_paths = {}
             resolved_local_entries = []
@@ -3825,12 +4003,12 @@ class VideoProcessorApp:
             elif any(x.get_is_url() for x in self.uploaded_videos) and resolve_remote and not audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
-                    max_height=max_height
+                    max_height=max_height, limiter=_resolve_limiter,
                 )
             elif any(x.get_is_url() for x in self.uploaded_videos) and audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
-                    max_height=max_height
+                    max_height=max_height, limiter=_resolve_limiter,
                 )
                 failed_remote_ids = set()
                 for cache_index, (upload, source) in enumerate(remote_entries):
@@ -3861,6 +4039,59 @@ class VideoProcessorApp:
                     (upload, source) for upload, source in remote_entries
                     if stable_source_id(source) not in failed_remote_ids
                 ]
+
+                # 上一轮某些远程源检测失败（或整批只跑到一半被取消）：本次如果重新
+                # 解析到了这些源且 detection cache 里有失败标记，就询问是否重试。
+                if remote_entries:
+                    previously_failed = []
+                    for upload, source in remote_entries:
+                        if source is None:
+                            continue
+                        try:
+                            if cache_store.has_detection_failure(
+                                    *_detection_cache_args(
+                                        source, selected_model, precision,
+                                        detection_block_size(self.remote_mode.get(), block_size, True),
+                                        threshold, focus_idx,
+                                    )):
+                                previously_failed.append(source)
+                        except Exception:
+                            continue
+                    if previously_failed:
+                        retry_choice = messagebox.askyesno(
+                            "Retry Failed Sources",
+                            f"{len(previously_failed)} remote source(s) failed detection in a "
+                            f"previous run and are now resolved again:\n\n"
+                            + "\n".join(f"  - {get_source_display_name(s)}" for s in previously_failed[:8])
+                            + ("\n  ..." if len(previously_failed) > 8 else "")
+                            + "\n\nRe-detect them now? (Yes re-runs detection for these; "
+                              "No skips them this run.)",
+                        )
+                        if retry_choice:
+                            for source in previously_failed:
+                                try:
+                                    cache_store.clear_detection_failure(
+                                        *_detection_cache_args(
+                                            source, selected_model, precision,
+                                            detection_block_size(self.remote_mode.get(), block_size, True),
+                                            threshold, focus_idx,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                            print(
+                                f"{Fore.CYAN}Re-detecting {len(previously_failed)} previously "
+                                f"failed remote source(s).")
+                        else:
+                            drop_ids = {stable_source_id(s) for s in previously_failed}
+                            remote_entries = [
+                                (u, s) for u, s in remote_entries
+                                if s is None or stable_source_id(s) not in drop_ids
+                            ]
+                            print(
+                                f"{Fore.YELLOW}Skipping {len(drop_ids)} previously failed "
+                                f"remote source(s) this run.")
+
 
             res = ()
             if self.use_custom_resolution.get():
@@ -3952,6 +4183,15 @@ class VideoProcessorApp:
                     print(f"{Fore.GREEN}Loaded {loaded} of {len(with_videos)} video(s).")
                     if loaded == 0:
                         raise Exception("No videos from timestamps matched the current list.")
+                    _uploaded_remote = sum(
+                        1 for v in self.uploaded_videos if v.get_is_url())
+                    if _uploaded_remote > loaded:
+                        print(
+                            f"{Fore.YELLOW}WARNING: {_uploaded_remote - loaded} remote source(s) "
+                            f"in the current list have no timestamp data in {txt_path}. "
+                            f"They were likely skipped in the earlier run. If you want to recover "
+                            f"them, cancel and re-run WITHOUT skipping detection, so the missed "
+                            f"sources are re-detected.")
 
                     total_progress = ((4 if combine else 2) if self.is_video else (2 if combine else 1)) * (loaded + (1 if combine and loaded > 1 else 0)) * 100
                     self.final_bar.reset_total_progress(total_progress)
@@ -4065,7 +4305,9 @@ class VideoProcessorApp:
                         self.uploaded_videos, resolved_local_entries, remote_entries)
                 else:
                     processing_uploads = list(self.uploaded_videos)
-                for i, upload in enumerate(processing_uploads):
+                def run_detection(upload, i):
+                    """Run detection for one upload; returns True on success."""
+                    nonlocal vids_with_clips
                     input_video_path = remote_detection_input(
                         upload, self.remote_mode.get(), audio_cache_paths
                     )
@@ -4122,18 +4364,27 @@ class VideoProcessorApp:
                         failure = f"{get_source_display_name(input_video_path)}: {exc}"
                         incomplete_failures.append(failure)
                         print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
-                        continue
+                        _mark_detection_failure(cache_store, input_video_path,
+                                                 precision, current_block_size, threshold,
+                                                 focus_idx, selected_model, str(exc))
+                        return False
                     except RemoteAudioStallError as exc:
                         failure = f"{get_source_display_name(input_video_path)}: {exc}"
                         incomplete_failures.append(failure)
                         print(f"{Fore.YELLOW}Remote VOD skipped (stalled): {failure}")
-                        continue
+                        _mark_detection_failure(cache_store, input_video_path,
+                                                 precision, current_block_size, threshold,
+                                                 focus_idx, selected_model, str(exc))
+                        return False
                     except Exception as exc:
                         if isinstance(input_video_path, MediaSource):
                             failure = f"{get_source_display_name(input_video_path)}: {exc}"
                             incomplete_failures.append(failure)
                             print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
-                            continue
+                            _mark_detection_failure(cache_store, input_video_path,
+                                                     precision, current_block_size, threshold,
+                                                     focus_idx, selected_model, str(exc))
+                            return False
                         raise
                     if (save_audio_path and os.path.isfile(save_audio_path)
                             and isinstance(input_video_path, MediaSource)):
@@ -4155,6 +4406,16 @@ class VideoProcessorApp:
                         if dropped:
                             print(f"{Fore.CYAN}Strict FP filter: dropped {dropped} suspect clip(s).")
                     dict_list.append(timestamps)
+                    if isinstance(input_video_path, MediaSource):
+                        try:
+                            cache_store.clear_detection_failure(
+                                *_detection_cache_args(
+                                    input_video_path, selected_model, precision,
+                                    current_block_size, threshold, focus_idx,
+                                )
+                            )
+                        except Exception:
+                            pass
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
                     num_found = len(timestamps['timestamps'])
                     if num_found > 1:
@@ -4168,6 +4429,34 @@ class VideoProcessorApp:
                     else:
                         print(
                             f"{Fore.YELLOW}Could not find any clips.")
+                    return True
+
+                failed_uploads = []
+                for i, upload in enumerate(processing_uploads):
+                    ok = run_detection(upload, i)
+                    if not ok and upload.get_is_url():
+                        failed_uploads.append(upload)
+
+                # 第二遍：网络/限流是暂时性的，等退避后仅对失败的远程源重试一次，
+                # 避免整批最后直接跳过本来能恢复的源。
+                if failed_uploads:
+                    print(
+                        f"{Fore.CYAN}Retrying {len(failed_uploads)} failed remote source(s) "
+                        f"after a short pause...")
+                    time.sleep(10)
+                    recovered = []
+                    for retry_index, upload in enumerate(failed_uploads):
+                        ok = run_detection(upload, len(processing_uploads) + retry_index)
+                        if not ok:
+                            print(
+                                f"{Fore.YELLOW}  Retry still failed: "
+                                f"{get_source_display_name(upload)}")
+                        else:
+                            recovered.append(get_source_display_name(upload))
+                    if recovered:
+                        print(
+                            f"{Fore.GREEN}Retry pass recovered {len(recovered)} previously "
+                            f"failed source(s); remaining failures listed below.")
 
                 if incomplete_failures:
                     print(

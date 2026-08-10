@@ -2,6 +2,15 @@
 build*/
 *.pyc
 __pycache__/
+AutoComper Enhanced*.zip
+lib/
+nul
+convert_f32.py
+preferences.ini
+
+# Plan docs (local only, not part of the release)
+docs/
+.superpowers/
 
 # IDE / Editor
 .vscode/

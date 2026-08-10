@@ -135,6 +135,25 @@ class CacheStore:
     def load_detection_result(self, *args: Any) -> Any | None:
         return self.read_json(self.get_detection_cache_path(*args))
 
+    def get_detection_failure_path(self, *args: Any) -> Path:
+        path = self.get_detection_cache_path(*args)
+        return path.with_suffix(".failed.json")
+
+    def save_detection_failure(self, *args: Any) -> Path:
+        result = args[-1]
+        path = self.get_detection_failure_path(*args[:-1])
+        self.save_json(path, result)
+        return path
+
+    def load_detection_failure(self, *args: Any) -> Any | None:
+        return self.read_json(self.get_detection_failure_path(*args))
+
+    def has_detection_failure(self, *args: Any) -> bool:
+        return self.get_detection_failure_path(*args).is_file()
+
+    def clear_detection_failure(self, *args: Any) -> None:
+        self.get_detection_failure_path(*args).unlink(missing_ok=True)
+
     def get_audio_cache_path(
         self,
         source_identity: str,

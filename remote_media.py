@@ -42,6 +42,7 @@ class SegmentFetchError(RemoteMediaError):
 
 
 _BROWSER_COOKIE_NAMES = ("firefox", "chrome", "edge")
+_COOKIES_FILE_PREFIX = "cookiesfile:"
 _BILIBILI_HOST_MARKERS = ("bilibili.com", "b23.tv")
 _BILIBILI_CDN_HOSTS = (
     "upos-sz-mirrorcos.bilivideo.com",
@@ -118,18 +119,23 @@ class PlaylistDescriptor:
         return list(page)
 
     def needs_hydration(self, entry: PlaylistEntry) -> bool:
-        return bool(self._hydrate_entry and entry.index not in self._hydrated_indices)
+        return bool(
+            self._hydrate_entry
+            and entry.index not in self._hydrated_indices
+        )
 
     def hydrate_entry(self, entry: PlaylistEntry) -> PlaylistEntry:
         if not self._hydrate_entry or entry.index in self._hydrated_indices:
             return entry
-        self._hydrated_indices.add(entry.index)
         try:
             hydrated = self._hydrate_entry(entry)
         except Exception:
             hydrated = None
         if hydrated:
             _merge_entry_metadata(entry, hydrated)
+            entry.metadata["_resolved_info"] = dict(hydrated)
+            self._hydrated_indices.add(entry.index)
+            entry.metadata["hydration_failed"] = False
         else:
             entry.metadata["hydration_failed"] = True
         return entry
@@ -747,6 +753,23 @@ def _segment_has_stream(path, want_video=True):
     return bool(re.search(r"Stream #\d+:\d+.*" + kind, stderr))
 
 
+def _refresh_with_backoff(
+    refresh_func: Callable[[MediaSource], MediaSource | None],
+    source: MediaSource,
+    logger: Callable[[str], Any] | None = None,
+    attempts: int = 3,
+) -> MediaSource | None:
+    """Retry a refresh with rate-limit backoff so one rate-limited resolve does not
+    cascade into hard-retrying an expired URL. Re-raises the last failure."""
+    from remote_rate import LimitedRefresher, ResolveLimiter
+    if isinstance(refresh_func, LimitedRefresher):
+        return refresh_func(source)
+    limited = LimitedRefresher(
+        refresh_func, limiter=ResolveLimiter(), retries=attempts, logger=logger
+    )
+    return limited(source)
+
+
 def fetch_segment(
     source: MediaSource,
     start: float,
@@ -823,6 +846,11 @@ def fetch_segment(
             return_code = getattr(result, "returncode", 0)
             if return_code != 0:
                 detail = getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+                if "403" in str(detail):
+                    detail = (
+                        f"{detail} (The remote source URL likely expired or is "
+                        f"rate-limited; AutoComper will try refreshing the source.)"
+                    )
                 raise SegmentFetchError(f"FFmpeg segment fetch failed (rc={return_code}): {detail}")
             if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                 raise SegmentFetchError(f"FFmpeg segment fetch completed without output: {temporary_path}")
@@ -852,7 +880,7 @@ def fetch_segment(
             if refresh_func is not None and not refreshed:
                 refreshed = True
                 try:
-                    updated = refresh_func(source)
+                    updated = _refresh_with_backoff(refresh_func, source, logger=logger)
                     if isinstance(updated, MediaSource) and updated is not source:
                         source.__dict__.update(updated.__dict__)
                     if logger is not None:
@@ -907,14 +935,20 @@ def parse_url_list(text: str) -> list[str]:
 def _normalize_browser_cookies(browser_cookies: str | None) -> str | None:
     if browser_cookies is None:
         return None
-    value = str(browser_cookies).strip().lower()
-    if value == "none":
+    value = str(browser_cookies).strip()
+    if value.casefold() == "none":
         return None
-    if value not in (*_BROWSER_COOKIE_NAMES, "auto"):
+    if value.startswith(_COOKIES_FILE_PREFIX):
+        cookies_path = value[len(_COOKIES_FILE_PREFIX):].strip()
+        if not cookies_path:
+            raise ValueError("cookies file path is empty")
+        return f"{_COOKIES_FILE_PREFIX}{cookies_path}"
+    lowered = value.casefold()
+    if lowered not in (*_BROWSER_COOKIE_NAMES, "auto"):
         raise ValueError(
-            "browser_cookies must be None, firefox, chrome, edge, or auto"
+            "browser_cookies must be None, firefox, chrome, edge, auto, or a cookies file"
         )
-    return value
+    return lowered
 
 
 def _ydl_options(
@@ -929,7 +963,11 @@ def _ydl_options(
     if extract_flat:
         options["extract_flat"] = True
     normalized = _normalize_browser_cookies(browser_cookies)
-    if normalized in _BROWSER_COOKIE_NAMES:
+    if normalized is None:
+        return options
+    if normalized.startswith(_COOKIES_FILE_PREFIX):
+        options["cookies"] = normalized[len(_COOKIES_FILE_PREFIX):]
+    elif normalized in _BROWSER_COOKIE_NAMES:
         options["cookiesfrombrowser"] = (normalized,)
     return options
 
@@ -981,7 +1019,10 @@ def _readable_resolve_error(url: str, exc: Exception) -> str:
     if any(marker in lowered for marker in ("dpapi", "decrypt", "browser", "not installed", "not logged")):
         return (
             f"Could not read browser cookies for {url}: {detail}. "
-            "Check that the browser is installed and logged in, or choose another cookies source."
+            "On Windows, only Firefox is reliable. Chrome 127+ encrypts its cookies "
+            "(App-Bound) and Edge locks its database while the browser is open. "
+            "Close Edge, switch to Firefox, or import a cookies.txt file "
+            "('Get cookies.txt LOCALLY' browser extension)."
         )
     return f"Could not resolve source {url}: {detail}"
 
@@ -1007,6 +1048,20 @@ def _short_cookie_failure(browser: str, exc: Exception) -> str:
     return f"{browser}: {detail}"
 
 
+_cookie_failure_last_printed: dict[str, float] = {}
+
+
+def _cookie_failure_should_print(browser: str, url: str) -> bool:
+    """Throttle per-browser cookie failure logs to avoid refresh-storm spam."""
+    key = f"{browser}\x00{url}"
+    now = time.monotonic()
+    last = _cookie_failure_last_printed.get(key)
+    if last is not None and now - last < 30:
+        return False
+    _cookie_failure_last_printed[key] = now
+    return True
+
+
 def _extract_with_cookie_policy(
     url: str,
     ydl_factory: Callable[..., Any] | None,
@@ -1028,12 +1083,42 @@ def _extract_with_cookie_policy(
                 return _extract_info(url, ydl_factory, browser, extract_flat=extract_flat)
             except SourceResolveError as exc:
                 failures.append(_short_cookie_failure(browser, exc))
-                print(f"Remote browser cookies failed ({url}): {failures[-1]}")
+                if _cookie_failure_should_print(browser, url):
+                    print(f"Remote browser cookies failed ({url}): {failures[-1]}")
         detail = "; ".join(failures)
         raise SourceResolveError(
             f"Could not resolve source {url}: {detail}. "
             "请登录 Bilibili 浏览器或选择 cookies"
         ) from initial_error
+
+
+def preflight_cookie_source(browser_cookies: str | None) -> str | None:
+    """Return a human-readable failure reason for an unusable cookie source, or None.
+
+    Only checks sources that can be validated locally without a network request:
+    a cookies.txt file must exist and be readable; no full resolve is performed.
+    ``None``/``auto``/browser names are considered usable here because they fall
+    back to direct access at resolve time.
+    """
+    normalized = _normalize_browser_cookies(browser_cookies)
+    if normalized is None:
+        return None
+    if normalized == "auto":
+        return None
+    if normalized.startswith(_COOKIES_FILE_PREFIX):
+        cookies_path = normalized[len(_COOKIES_FILE_PREFIX):]
+        if not os.path.isfile(cookies_path):
+            return (
+                f"Cookies file not found: {cookies_path}. "
+                "Re-choose the file in Remote Settings (Remote Browser Cookies → Cookies File…)."
+            )
+        try:
+            with open(cookies_path, "rb"):
+                pass
+        except OSError as exc:
+            return f"Cookies file is not readable: {cookies_path} ({exc})"
+        return None
+    return None
 
 
 def _stream_url(info: Mapping[str, Any], audio: bool) -> str:
@@ -1516,6 +1601,21 @@ def _source_from_info(url: str, info: Mapping[str, Any], max_height: int | None 
         ),
         max_height,
     )
+
+
+def source_from_hydrated_entry(entry: PlaylistEntry, max_height: int | None = None) -> MediaSource:
+    """Build a MediaSource from an entry hydrated earlier, avoiding a second
+    full yt-dlp extraction on import. Falls back to the single-VOD path when
+    the cached info is a playlist or lacks stream candidates."""
+    info = (entry.metadata or {}).get("_resolved_info")
+    if not isinstance(info, Mapping):
+        raise SourceResolveError(f"Source was not hydrated: {entry.webpage_url}")
+    info = dict(info)
+    info.setdefault("webpage_url", entry.webpage_url)
+    info.setdefault("id", entry.entry_id)
+    if info.get("_type") in ("playlist", "multi_video"):
+        raise SourceResolveError(f"Source is a playlist, not a single VOD: {entry.webpage_url}")
+    return _source_from_info(entry.webpage_url, info, max_height)
 
 
 def apply_video_quality_limit(source: MediaSource, max_height: int | None) -> MediaSource:
