@@ -476,14 +476,27 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False,
             raise Exception(f"FFmpeg audio cut failed for {os.path.basename(input_file)}:\n{result.stderr}")
         return True
 
+    # 多段：用 FLAC 中间格式（无 encoder priming），避免 MP3 每段引入的
+    # encoder delay 在 concat 时逐段累积（实测 20 段 +0.85s → 0）。
     seg_files = []
     seg_dir = os.path.dirname(output_file)
     try:
         for i, (s, e) in enumerate(timestamps):
-            seg_file = os.path.join(seg_dir, f"_aseg{i}.mp3")
+            seg_file = os.path.join(seg_dir, f"_aseg{i}.flac")
             seg_files.append(seg_file)
-            _ffmpeg_cut_audio(input_file, [(s, e)], seg_file, normalize=normalize,
-                              progress_callback=progress_callback, duration=duration)
+            cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2',
+                   '-ss', str(s - min(_SEEK_PAD, s)), '-i', input_file,
+                   '-ss', str(min(_SEEK_PAD, s)), '-to', str(min(_SEEK_PAD, s) + (e - s)),
+                   '-map', '0:a:0', '-c:a', 'flac', '-ar', '44100',
+                   '-avoid_negative_ts', 'make_zero', seg_file]
+            if normalize:
+                cmd = cmd[:-1] + ['-af', 'loudnorm', seg_file]
+            result = _run_ffmpeg(cmd, timeout=600,
+                                 progress_callback=progress_callback,
+                                 duration=e - s, stage="Encoding audio clip")
+            if result.returncode != 0:
+                raise Exception(
+                    f"FFmpeg audio cut failed for {os.path.basename(input_file)}:\n{result.stderr}")
         _ffmpeg_concat_audio(seg_files, output_file, normalize=normalize,
                              progress_callback=progress_callback)
     finally:
@@ -498,11 +511,6 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False,
 def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callback=None):
     if not file_list:
         return False
-    if len(file_list) == 1:
-        shutil.copy2(file_list[0], output_file)
-        os.remove(file_list[0])
-        return True
-
     temp_dir = os.path.dirname(file_list[0])
     list_path = os.path.join(temp_dir, 'concat_list.txt')
     durations = []
@@ -516,13 +524,15 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
             if durations[i]:
                 fh.write(f"duration {durations[i]:.6f}\n")
 
+    # 输入为 FLAC 中间片段（无 encoder priming），统一重编码为 mp3，
+    # 否则 -c:a copy 无法把 FLAC 直接封进 .mp3。
     cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2',
            '-fflags', '+genpts+igndts', '-f', 'concat', '-safe', '0', '-copytb', '0',
            '-i', list_path]
     if normalize:
         cmd += ['-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100', '-af', 'loudnorm']
     else:
-        cmd += ['-c:a', 'copy']
+        cmd += ['-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100']
     cmd.append(output_file)
 
     total_duration = sum((duration or 0) for duration in durations)
@@ -639,20 +649,21 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         print(f"{Fore.YELLOW}  Warning: {orig_count - len(timestamps)} segment(s) too short")
 
                 # ── 修剪相邻 clip 重叠（编译阶段最后防线）──
+                # padding 后相邻 clip 可能重叠（紧邻 clip 各自加了 before/after）。
+                # 只修剪重叠部分，而不是删除整个 clip：删除会让边界处的
+                # speech/burp 整段丢失（cut off），也不该让内容重复播放。
                 if len(timestamps) > 1:
                     timestamps.sort(key=lambda x: x[0])
-                    i = 0
-                    while i < len(timestamps) - 1:
-                        if timestamps[i][1] > timestamps[i + 1][0]:
-                            dur_i = timestamps[i][1] - timestamps[i][0]
-                            dur_j = timestamps[i + 1][1] - timestamps[i + 1][0]
-                            if dur_i >= dur_j:
-                                del timestamps[i + 1]
-                            else:
-                                del timestamps[i]
-                        else:
-                            i += 1
-                    timestamps = [(s, e) for s, e in timestamps if e - s >= 1.0]
+                    trimmed = []
+                    for ts in timestamps:
+                        s, e = ts
+                        if trimmed and s < trimmed[-1][1]:
+                            # 重叠：把当前 clip 起点推到上一 clip 终点，
+                            # 保留两个 clip 且恰好衔接。
+                            s = trimmed[-1][1]
+                        if e - s >= 1.0:
+                            trimmed.append((s, e))
+                    timestamps = trimmed
 
                 if not timestamps:
                     print(f"{Fore.YELLOW}No timestamps found for this video!")

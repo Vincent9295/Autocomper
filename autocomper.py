@@ -644,12 +644,13 @@ def resolve_remote_uploads(
     resolver = resolver or resolve_source
     local_entries = []
     remote_sources = []
-    remote_count = 0
+    total_remote = sum(1 for upload in uploaded_videos if upload.get_is_url())
+    resolved_count = 0
     for upload in uploaded_videos:
         if not upload.get_is_url():
             local_entries.append(upload)
             continue
-        remote_count += 1
+        resolved_count += 1
         source = upload.get_source()
         try:
             if limiter is not None:
@@ -671,10 +672,19 @@ def resolve_remote_uploads(
             upload.set_source(source)
             upload.set_path(source.display_name or source.source_url)
             remote_sources.append((upload, source))
+            if logger is not None:
+                logger(
+                    f"Resolving remote source [{resolved_count}/{total_remote}]: "
+                    f"{source.display_name or source.source_id or source.source_url}"
+                )
         except Exception as exc:
+            if logger is not None:
+                logger(
+                    f"Resolving remote source [{resolved_count}/{total_remote}] failed: {exc}"
+                )
             message = f"Remote source failed ({upload.get_url() or upload.get_path()}): {exc}"
             (logger or print)(message)
-    if remote_count and not remote_sources and not local_entries:
+    if total_remote and not remote_sources and not local_entries:
         raise RuntimeError("No remote sources could be resolved; see the preceding errors.")
     return local_entries, remote_sources
 
@@ -888,10 +898,25 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                 local_item = entry
             else:
                 local_item = dict(entry)
-                local_item['timestamps'] = [
-                    dict(ts, start=float(ts['start']) - before, end=float(ts['end']) + after)
-                    for ts in entry.get('timestamps', [])
-                ]
+                # 本地 clip 的 padding 同样按相邻 clip 钳制，避免紧邻 clip 的
+                # padding 重叠（与远程 clip 的 eff_start/eff_end 行为一致）。
+                ts_list = list(entry.get('timestamps', []))
+                clamped = []
+                prev_eff_end = None
+                for idx, ts in enumerate(ts_list):
+                    start = float(ts['start'])
+                    end = float(ts['end'])
+                    next_start = (
+                        float(ts_list[idx + 1]['start'])
+                        if idx + 1 < len(ts_list) else None
+                    )
+                    eff_end = (end + after) if next_start is None else min(end + after, next_start)
+                    eff_start = start - before
+                    if prev_eff_end is not None:
+                        eff_start = max(eff_start, prev_eff_end)
+                    prev_eff_end = eff_end
+                    clamped.append(dict(ts, start=eff_start, end=eff_end))
+                local_item['timestamps'] = clamped
             # 本地 entry 直接参与后续 assemble；远程 entry 等下载完成后才放行。
             # 必须在这里按原始顺序记录占位，否则本地全被提前、远程全部殿后，
             # 交错排列（如 [url, local, url]）的列表顺序会被破坏。
@@ -4013,12 +4038,12 @@ class VideoProcessorApp:
             elif any(x.get_is_url() for x in self.uploaded_videos) and resolve_remote and not audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
-                    max_height=max_height, limiter=_resolve_limiter,
+                    max_height=max_height, limiter=_resolve_limiter, logger=print,
                 )
             elif any(x.get_is_url() for x in self.uploaded_videos) and audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
-                    max_height=max_height, limiter=_resolve_limiter,
+                    max_height=max_height, limiter=_resolve_limiter, logger=print,
                 )
                 failed_remote_ids = set()
                 for cache_index, (upload, source) in enumerate(remote_entries):
