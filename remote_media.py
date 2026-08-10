@@ -1603,6 +1603,27 @@ def _source_from_info(url: str, info: Mapping[str, Any], max_height: int | None 
     )
 
 
+def _info_has_streams(info: Mapping[str, Any]) -> bool:
+    """Return whether an info dict carries enough data to build a MediaSource.
+
+    Bilibili playlist hydration uses the lightweight view API which returns
+    only metadata (id/title/duration/pubdate/webpage_url) with no stream
+    candidates. Reusing that as a full info would produce an empty-URL
+    MediaSource, so import must fall back to a full resolve when no usable
+    stream data is present.
+    """
+    if not isinstance(info, Mapping):
+        return False
+    for key in ("formats", "requested_formats"):
+        value = info.get(key)
+        if isinstance(value, (list, tuple)) and value:
+            return True
+    for key in ("url", "audio_url", "video_url", "manifest_url"):
+        if str(info.get(key) or "").strip():
+            return True
+    return False
+
+
 def source_from_hydrated_entry(entry: PlaylistEntry, max_height: int | None = None) -> MediaSource:
     """Build a MediaSource from an entry hydrated earlier, avoiding a second
     full yt-dlp extraction on import. Falls back to the single-VOD path when
@@ -1615,7 +1636,16 @@ def source_from_hydrated_entry(entry: PlaylistEntry, max_height: int | None = No
     info.setdefault("id", entry.entry_id)
     if info.get("_type") in ("playlist", "multi_video"):
         raise SourceResolveError(f"Source is a playlist, not a single VOD: {entry.webpage_url}")
-    return _source_from_info(entry.webpage_url, info, max_height)
+    if not _info_has_streams(info):
+        raise SourceResolveError(
+            f"Source metadata is not resolvable without a fresh extraction: {entry.webpage_url}"
+        )
+    source = _source_from_info(entry.webpage_url, info, max_height)
+    if not (source.audio_url or source.video_url):
+        raise SourceResolveError(
+            f"Source has no usable stream URLs: {entry.webpage_url}"
+        )
+    return source
 
 
 def apply_video_quality_limit(source: MediaSource, max_height: int | None) -> MediaSource:

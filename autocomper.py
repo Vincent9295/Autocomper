@@ -2510,6 +2510,7 @@ class VideoProcessorApp:
             self.remote_cache_open_button,
             self.remote_cache_clear_button,
             self.remote_cache_choose_button,
+            self.import_external_audio_button,
         ]
         
         self.enable_while_processing = [
@@ -3464,7 +3465,7 @@ class VideoProcessorApp:
             self.root.after(0, self._fail_external_audio_import, str(exc))
 
     def _finish_external_audio_import(self, display_name):
-        self.import_external_audio_button.configure(state=tk.NORMAL)
+        self._restore_external_audio_button_state()
         self.refresh_remote_cache_size()
         self.clear_transfer_progress("External audio imported.")
         messagebox.showinfo(
@@ -3473,9 +3474,18 @@ class VideoProcessorApp:
         )
 
     def _fail_external_audio_import(self, error):
-        self.import_external_audio_button.configure(state=tk.NORMAL)
+        self._restore_external_audio_button_state()
         self.clear_transfer_progress("External audio import failed.")
         messagebox.showerror("Import External Audio", error)
+
+    def _restore_external_audio_button_state(self):
+        # import 完成后本应恢复按钮；但若此刻 batch 正在运行（disable_objects
+        # 已禁用该按钮），则保持禁用，等运行结束时 reenable_disabled_objects 再恢复。
+        try:
+            if str(self.import_external_audio_button.cget("state")) != tk.DISABLED:
+                self.import_external_audio_button.configure(state=tk.NORMAL)
+        except tk.TclError:
+            self.import_external_audio_button.configure(state=tk.NORMAL)
 
     def open_remote_cache(self):
         path = str(self.remote_cache_store.root)
