@@ -68,6 +68,33 @@ def check_download_space(output_location, estimated_bytes, overhead=1.2,
         )
 
 
+def check_compile_disk_space(output_location, total_seconds, max_height=None,
+                             overhead=1.5, reserve=2 * 1024 * 1024 * 1024):
+    """Preflight disk space before remote clip materialization + concat.
+
+    ``total_seconds`` is the sum of every clip duration about to be downloaded.
+    ``max_height`` (from the Max Download Quality setting) drives a
+    conservative per-second byte estimate. Raising here - before any download
+    starts - prevents a big batch from silently filling the temp disk and
+    failing mid-way with Errno 28 (the entire compile then aborts with nothing).
+    """
+    if not total_seconds or total_seconds <= 0:
+        return
+    if max_height is None:
+        bytes_per_sec = 600 * 1024
+    elif max_height <= 480:
+        bytes_per_sec = 200 * 1024
+    elif max_height <= 720:
+        bytes_per_sec = 350 * 1024
+    elif max_height <= 1080:
+        bytes_per_sec = 500 * 1024
+    else:
+        bytes_per_sec = 800 * 1024
+    estimated_bytes = int(total_seconds * bytes_per_sec)
+    check_download_space(output_location, estimated_bytes, overhead=overhead,
+                         reserve=reserve)
+
+
 def run_tracked(cmd, timeout=None, text=False):
     """subprocess.run 等价物，注册进程以便取消时统一终止。"""
     opts = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}

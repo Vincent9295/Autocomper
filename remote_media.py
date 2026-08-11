@@ -41,6 +41,24 @@ class SegmentFetchError(RemoteMediaError):
     """A requested remote media segment could not be materialized."""
 
 
+_FFMPEG_DETAIL_MAX = 400
+
+
+def _sanitize_ffmpeg_detail(detail):
+    """Trim a raw ffmpeg error block for safe, compact logging.
+
+    FFmpeg progress output adds dozens of lines per failed remote fetch and
+    signed stream URLs carry expiring tokens. Keep only the tail of the text
+    (the actual error line lives at the end) and redact every URL query
+    string so logs stay readable, token-free, and cheap to render.
+    """
+    text = str(detail or "")
+    text = re.sub(r"(https?://[^\s?]+)\?[^\s]*", r"\1?[redacted]", text)
+    if len(text) > _FFMPEG_DETAIL_MAX:
+        text = "..." + text[-_FFMPEG_DETAIL_MAX:]
+    return text
+
+
 _BROWSER_COOKIE_NAMES = ("firefox", "chrome", "edge")
 _COOKIES_FILE_PREFIX = "cookiesfile:"
 _BILIBILI_HOST_MARKERS = ("bilibili.com", "b23.tv")
@@ -482,7 +500,9 @@ def fetch_audio_cache(
             result = runner(build_hls_remux_command(transport_path, temporary_path),
                             timeout=effective_timeout, text=True)
             if getattr(result, "returncode", 0) != 0:
-                detail = getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+                detail = _sanitize_ffmpeg_detail(
+                    getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+                )
                 raise SegmentFetchError(f"FFmpeg HLS remux failed (rc={result.returncode}): {detail}")
             if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                 raise SegmentFetchError("FFmpeg HLS remux completed without output")
@@ -533,7 +553,9 @@ def fetch_audio_cache(
                 monitor.join(timeout=1)
             return_code = getattr(result, "returncode", 0)
             if return_code != 0:
-                detail = getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+                detail = _sanitize_ffmpeg_detail(
+                    getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+                )
                 raise SegmentFetchError(f"FFmpeg audio cache fetch failed (rc={return_code}): {detail}")
             if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                 raise SegmentFetchError(
@@ -845,8 +867,11 @@ def fetch_segment(
             result = run_command(command)
             return_code = getattr(result, "returncode", 0)
             if return_code != 0:
-                detail = getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
-                if "403" in str(detail):
+                raw_detail = (getattr(result, "stderr", "")
+                              or getattr(result, "stdout", "") or "unknown error")
+                has_403 = "403" in str(raw_detail)
+                detail = _sanitize_ffmpeg_detail(raw_detail)
+                if has_403:
                     detail = (
                         f"{detail} (The remote source URL likely expired or is "
                         f"rate-limited; AutoComper will try refreshing the source.)"
@@ -875,7 +900,8 @@ def fetch_segment(
             return destination
         except Exception as exc:
             last_error = exc if isinstance(exc, SegmentFetchError) else SegmentFetchError(
-                f"Could not fetch remote segment {start}-{end}: {exc}"
+                f"Could not fetch remote segment {start}-{end}: "
+                f"{_sanitize_ffmpeg_detail(exc)}"
             )
             if refresh_func is not None and not refreshed:
                 refreshed = True

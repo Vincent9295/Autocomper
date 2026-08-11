@@ -19,6 +19,17 @@ import os
 
 MERGE_THRESHOLD = 2  # seconds
 
+_FFMPEG_DETAIL_MAX = 400
+
+
+def _sanitize_ffmpeg_detail(detail):
+    """Trim a raw ffmpeg error block for safe, compact logging."""
+    text = str(detail or "")
+    text = re.sub(r"(https?://[^\s?]+)\?[^\s]*", r"\1?[redacted]", text)
+    if len(text) > _FFMPEG_DETAIL_MAX:
+        text = "..." + text[-_FFMPEG_DETAIL_MAX:]
+    return text
+
 
 def _source_key(filename, entry=None):
     metadata = (entry or {}).get("source_metadata") or {}
@@ -182,8 +193,9 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             if result.returncode != 0:
                 raise Exception(
                     f"FFmpeg remux failed for {os.path.basename(input_file)}"
-                    f"\n  rc={result.returncode}\n  stderr: {result.stderr}"
-                    f"\n  stdout: {result.stdout}")
+                    f"\n  rc={result.returncode}\n  stderr: "
+                    f"{_sanitize_ffmpeg_detail(result.stderr)}"
+                    f"\n  stdout: {_sanitize_ffmpeg_detail(result.stdout)}")
             return True
 
     video_codec = get_video_codec()
@@ -231,7 +243,9 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                                  stage="Encoding clip")
         if result.returncode != 0:
             raise Exception(f"FFmpeg cut failed for {os.path.basename(input_file)}"
-                            f"\n  rc={result.returncode}\n  stderr: {result.stderr}\n  stdout: {result.stdout}")
+                            f"\n  rc={result.returncode}\n  stderr: "
+                            f"{_sanitize_ffmpeg_detail(result.stderr)}\n  stdout: "
+                            f"{_sanitize_ffmpeg_detail(result.stdout)}")
         return True
 
     seg_files = []
@@ -365,7 +379,7 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
             detail += f"\nMissing: {missing}"
         if no_video and len(no_video) <= 5:
             detail += f"\nNo video stream: {no_video}"
-        raise Exception(f"FFmpeg concat failed:{detail}\n[stderr]\n{result.stderr}\n[stdout]\n{result.stdout}")
+        raise Exception(f"FFmpeg concat failed:{detail}\n[stderr]\n{_sanitize_ffmpeg_detail(result.stderr)}\n[stdout]\n{_sanitize_ffmpeg_detail(result.stdout)}")
     return True
 
 
@@ -547,7 +561,7 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
         detail = f"\nFiles: {len(file_list)}, missing: {len(missing)}"
         if missing and len(missing) <= 5:
             detail += f"\nMissing: {missing}"
-        raise Exception(f"FFmpeg audio concat failed:{detail}\n[stderr]\n{result.stderr}\n[stdout]\n{result.stdout}")
+        raise Exception(f"FFmpeg audio concat failed:{detail}\n[stderr]\n{_sanitize_ffmpeg_detail(result.stderr)}\n[stdout]\n{_sanitize_ffmpeg_detail(result.stdout)}")
     return True
 
 
@@ -600,7 +614,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 timestamps = [(d["start"], d["end"]) for d in elt["timestamps"]]
 
                 print(f"{Fore.GREEN}[{n + 1}/{len(dict_list)}]{Style.RESET_ALL} "
-                      f"Queuing {filename_stripped}...", end="")
+                      f"Queuing {filename_stripped}...")
 
                 if padding:
                     before, after = padding

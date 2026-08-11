@@ -128,6 +128,14 @@ Remote Stream reports the current detection block, for example `Block: 6 / 13`. 
 
 While a compilation is being prepared, the UI reports `Preparing clips: N / total` together with the current VOD, clip number, time range, and live download speed/ETA. During the FFmpeg compile the same panel shows encoding progress, speed, and ETA, and the log lists each clip as it is written and each concat batch as it is merged. The UI stays responsive even for large compilations.
 
+#### Skipped Clips and the Skipped-Clips Report
+
+Each remote clip is downloaded on its own. If one clip cannot be fetched (expired signed URL, CDN connection failure, disk full, or an unreachable source), AutoComper records the failure, skips that clip, and continues with the next one; the final video is compiled from the clips that did succeed. The log then prints a compact summary grouped by failure cause (URL expired/rate-limited, connection failed, disk full, other) instead of one giant error wall per clip.
+
+For the full detail on every skipped clip, AutoComper writes a `_skipped_clips.txt` file next to your output video (for example `MyVideo_skipped_clips.txt`). It lists each skipped clip's name, full source URL, time range, and the exact failure reason, so you can see exactly what was left out. The file is only created when at least one clip was skipped. If nothing is skipped, no file is produced.
+
+Before downloading any clips, AutoComper checks that the temp drive has enough free space for the selected clips plus the final merge (based on your **Max Download Quality**). If the disk would run out mid-compile, it stops with a clear "insufficient disk space" error instead of filling the drive and failing partway.
+
 #### Remote Settings
 
 The **Remote Settings** panel controls how URL inputs are resolved and cached:

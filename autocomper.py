@@ -77,7 +77,7 @@ from remote_rate import LimitedRefresher, ResolveLimiter
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
                      convert_quality_str_to_int, download_audio, download_video,
                      get_bundle_filepath, kill_tracked_procs, run_tracked,
-                     run_tracked_progress)
+                     run_tracked_progress, check_compile_disk_space)
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
 VIDEO_OUTPUT = [("Video Files", "*.mp4"), ("All Files", "*.*")]
@@ -734,12 +734,16 @@ def refresh_remote_source(source, browser_cookies=None):
 def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                                selected_intervals=None, cache_store=None, padding=None,
                                is_video=True, refresh_func=None, failures=None,
-                               progress_callback=None, max_parallel=5):
+                               progress_callback=None, max_parallel=5,
+                               failure_records=None):
     """Return compile-ready entries with padding normalized exactly once.
 
     Remote video/audio clips are downloaded concurrently (``max_parallel``
     workers) while preserving input order in the returned list. A failed clip
     is isolated into ``failures`` without blocking the rest of the batch.
+    ``failure_records`` (if given) receives structured per-clip failure dicts
+    (name / url / start / end / reason) so a detailed skipped-clips report can
+    be written without re-parsing log text.
     """
     selected_intervals = selected_intervals or {}
     before, after = (padding or (0, 0))
@@ -759,6 +763,50 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     def emit(event):
         if progress_callback is not None:
             progress_callback(event)
+
+    def fail_task(task, exc):
+        (entry_index, interval_index, source, start, end, output,
+         clip_index, clips_total, video_index, duration, pred) = task
+        in_flight_key = (entry_index, interval_index)
+        with in_flight_lock:
+            in_flight.pop(in_flight_key, None)
+        with completed_lock:
+            state["completed"] += 1
+            current_completed = state["completed"]
+        message = (
+            f"Could not fetch {get_source_display_name(source)} "
+            f"interval {start:g}-{end:g}: {exc}"
+        )
+        if failures is None:
+            raise RuntimeError(message) from exc
+        failures.append(message)
+        if failure_records is not None:
+            failure_records.append({
+                "name": get_source_display_name(source),
+                "url": getattr(source, "source_url", None) or str(source),
+                "start": start,
+                "end": end,
+                "reason": str(exc),
+            })
+        try:
+            os.remove(output)
+        except OSError:
+            pass
+        emit({
+            "kind": "complete",
+            "video": video_index,
+            "videos_total": remote_video_total,
+            "clip": clip_index,
+            "clips_total": clips_total,
+            "start": start,
+            "end": end,
+            "elapsed": 0.0,
+            "name": get_source_display_name(source),
+            "completed": current_completed,
+            "total": state["total"],
+            "failed": True,
+        })
+        return None
 
     def fetch_task(task):
         (entry_index, interval_index, source, start, end, output,
@@ -826,37 +874,7 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                 fetched = fetcher(source, start, end, output, cache_store=cache_store,
                                   **fetch_kwargs)
         except Exception as exc:
-            with in_flight_lock:
-                in_flight.pop(in_flight_key, None)
-            with completed_lock:
-                state["completed"] += 1
-                current_completed = state["completed"]
-            message = (
-                f"Could not fetch {get_source_display_name(source)} "
-                f"interval {start:g}-{end:g}: {exc}"
-            )
-            if failures is None:
-                raise RuntimeError(message) from exc
-            failures.append(message)
-            try:
-                os.remove(output)
-            except OSError:
-                pass
-            emit({
-                "kind": "complete",
-                "video": video_index,
-                "videos_total": remote_video_total,
-                "clip": clip_index,
-                "clips_total": clips_total,
-                "start": start,
-                "end": end,
-                "elapsed": 0.0,
-                "name": get_source_display_name(source),
-                "completed": current_completed,
-                "total": state["total"],
-                "failed": True,
-            })
-            return None
+            return fail_task(task, exc)
         with in_flight_lock:
             in_flight.pop(in_flight_key, None)
         with completed_lock:
@@ -965,20 +983,48 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     if not tasks:
         return [item for kind, item in result_plan]
 
-    results_by_task = {}
-    with ThreadPoolExecutor(max_workers=min(len(tasks), max(max_parallel, 1))) as executor:
-        futures = {
-            executor.submit(fetch_task, task): (task[0], task[1])
-            for task in tasks
-        }
-        for future in futures:
-            key = futures[future]
+    # 按 source 分组，下载前对过期源统一做一次前瞻刷新（限流器控制节奏）。
+    # 过期 URL 是批量化 materialize 失败的主因；一次刷新后该 source 的
+    # 所有 clips 共享新 URL，比"每个 clip 失败才 refresh"更稳、刷新次数更少。
+    # 刷新失败（如被 Bilibili 限流）时整组跳过，避免逐 clip 重试制造噪音。
+    grouped = {}
+    for task in tasks:
+        gid = stable_source_id(task[2])
+        grouped.setdefault(gid, {"source": task[2], "tasks": []})["tasks"].append(task)
+
+    submit_tasks = []
+    for group in grouped.values():
+        source = group["source"]
+        resolved_at = getattr(source, "resolved_at", None)
+        stale = (resolved_at is not None
+                 and time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD)
+        if refresh_func is not None and stale:
             try:
-                result = future.result()
-            except Exception:
-                result = None
-            if result is not None:
-                results_by_task[key] = result
+                with refresh_lock:
+                    updated = refresh_func(source)
+                if isinstance(updated, MediaSource) and updated is not source:
+                    source.__dict__.update(updated.__dict__)
+            except Exception as exc:
+                for task in group["tasks"]:
+                    fail_task(task, exc)
+                continue
+        submit_tasks.extend(group["tasks"])
+
+    results_by_task = {}
+    if submit_tasks:
+        with ThreadPoolExecutor(max_workers=min(len(submit_tasks), max(max_parallel, 1))) as executor:
+            futures = {
+                executor.submit(fetch_task, task): (task[0], task[1])
+                for task in submit_tasks
+            }
+            for future in futures:
+                key = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+                if result is not None:
+                    results_by_task[key] = result
 
     materialized = []
     for kind, payload in result_plan:
@@ -989,6 +1035,96 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             if result is not None:
                 materialized.append(result)
     return materialized
+
+
+def _summarize_remote_failures(failures, max_examples=3):
+    """Aggregate materialize failures by source + cause into a few compact lines.
+
+    Individual clip failures used to print one huge line each (full ffmpeg
+    progress dump plus a signed URL), which flooded the log widget and froze
+    the UI on large batches. Grouping by cause keeps the log readable, bounded,
+    and still names the affected sources.
+    """
+    if not failures:
+        return []
+    counts = {}
+    names = {}
+    for failure in failures:
+        text = str(failure)
+        m = re.match(r"^Could not fetch (.+?) interval .*?: (.*)$", text)
+        name = m.group(1) if m else "unknown source"
+        reason = m.group(2) if m else text
+        lowered = reason.lower()
+        if "403" in reason or "forbidden" in lowered:
+            cause = "URL expired / rate-limited (403)"
+        elif "no space left" in lowered or "errno 28" in lowered:
+            cause = "disk full (Errno 28)"
+        elif "-138" in reason or "error number -138" in lowered:
+            cause = "connection failed (-138)"
+        else:
+            cause = "other error"
+        counts[cause] = counts.get(cause, 0) + 1
+        seen = names.setdefault(cause, [])
+        if name not in seen:
+            seen.append(name)
+    lines = []
+    for cause, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+        vod_names = names[cause]
+        line = (f"  {cause}: {count} clip(s) skipped across "
+                f"{len(vod_names)} VOD(s)")
+        examples = vod_names[:max_examples]
+        if examples:
+            line += " - e.g. " + ", ".join(examples)
+            if len(vod_names) > max_examples:
+                line += f" (+{len(vod_names) - max_examples} more)"
+        lines.append(line)
+    if "disk full (Errno 28)" in counts:
+        lines.append("  Tip: free disk space or relocate the cache/temp directory before retrying.")
+    return lines
+
+
+def _total_clip_seconds(dict_list, padding=None):
+    """Sum every clip duration (including padding) across all compile entries."""
+    before, after = padding or (0, 0)
+    before, after = float(before), float(after)
+    total = 0.0
+    for entry in dict_list:
+        for ts in entry.get('timestamps', []):
+            total += max(0.0, float(ts.get('end', 0)) - float(ts.get('start', 0)))
+            total += before + after
+    return total
+
+
+def _write_skipped_report(records, output_video_path):
+    """Write a per-clip skipped-clips report next to the output video.
+
+    The log keeps a compact aggregate summary; this file lists every skipped
+    clip with its full source URL, name, interval, and failure reason so the
+    user can see exactly what was missed without the log flooding.
+    """
+    if not records:
+        return None
+    report_path = os.path.splitext(str(output_video_path))[0] + "_skipped_clips.txt"
+    lines = [
+        "Skipped clips (clips that failed to fetch and were left out of the compile):",
+        "",
+    ]
+    for record in records:
+        name = record.get("name") or "unknown"
+        url = record.get("url") or "unknown URL"
+        start = record.get("start")
+        end = record.get("end")
+        interval = f"{start:g}-{end:g}s" if isinstance(start, (int, float)) and isinstance(end, (int, float)) else "?"
+        lines.append(f"[{interval}] {name}")
+        lines.append(f"  URL: {url}")
+        lines.append(f"  Reason: {record.get('reason')}")
+        lines.append("")
+    try:
+        with open(report_path, 'w', encoding='utf-8') as fh:
+            fh.write("\n".join(lines))
+    except OSError:
+        return None
+    return report_path
 
 def convert_seconds_to_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -4284,6 +4420,12 @@ class VideoProcessorApp:
                     ensure_temp_dir()
                     remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
                     remote_failures = []
+                    # 下载开始前预检磁盘：大批次会把所有远程片段写进 TEMP，
+                    # 磁盘不足时中间失败（Errno 28）会拖垮整个 compile。提前报错更清晰。
+                    check_compile_disk_space(
+                        remote_temp,
+                        _total_clip_seconds(dict_list, padding),
+                        convert_quality_str_to_int(self.max_quality.get()))
                     # 检测可能已耗时 1-3 小时：compile 前对所有远程源做一次前瞻刷新，
                     # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
                     for entry in dict_list:
@@ -4304,14 +4446,19 @@ class VideoProcessorApp:
                                 print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
+                        remote_failure_records = []
                         compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
                             refresh_func=refresh_func,
                             progress_callback=self._show_remote_clip_progress,
-                            max_parallel=self.remote_download_concurrency.get())
-                        for failure in remote_failures:
-                            print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+                            max_parallel=self.remote_download_concurrency.get(),
+                            failure_records=remote_failure_records)
+                        for line in _summarize_remote_failures(remote_failures):
+                            print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
+                        skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
+                        if skipped_report:
+                            print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
                         if not compile_entries:
                             raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
                         self.clear_transfer_progress("Starting compile...")
@@ -4324,6 +4471,9 @@ class VideoProcessorApp:
                         raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
                     finally:
                         shutil.rmtree(remote_temp, ignore_errors=True)
+                    if remote_failures:
+                        print(f"{Fore.YELLOW}Skipped {len(remote_failures)} remote clip(s); "
+                              f"see the Remote fetch summary above for which VODs are missing.{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                     messagebox.showinfo("Info", f"Video(s) exported to {output_video_path}. Enjoy!")
                     print(f"{Fore.GREEN}SUCCESS!")
@@ -4617,15 +4767,25 @@ class VideoProcessorApp:
                 ensure_temp_dir()
                 remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
                 remote_failures = []
+                # 下载开始前预检磁盘（与上一 compile 路径一致）。
+                check_compile_disk_space(
+                    remote_temp,
+                    _total_clip_seconds(dict_list, padding),
+                    convert_quality_str_to_int(self.max_quality.get()))
                 try:
                     self.clear_transfer_progress("Preparing remote clips...")
+                    remote_failure_records = []
                     compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
                             progress_callback=self._show_remote_clip_progress,
-                            max_parallel=self.remote_download_concurrency.get())
-                    for failure in remote_failures:
-                        print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+                            max_parallel=self.remote_download_concurrency.get(),
+                            failure_records=remote_failure_records)
+                    for line in _summarize_remote_failures(remote_failures):
+                        print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
+                    skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
+                    if skipped_report:
+                        print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
                     if not compile_entries:
                         raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
                     self.clear_transfer_progress("Starting compile...")
@@ -4638,6 +4798,9 @@ class VideoProcessorApp:
                     raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
                 finally:
                     shutil.rmtree(remote_temp, ignore_errors=True)
+                if remote_failures:
+                    print(f"{Fore.YELLOW}Skipped {len(remote_failures)} remote clip(s); "
+                          f"see the Remote fetch summary above for which VODs are missing.{Style.RESET_ALL}")
                 print(
                     f"{Fore.GREEN}Wrote final video to {output_video_path.split('/')[-1]}.")
                 messagebox.showinfo(
