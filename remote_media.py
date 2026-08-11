@@ -809,6 +809,7 @@ def fetch_segment(
     refresh_func: Callable[[MediaSource], MediaSource | None] | None = None,
     logger: Callable[[str], Any] | None = None,
     progress_callback: Callable[..., Any] | None = None,
+    stall_timeout: float = 30,
 ) -> Path:
     """Fetch a requested remote interval, optionally reusing covering cache."""
     if padding_before < 0 or padding_after < 0:
@@ -848,7 +849,7 @@ def fetch_segment(
 
         return run_tracked_progress(
             command, duration=expected_duration, timeout=timeout,
-            progress_callback=report,
+            progress_callback=report, stall_timeout=stall_timeout,
         )
     last_error: Exception | None = None
     refreshed = False
@@ -985,6 +986,7 @@ def _ydl_options(
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "socket_timeout": 30,
     }
     if extract_flat:
         options["extract_flat"] = True
@@ -1017,8 +1019,17 @@ def _extract_info(
     ydl_factory: Callable[..., Any] | None,
     browser_cookies: str | None = None,
     extract_flat: bool = False,
+    resolve_timeout: float = 90,
 ) -> Mapping[str, Any]:
-    try:
+    """Resolve one URL with yt-dlp, enforcing a wall-clock timeout.
+
+    yt-dlp's ``socket_timeout`` covers individual socket reads, but a resolve
+    can still stall across many retries or in platform-specific handlers. A
+    watchdog thread aborts after ``resolve_timeout`` so an unstable network can
+    never hang the whole run forever.
+    """
+
+    def _do_extract() -> Mapping[str, Any]:
         ydl = _make_ydl(
             ydl_factory,
             browser_cookies=browser_cookies,
@@ -1026,14 +1037,34 @@ def _extract_info(
         )
         if hasattr(ydl, "__enter__"):
             with ydl as active_ydl:
-                info = active_ydl.extract_info(url, download=False)
-        else:
-            info = ydl.extract_info(url, download=False)
-    except SourceResolveError:
-        raise
-    except Exception as exc:
-        raise SourceResolveError(_readable_resolve_error(url, exc)) from exc
+                return active_ydl.extract_info(url, download=False)
+        return ydl.extract_info(url, download=False)
 
+    import queue as _queue
+    import threading as _threading
+
+    result_queue = _queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            result_queue.put(_do_extract())
+        except BaseException as exc:  # noqa: BLE001 - surface any resolve error
+            result_queue.put(exc)
+
+    thread = _threading.Thread(target=worker, name="ytdlp-resolve", daemon=True)
+    thread.start()
+    try:
+        item = result_queue.get(timeout=resolve_timeout)
+    except _queue.Empty:
+        raise SourceResolveError(
+            f"Could not resolve source {url}: timed out after "
+            f"{resolve_timeout:g}s (network stalled or rate-limited)"
+        )
+    if isinstance(item, BaseException):
+        if isinstance(item, SourceResolveError):
+            raise item
+        raise SourceResolveError(_readable_resolve_error(url, item)) from item
+    info = item
     if not isinstance(info, Mapping):
         raise SourceResolveError(f"Could not resolve source {url}: invalid metadata")
     return info

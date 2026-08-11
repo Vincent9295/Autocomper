@@ -122,8 +122,16 @@ def run_tracked(cmd, timeout=None, text=False):
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
-def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=None):
-    """Run FFmpeg while forwarding its machine-readable progress output."""
+def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=None,
+                         stall_timeout=None):
+    """Run FFmpeg while forwarding its machine-readable progress output.
+
+    ``stall_timeout`` (seconds) adds a no-data watchdog: if FFmpeg produces no
+    output for that long (e.g. a half-open network read), the process is killed
+    and ``RemoteAudioStallError`` is raised so callers can refresh and retry
+    instead of hanging forever. Reads happen on a daemon thread so a silent
+    process can never block the timeout check.
+    """
     command = list(cmd)
     if "-progress" not in command:
         command.extend(["-progress", "pipe:1", "-nostats"])
@@ -140,6 +148,10 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
     p = subprocess.Popen(command, **opts)
     _ACTIVE_PROCS.add(p)
     try:
+        if stall_timeout is not None and stall_timeout > 0:
+            return _run_progress_with_stall(p, state, output, duration,
+                                            progress_callback, started_at,
+                                            timeout, stall_timeout, command)
         while True:
             line = p.stdout.readline()
             if line:
@@ -162,6 +174,60 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
         return subprocess.CompletedProcess(command, p.returncode, "\n".join(output), "")
     finally:
         _ACTIVE_PROCS.discard(p)
+
+
+def _run_progress_with_stall(p, state, output, duration, progress_callback,
+                             started_at, timeout, stall_timeout, command):
+    import queue as _queue
+    import threading as _threading
+
+    items = _queue.Queue()
+
+    def reader():
+        try:
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    items.put(None)
+                    break
+                items.put(line)
+        except BaseException as exc:  # noqa: BLE001 - surface any read error
+            items.put(exc)
+
+    thread = _threading.Thread(target=reader, name="ffmpeg-progress-reader", daemon=True)
+    thread.start()
+    try:
+        while True:
+            try:
+                item = items.get(timeout=stall_timeout)
+            except _queue.Empty:
+                p.kill()
+                from sound_reader import RemoteAudioStallError
+                raise RemoteAudioStallError(
+                    f"No data from FFmpeg for {stall_timeout:g}s; remote URL likely "
+                    f"expired or the connection hung")
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            text_line = item.decode("utf-8", errors="replace").strip()
+            output.append(text_line)
+            if "=" in text_line:
+                key, value = text_line.split("=", 1)
+                state[key] = value
+                if key == "out_time_ms" and progress_callback is not None:
+                    try:
+                        current = float(value) / 1_000_000
+                    except ValueError:
+                        continue
+                    progress_callback(current, duration, time.monotonic() - started_at)
+            if timeout is not None and time.monotonic() - started_at > timeout:
+                p.kill()
+                raise subprocess.TimeoutExpired(command, timeout)
+    finally:
+        p.wait(timeout=10)
+        thread.join(timeout=1)
+    return subprocess.CompletedProcess(command, p.returncode, "\n".join(output), "")
 
 
 def register_proc(p):

@@ -1474,6 +1474,17 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     os.remove(full_audio.name)
                 except OSError:
                     pass
+            # 用完即删：reverify 处理完该源后释放临时音频。只删 Remote Stream
+            # 的 reverify-stream-*.wav，绝不删 Audio Cache 模式的持久 m4a 缓存。
+            if cached_audio is not None:
+                cached_name = os.path.basename(cached_audio)
+                if cached_name.startswith("reverify-stream-"):
+                    try:
+                        os.remove(cached_audio)
+                    except OSError:
+                        pass
+                    if audio_cache_paths is not None:
+                        audio_cache_paths.pop(stable_source_id(filename), None)
         except Exception as exc:
             if isinstance(filename, MediaSource):
                 print(f"{Fore.YELLOW}  Verify scan failed for remote source "
@@ -2623,7 +2634,11 @@ class VideoProcessorApp:
             self.use_clip_padding_checkbox, 'Add extra time before and after each individual clip. Values are in seconds.\nIf using this option, Iit\'s recommended to enable \'Merge Nearby Clips\' to avoid duplicate clips.'
         )
         verify_tooltip = CustomHovertip(
-            self.verify_checkbox, 'After AI detection, scan near each clip with a lower threshold to find clips the AI may have missed.')
+            self.verify_checkbox,
+            'After AI detection, scan near each clip with a lower threshold to find clips the AI may have missed.\n\n'
+            'Note: any remote source is detected by downloading its full audio first.\n'
+            'With Re-verify enabled, Remote Stream mode re-downloads the small window around each clip for the scan.\n'
+            'Audio Cache mode keeps the stored audio and reuses it for the scan, so nothing extra is downloaded.')
         review_tooltip = CustomHovertip(
             self.review_checkbox, 'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.')
         strict_fp_tooltip = CustomHovertip(
@@ -4503,15 +4518,6 @@ class VideoProcessorApp:
                     print(
                         f"{Fore.GREEN}[{i + 1}/{len(processing_uploads)}]{Style.RESET_ALL} Getting timestamps for "
                         f"{get_source_display_name(input_video_path)}")
-                    save_audio_path = None
-                    if (self.use_verify.get()
-                            and self.remote_mode.get() == "Remote Stream"
-                            and isinstance(input_video_path, MediaSource)):
-                        ensure_temp_dir()
-                        _fd, save_audio_path = tempfile.mkstemp(
-                            suffix=".wav", prefix="reverify-stream-", dir=TEMP_DIR)
-                        os.close(_fd)
-                        os.remove(save_audio_path)
                     if isinstance(input_video_path, MediaSource):
                         # 超大批次在开头一次性解析所有 URL，排到后面的源可能早已过期：
                         # 检测前若解析已超阈值则重新 resolve 一次新鲜 URL。
@@ -4537,7 +4543,7 @@ class VideoProcessorApp:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
                             use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
-                            refresh_func=refresh_func, save_audio_path=save_audio_path,
+                            refresh_func=refresh_func,
                             progress_callback=lambda sample, upload=upload, i=i:
                                 self._queue_transfer_progress(
                                     sample,
@@ -4571,9 +4577,6 @@ class VideoProcessorApp:
                                                      focus_idx, selected_model, str(exc))
                             return False
                         raise
-                    if (save_audio_path and os.path.isfile(save_audio_path)
-                            and isinstance(input_video_path, MediaSource)):
-                        audio_cache_paths[stable_source_id(input_video_path)] = save_audio_path
                     timestamps = {'filename': timestamps['filename'],
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
                     source_for_result = upload.get_source() if audio_cache and upload.get_is_url() else input_video_path

@@ -229,6 +229,11 @@ Re-verify uses DRC (Dynamic Range Compression) to boost quiet sounds near detect
 - **New/original**: DRC-discovered clips shown separately — no automatic boundary expansion
 - **Output**: `Verification: scanned X window(s), confirmed Y new, DRC-skip Z, rejected W.`
 
+Any remote source must download its full audio timeline before detection can run — this is true for both **Remote Stream** and **Audio Cache**, even though neither downloads the video. What happens during **Re-verify** depends on the mode:
+
+- **Remote Stream** keeps no stored audio, so the re-verify scan re-downloads only the small window around each detected clip (no full re-download).
+- **Audio Cache** keeps the stored audio and reuses it directly for the re-verify scan, so nothing extra is downloaded.
+
 ### Timestamps Format
 
 ```

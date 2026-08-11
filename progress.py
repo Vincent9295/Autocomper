@@ -132,6 +132,11 @@ def format_block_progress(current, total, elapsed, source_duration=None):
 def format_compile_progress(current, total, elapsed, stage="FFmpeg"):
     current = max(0.0, float(current or 0))
     total_value = max(0.0, float(total or 0))
+    # 真实编码时长(current/out_time)可能超过预估 total：concat 的 aresample=async=1
+    # 会插入同步静音、CFR 会把片段补齐到帧边界，累计起来 current 会略超预估。
+    # 把 total 钳制到 >= current，避免显示成 "Encoded: 59:22 / 55:54" 像超时。
+    if total_value and current > total_value:
+        total_value = current
     elapsed = max(0.0, float(elapsed or 0))
     percent = min(100.0, current / total_value * 100) if total_value else None
     speed = current / elapsed if elapsed > 0 else 0.0

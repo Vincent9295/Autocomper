@@ -261,7 +261,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         # 必须走 batched：单视频上千 segment 时 _ffmpeg_concat 会把所有 -i
         # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206
         _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
-                               fps=fps, progress_callback=progress_callback)
+                               fps=fps, progress_callback=progress_callback,
+                               total_duration=duration)
     finally:
         for sf in seg_files:
             try:
@@ -272,7 +273,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
 
 
 def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
-                    progress_callback=None):
+                    progress_callback=None, total_duration=None):
     """Concatenate using concat FILTER (frame-level, not demuxer)."""
     if not file_list:
         return False
@@ -350,11 +351,14 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
             h, mi, s, ms = map(int, dm.groups())
             total_dur += h * 3600 + mi * 60 + s + ms / 100
     concat_timeout = max(1800, int(total_dur * 2) + 600)
+    # 进度显示用调用方传入的真实总长（含 padding），否则 probe 到的片段时长
+    # 会低于实际输出，让 Encoded: X / Y 看起来像超时。
+    progress_dur = total_duration if total_duration else total_dur
 
     video_codec = get_video_codec()
     try:
         result = _run_ffmpeg(build_cmd(video_codec), timeout=concat_timeout,
-                             progress_callback=progress_callback, duration=total_dur,
+                             progress_callback=progress_callback, duration=progress_dur,
                              stage="Final merge")
     except subprocess.TimeoutExpired:
         if 'h264_nvenc' not in video_codec:
@@ -384,7 +388,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
 
 
 def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6,
-                           fps=None, _lvl=0, progress_callback=None):
+                           fps=None, _lvl=0, progress_callback=None,
+                           temp_dir=None, total_duration=None):
     """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
     保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。"""
     if not file_list:
@@ -416,9 +421,12 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
 
     if len(file_list) <= batch_size:
         return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize, fps=fps,
-                              progress_callback=progress_callback)
+                              progress_callback=progress_callback,
+                              total_duration=total_duration)
 
-    temp_dir = os.path.dirname(output_file) or os.path.dirname(file_list[0])
+    # 中间文件默认与输出同盘；调用方可传入 compile 的临时目录，避免大批量
+    # 合并时 _batchL* 中间件 flood 用户输出文件夹。
+    temp_dir = temp_dir or os.path.dirname(output_file) or os.path.dirname(file_list[0])
     batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
     batch_files = []
     try:
@@ -431,7 +439,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                     0, None, 0, f"Batch {bi + 1}/{len(batches)}: starting"
                 ))
             ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps,
-                                progress_callback=progress_callback)
+                                progress_callback=progress_callback,
+                                total_duration=total_duration)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
         print(f"  Final merge ({len(batch_files)} files)...")
@@ -442,9 +451,11 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
             return _ffmpeg_concat_batched(batch_files, output_file, res=res,
                                           normalize=normalize, batch_size=batch_size,
                                           fps=fps, _lvl=_lvl + 1,
-                                          progress_callback=progress_callback)
+                                          progress_callback=progress_callback,
+                                          temp_dir=temp_dir,
+                                          total_duration=total_duration)
         _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps,
-                        progress_callback=progress_callback)
+                       progress_callback=progress_callback, total_duration=total_duration)
     finally:
         for bf in batch_files:
             try:
@@ -572,15 +583,25 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 excluded=None, progress_callback=None):
     output_format = ".mp4" if is_video else ".mp3"
 
+    # 同进程二次运行会复用旧路径的 probe 结果（如 _seg0.mp4 已重写），
+    # 清空缓存避免时长/尺寸用旧值。
+    _PROBE_CACHE.clear()
+
     # 清理上次崩溃/强杀残留的中间文件（只删我们自己的命名模式，不碰用户文件）
     _out_dir = output if os.path.isdir(output) else os.path.dirname(output)
     if _out_dir and os.path.isdir(_out_dir):
         for _stale in os.listdir(_out_dir):
-            if re.fullmatch(r'(_batchL\d+_\d+|_seg\d+|_aseg\d+)\.(mp4|mp3)', _stale):
+            if re.fullmatch(r'(_batchL\d+_\d+|_seg\d+|_aseg\d+)\.(mp4|mp3|flac)', _stale):
                 try:
                     os.remove(os.path.join(_out_dir, _stale))
                 except OSError:
                     pass
+        _stale_list = os.path.join(_out_dir, 'concat_list.txt')
+        if os.path.exists(_stale_list):
+            try:
+                os.remove(_stale_list)
+            except OSError:
+                pass
 
     if is_video:
         cut_func, concat_func = _ffmpeg_cut, _ffmpeg_concat
@@ -745,9 +766,15 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     raise Exception("All clip writes failed; nothing to combine.")
                 print("Combining individual media, please do not close the program...", end="")
                 if is_video:
+                    # 真实总长 = 所有 clip 的已裁剪时长之和（含 padding），
+                    # 让进度显示 Encoded: X / X 而不是 probe 的未含 padding 估值。
+                    total_duration = sum(
+                        e - s for task in tasks for s, e in task[3]
+                    )
                     _ffmpeg_concat_batched(
                         tempfiles, output, res=res, normalize=normalize, fps=fps,
                         progress_callback=progress_callback,
+                        temp_dir=temp_dir, total_duration=total_duration,
                     )
                 else:
                     concat_func(tempfiles, output, normalize=normalize,
