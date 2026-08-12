@@ -775,6 +775,30 @@ def _segment_has_stream(path, want_video=True):
     return bool(re.search(r"Stream #\d+:\d+.*" + kind, stderr))
 
 
+def _segment_duration(path) -> float | None:
+    """Return the container duration of a downloaded segment in seconds.
+
+    Uses the same bounded ffmpeg probe as `_segment_has_stream` so a corrupt or
+    truncated download (which ffmpeg may still exit 0 for) can be detected
+    before it enters the compile stage.
+    """
+    try:
+        out = run_tracked(
+            [FFMPEG_PATH, "-hide_banner", "-i", str(path),
+             "-probesize", "32M", "-analyzeduration", "100M"],
+            timeout=10, text=True)
+        stderr = getattr(out, "stderr", None)
+    except Exception:
+        return None
+    if not isinstance(stderr, str):
+        return None
+    m = re.search(r"Duration: (\d+):(\d+):(\d+)\.(\d+)", stderr)
+    if not m:
+        return None
+    h, mi, s, ms = map(int, m.groups())
+    return h * 3600 + mi * 60 + s + ms / 100.0
+
+
 def _refresh_with_backoff(
     refresh_func: Callable[[MediaSource], MediaSource | None],
     source: MediaSource,
@@ -885,6 +909,22 @@ def fetch_segment(
                 raise SegmentFetchError(
                     f"FFmpeg segment fetch produced an unreadable segment "
                     f"(no {'video' if not audio_only else 'audio'} stream): {temporary_path}")
+            if run_func is None:
+                # 时长校验：下载部分成功但内容不完整/损坏时（URL 过期、CDN
+                # 半连接），ffmpeg 可能退出 0 且流存在，但返回的 segment 远短于
+                # 请求区间。明显偏短的 segment 直接当作损坏走 refresh/retry，
+                # 阻止损坏数据进入 compile（超长 reverify 合并 clip 最容易踩中）。
+                expected_duration = (
+                    float(end) + float(padding_after)
+                ) - max(0.0, float(start) - float(padding_before))
+                actual_duration = _segment_duration(temporary_path)
+                if (expected_duration > 0 and actual_duration is not None
+                        and actual_duration > 0
+                        and actual_duration < expected_duration * 0.5):
+                    raise SegmentFetchError(
+                        f"FFmpeg segment fetch produced a truncated segment "
+                        f"({actual_duration:g}s vs expected ~{expected_duration:g}s): "
+                        f"{temporary_path}")
             data = temporary_path.read_bytes()
             if cache_store is not None:
                 fetched_start = max(0.0, float(start) - float(padding_before))

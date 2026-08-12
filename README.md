@@ -41,7 +41,7 @@ The following are improvements in this Enhanced version compared with the origin
 | **Mixed resolutions** | Not handled | Auto-detect → scale/pad all to mode resolution |
 | **Clip overlap** | Possible audio bleed | Keep longer clip, discard shorter; compile never bridges gaps containing removed clips |
 | **Stereo input** | Left channel only | **50/50 L+R mix** |
-| **Re-verify** | None | DRC **+8dB**, threshold syncs to main, >0.75 direct accept, argmax gate on mid-score hits |
+| **Re-verify** | None | DRC **+8dB**, scans ±5s around each clip, min confidence **0.40**, >0.75 direct accept, argmax gate + margin + energy floor on mid-score hits |
 | **False positives** | None | Optional **Strict FP filter** (drop clips where burp isn't the top class); suspect clips pre-deselected in Review |
 | **Memory** | Unbounded | `-threads 2`, batched concat (6 files/batch), segment-by-segment encoding |
 
@@ -224,8 +224,11 @@ Active live streams, DRM-protected media, and every private or region-restricted
 Re-verify uses DRC (Dynamic Range Compression) to boost quiet sounds near detected clips. Key behaviors:
 
 - **DRC gain**: up to +8 dB (boosts quiet burps buried in music)
-- **Threshold**: automatically syncs to your main detection threshold (no mismatch)
+- **Scan window**: ±5 seconds around each clip (catches burps the model missed right next to a hit)
+- **Threshold floor**: never scans below **0.40**, even when your main detection threshold is set low (0.2–0.5) — keeps the scan out of the high-false-positive noise band
 - **High-score skip**: DRC hits with confidence > 0.75 bypass P3 confirmation
+- **Argmax margin**: mid-score hits are accepted only when burp clearly beats the next-best sound class (1.15×), not merely "happens to be top class"
+- **Energy floor**: rejects clips whose raw (un-boosted) audio is near-silent — kills "no sound" false positives
 - **New/original**: DRC-discovered clips shown separately — no automatic boundary expansion
 - **Output**: `Verification: scanned X window(s), confirmed Y new, DRC-skip Z, rejected W.`
 

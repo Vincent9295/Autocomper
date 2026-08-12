@@ -136,13 +136,17 @@ def compute_timestamps(framewise_output, precision, threshold, focus_idx, offset
         f1 = min(framewise_output.shape[0], (segment['end'] + 1) * precision)
         peak = f0 + int(np.argmax(framewise_output[f0:f1, focus_idx]))
         top1_idx = int(np.argmax(framewise_output[peak, :]))
+        peak_scores = framewise_output[peak, :]
+        top1_score = float(peak_scores[top1_idx])
+        runner_up = float(np.partition(peak_scores, -2)[-2])
         segments.append({
             'start': segment['start'] * precision / 100 + offset,
             'end': segment['end'] * precision / 100 + offset + 1,
             'pred': round(float(segment['pred']), 6),
             'suspect': top1_idx != focus_idx,
             'top1_idx': top1_idx,
-            'top1_score': round(float(framewise_output[peak, top1_idx]), 6),
+            'top1_score': round(top1_score, 6),
+            'runner_up': round(runner_up, 6),
         })
     return segments
 

@@ -487,6 +487,17 @@ REMOTE_REFRESH_THRESHOLD = 1800.0
 # 预览前，若源已超过该秒数（5 分钟）未刷新则主动重新解析，避免用过期的
 # signed URL 拉预览段导致 403。
 PREVIEW_REFRESH_THRESHOLD = 300.0
+# Reverify 扫描的置信度下限：主检测 threshold 很低（0.2-0.5）时，threshold*0.6
+# 会跌进 98% 假阳率的噪声带（实测 <0.5 置信度 98% 是 FP）。加一个独立下限，
+# reverify 只补充"清晰可辨的 argmax burp"，不把噪声当新 clip。
+REVERIFY_FLOOR = 0.40
+# Reverify 候选新 clip 的 argmax 带宽：class 58 必须至少是次高类的 1.15 倍，
+# 否则只是"恰好是 argmax"，容易被怪声音（气泡音/deep 笑）的竞争类带偏。
+REVERIFY_MARGIN = 1.15
+# Reverify 候选新 clip 的原始音频能量下限（未做 DRC 提升前的 float RMS）。
+# 低于该值说明 clip 区间内几乎是静音——模型不靠静音也能给 58 分，但该 clip
+# 在成片里就是"没有声音"的假阳。直接砍掉。
+REVERIFY_ENERGY_FLOOR = 0.01
 
 
 def ensure_temp_dir():
@@ -1219,6 +1230,7 @@ def _scan_reverify_audio(raw, scan_windows, precision, focus_idx, threshold,
         blocks = slice_audio[:num_blocks * frame_count].reshape(num_blocks, frame_count)
         for b_idx in range(num_blocks):
             block = blocks[b_idx]
+            raw_block = block
             rms = _np.sqrt(_np.mean(block ** 2))
             if rms > 0.005:
                 block = block.copy() * min(2.5, 0.25 / rms)
@@ -1227,11 +1239,24 @@ def _scan_reverify_audio(raw, scan_windows, precision, focus_idx, threshold,
             })[0]
             block_offset = b_idx * verify_block_size + timestamp_offset
             for ts in _compute_ts(preds[0], precision, threshold, focus_idx, block_offset):
+                # 用未做 DRC 的原始 block 量 clip 区间的真实能量：DRC 会把安静
+                # 片段抬 2.5x 骗过模型，但成片播放的是未提升的原始音频，几乎
+                # 听不见 = "no sound" 假阳。能量不足直接拒绝。
+                rel_s = max(0, int((ts['start'] - block_offset) * sample_rate))
+                rel_e = min(len(raw_block), int((ts['end'] - block_offset) * sample_rate))
+                if rel_e - rel_s < sample_rate:
+                    rejected += 1
+                    continue
+                clip_energy = _np.sqrt(_np.mean(raw_block[rel_s:rel_e] ** 2))
+                if clip_energy < REVERIFY_ENERGY_FLOOR:
+                    rejected += 1
+                    continue
                 if ts['pred'] > direct_accept:
                     ts['source'] = 'new'
                     found.append(ts)
                     dskip += 1
-                elif not ts['suspect']:
+                elif not ts['suspect'] and (
+                        ts.get('top1_score', 1.0) >= ts.get('runner_up', 0.0) * REVERIFY_MARGIN):
                     ts['source'] = 'new'
                     found.append(ts)
                     confirmed += 1
@@ -1305,6 +1330,10 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
     if not dict_list:
         return dict_list
     ensure_temp_dir()
+
+    # 主检测 threshold 很低时（0.2-0.5），threshold*0.6 会跌进 98% 假阳噪声带。
+    # reverify 只在主阈值的基础上降一点，且绝不低于独立下限 REVERIFY_FLOOR。
+    scan_threshold = max(float(threshold) * 0.6, REVERIFY_FLOOR)
 
     if ort_session is None:
         import onnxruntime as ort
@@ -1392,8 +1421,17 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                             progress_callback=fetch_progress)
                         raw = _read_wav_pcm(audio_path)
                         duration = len(raw) / sample_rate
+                        expected_window = we - ws
+                        if (expected_window > 1.0 and duration > 0
+                                and duration < expected_window * 0.5):
+                            print(
+                                f"{Fore.YELLOW}  Verify window fetch too short for "
+                                f"{get_source_display_name(filename)} "
+                                f"({duration:g}s vs expected ~{expected_window:g}s); "
+                                f"skipping this window.")
+                            continue
                         found, scans, skipped, accepted, refused = _scan_reverify_audio(
-                            raw, [(0.0, duration)], precision, focus_idx, threshold,
+                            raw, [(0.0, duration)], precision, focus_idx, scan_threshold,
                             ort_session, verify_block_size, direct_accept, logger)
                         for ts in found:
                             ts['start'] += ws
@@ -1452,7 +1490,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 new_timestamps = []
                 for ws, we in scan_windows:
                     found, scans, skipped, accepted, refused = _scan_reverify_audio(
-                        raw, [(ws, we)], precision, focus_idx, threshold,
+                        raw, [(ws, we)], precision, focus_idx, scan_threshold,
                         ort_session, verify_block_size, direct_accept, logger,
                         timestamp_offset=ws)
                     new_timestamps.extend(found)
@@ -2491,7 +2529,7 @@ class VideoProcessorApp:
         self.checkbox_frame_five = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_five.pack(anchor=tk.W)
         self.use_verify = tk.BooleanVar()
-        self.verify_window_var = tk.DoubleVar(value=30.0)
+        self.verify_window_var = tk.DoubleVar(value=5.0)
         self.verify_checkbox = ttk.Checkbutton(
             self.checkbox_frame_five, text="Re-verify clips (scan near segments for missed clips)",
             variable=self.use_verify)
@@ -4390,7 +4428,7 @@ class VideoProcessorApp:
                             window=self.verify_window_var.get(),
                             focus_idx=focus_idx,
                             logger=self.final_bar,
-                            threshold=threshold * 0.6,
+                            threshold=threshold,
                             use_gpu=use_gpu, ort_session=shared_session,
                             cache_store=cache_store, refresh_func=refresh_func,
                             audio_cache_paths=audio_cache_paths,
@@ -4721,7 +4759,7 @@ class VideoProcessorApp:
                         window=self.verify_window_var.get(),
                         focus_idx=focus_idx,
                         logger=self.final_bar,
-                        threshold=threshold * 0.6,
+                        threshold=threshold,
                         use_gpu=use_gpu, ort_session=shared_session,
                         cache_store=cache_store, refresh_func=refresh_func,
                         audio_cache_paths=audio_cache_paths,
