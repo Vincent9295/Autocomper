@@ -69,6 +69,7 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            expand_input, resolve_source, select_audio_candidate,
                            stable_source_id, SourceResolveError,
                            apply_video_quality_limit,
+                           resolve_cached_audio,
                            source_from_hydrated_entry,
                            preflight_cookie_source,
                            _audio_cache_format_identity)
@@ -4237,6 +4238,19 @@ class VideoProcessorApp:
                 failed_remote_ids = set()
                 for cache_index, (upload, source) in enumerate(remote_entries):
                     try:
+                        # 音频已缓存时不再逐个探测 CDN 候选：Audio Cache 大批次
+                        # 每次运行都会对所有源做 3 格式 × 4 变体 = 12 次探测，
+                        # 90 个源就是上千次请求，极易触发 bilibili CDN 限流
+                        # （表现为 speed=unknown + 后续 compile 全 403）。
+                        cached_audio_path = resolve_cached_audio(source, cache_store)
+                        if cached_audio_path is not None:
+                            audio_cache_paths[stable_source_id(source)] = str(cached_audio_path)
+                            print(
+                                f"Audio cache hit for "
+                                f"{source.platform or 'unknown'}:{source.source_id or 'unknown'}: "
+                                f"{Path(cached_audio_path).name}"
+                            )
+                            continue
                         # 逐源选择 audio candidate：只在真正缓存该源前探测，
                         # 避免开跑前对所有源一次性探测导致排尾 URL 过期。
                         try:
@@ -4481,22 +4495,19 @@ class VideoProcessorApp:
                         convert_quality_str_to_int(self.max_quality.get()))
                     # 检测可能已耗时 1-3 小时：compile 前对所有远程源做一次前瞻刷新，
                     # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
+                    # 不依赖 resolved_at 阈值：bilibili 签名 URL 的 deadline 可能远早于
+                    # 30 分钟阈值判断（尤其 Audio Cache 大批次 + reverify 拖长流程后），
+                    # 旧 URL 会直接 403。无条件刷新，靠 LimitedRefresher 限流器控节奏。
                     for entry in dict_list:
                         source = entry.get('filename')
                         if not isinstance(source, MediaSource):
                             continue
-                        source_resolved_at = getattr(source, "resolved_at", None)
-                        if (source_resolved_at is not None
-                                and time.monotonic() - source_resolved_at > REMOTE_REFRESH_THRESHOLD):
-                            print(
-                                f"{Fore.CYAN}Refreshing stale remote source before compile for "
-                                f"{get_source_display_name(source)}...")
-                            try:
-                                updated = refresh_func(source)
-                                if isinstance(updated, MediaSource) and updated is not source:
-                                    source.__dict__.update(updated.__dict__)
-                            except Exception as exc:
-                                print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
+                        try:
+                            updated = refresh_func(source)
+                            if isinstance(updated, MediaSource) and updated is not source:
+                                source.__dict__.update(updated.__dict__)
+                        except Exception as exc:
+                            print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
                         remote_failure_records = []

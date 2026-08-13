@@ -179,10 +179,16 @@ def probe_audio_candidate(
     source: MediaSource,
     candidate: Mapping[str, Any],
     duration: float = 3,
-    timeout: float = 20,
+    timeout: float = 5,
     run_func: Callable[..., Any] | None = None,
 ) -> float | None:
-    """Probe a bounded portion of an audio candidate and return FFmpeg speed."""
+    """Probe a bounded portion of an audio candidate and return FFmpeg speed.
+
+    ``timeout`` is deliberately short (5s): a probe is only a latency heuristic
+    for candidate selection. On a large batch, every candidate that hangs eats
+    a full timeout per URL (90 VODs × 12 URLs = up to ~6h of pure timeouts),
+    which also looks like a CDN rate-limit stall in the logs.
+    """
     url = str(candidate.get("url") or "")
     if not url:
         return None
@@ -223,17 +229,24 @@ def select_audio_candidate(
     run_func: Callable[..., Any] | None = None,
     log_func: Callable[[str], Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Keep the best audio unless a bounded probe shows a slower candidate is needed."""
+    """Keep the best audio unless a bounded probe shows a slower candidate is needed.
+
+    If every candidate probe fails (timeout / 403), the source is left untouched
+    (its resolve-time ``audio_url``) and ``None`` is returned instead of silently
+    re-applying the first candidate — a probe that can't complete tells us nothing
+    about which CDN is usable, and forcing a URL here can pin a stale/rate-limited
+    one for the whole batch.
+    """
     candidates = list(source.audio_candidates or [])
     if not candidates:
         return None
-    best = candidates[0]
-    selected = best
     try:
         threshold = float(min_realtime_speed)
     except (TypeError, ValueError):
         threshold = 1.0
     index = 0
+    chose = False
+    chosen_candidate = None
     while index < len(candidates):
         candidate = candidates[index]
         group = [candidate]
@@ -262,7 +275,9 @@ def select_audio_candidate(
             continue
         fastest_speed, fastest_candidate = max(usable, key=lambda item: item[0])
         if fastest_speed >= threshold:
-            selected = fastest_candidate
+            apply_audio_candidate(source, fastest_candidate)
+            chose = True
+            chosen_candidate = fastest_candidate
             if log_func is not None and len(group) > 1:
                 log_func(
                     f"Bilibili CDN selected: {fastest_candidate.get('cdn_host')} "
@@ -271,8 +286,9 @@ def select_audio_candidate(
             break
         if log_func is not None:
             log_func(f"Audio candidate speed below {threshold:.1f}x; trying next candidate")
-    apply_audio_candidate(source, selected)
-    return selected
+    if not chose:
+        return None
+    return chosen_candidate
 
 
 def build_audio_cache_command(source: MediaSource, output_file: str | Path) -> list[str]:
@@ -352,6 +368,29 @@ def _audio_cache_format_identity(source: MediaSource) -> dict[str, Any]:
             identity["codec"] = codec
         return identity
     return {}
+
+
+def resolve_cached_audio(
+    source: MediaSource,
+    cache_store: Any,
+    output_file: str | Path | None = None,
+) -> Path | None:
+    """Return the cached audio path if it already exists, without probing the network.
+
+    Mirrors ``fetch_audio_cache``'s cache-hit lookup so callers can skip the
+    per-candidate CDN speed probes when the audio is already cached (large Audio
+    Cache batches would otherwise fire hundreds of probes every run and can trip
+    bilibili's CDN rate limiting).
+    """
+    if cache_store is None or not source.audio_url:
+        return None
+    requested_format = Path(output_file).suffix.lstrip(".") if output_file else "m4a"
+    audio_format = requested_format or "m4a"
+    return cache_store.resolve_audio_cache(
+        stable_source_id(source), source.audio_url, audio_format,
+        format_identity=_audio_cache_format_identity(source),
+    )
+
 
 
 def _audio_cache_retry_reason(error: SegmentFetchError) -> str:
