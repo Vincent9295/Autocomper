@@ -68,6 +68,10 @@ _BILIBILI_CDN_HOSTS = (
     "upos-sz-mirroralib.bilivideo.com",
 )
 _REMOTE_SEEK_PAD = 10.0
+# Playlist 条目 hydration 的解析超时。普通 resolve 用 90s，但 playlist 浏览时
+# 每个条目都可能触发一次 hydration（4 并发），慢网络下 90s/条会堆积大量后台
+# 线程；缩短到 30s 避免翻页时资源膨胀。
+_PLAYLIST_HYDRATION_TIMEOUT = 30.0
 
 
 def _segment_is_http(url) -> bool:
@@ -1203,20 +1207,24 @@ def _extract_with_cookie_policy(
     ydl_factory: Callable[..., Any] | None,
     browser_cookies: str | None,
     extract_flat: bool = False,
+    resolve_timeout: float = 90,
 ) -> Mapping[str, Any]:
     normalized = _normalize_browser_cookies(browser_cookies)
     if normalized != "auto":
-        return _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat)
+        return _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat,
+                             resolve_timeout=resolve_timeout)
 
     try:
-        return _extract_info(url, ydl_factory, extract_flat=extract_flat)
+        return _extract_info(url, ydl_factory, extract_flat=extract_flat,
+                             resolve_timeout=resolve_timeout)
     except SourceResolveError as initial_error:
         if not _should_auto_use_cookies(url, initial_error):
             raise
         failures = []
         for browser in _BROWSER_COOKIE_NAMES:
             try:
-                return _extract_info(url, ydl_factory, browser, extract_flat=extract_flat)
+                return _extract_info(url, ydl_factory, browser, extract_flat=extract_flat,
+                                     resolve_timeout=resolve_timeout)
             except SourceResolveError as exc:
                 failures.append(_short_cookie_failure(browser, exc))
                 if _cookie_failure_should_print(browser, url):
@@ -1569,15 +1577,23 @@ def _descriptor_from_info(
     ydl_factory: Callable[..., Any] | None = None,
     browser_cookies: str | None = None,
     bilibili_view_request: Callable[[str], Mapping[str, Any] | None] | None = None,
+    resolve_timeout: float = 90,
 ) -> PlaylistDescriptor:
     platform = _playlist_platform(url, info)
     entries = []
+    seen_entry_ids = set()
     for index, raw_entry in enumerate(info.get("entries") or []):
         if not isinstance(raw_entry, Mapping):
             continue
         entry = _flat_entry(platform, raw_entry, index)
-        if entry is not None:
-            entries.append(entry)
+        if entry is None:
+            continue
+        # 同一 playlist 里 entry_id 重复（yt-dlp flat 提取偶发）会破坏 treeview
+        # 的 iid 唯一性并让 selection 字典互相覆盖；保留首次出现的条目。
+        if entry.entry_id in seen_entry_ids:
+            continue
+        seen_entry_ids.add(entry.entry_id)
+        entries.append(entry)
         if len(entries) >= 1000:
             break
     if platform.casefold().startswith("bilibili") and len(entries) > 1:
@@ -1608,14 +1624,16 @@ def _descriptor_from_info(
                 except Exception:
                     pass
             return _extract_with_cookie_policy(
-                entry.webpage_url, ydl_factory, browser_cookies, extract_flat=False
+                entry.webpage_url, ydl_factory, browser_cookies, extract_flat=False,
+                resolve_timeout=resolve_timeout
             )
     elif platform.startswith("youtube") or platform in {"twitch", "twitch-vods"}:
         def hydrate_entry(entry: PlaylistEntry) -> Mapping[str, Any] | None:
             if entry.title != "Unknown" and entry.duration is not None and entry.upload_date:
                 return None
             return _extract_with_cookie_policy(
-                entry.webpage_url, ydl_factory, browser_cookies, extract_flat=False
+                entry.webpage_url, ydl_factory, browser_cookies, extract_flat=False,
+                resolve_timeout=resolve_timeout
             )
 
     return PlaylistDescriptor(
@@ -1674,6 +1692,7 @@ def describe_input(
             ydl_factory=ydl_factory,
             browser_cookies=browser_cookies,
             bilibili_view_request=bilibili_view_request,
+            resolve_timeout=_PLAYLIST_HYDRATION_TIMEOUT,
         )
     return _single_entry_from_info(input_value, info)
 

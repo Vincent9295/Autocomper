@@ -3277,12 +3277,26 @@ class VideoProcessorApp:
                     )
 
                     def finish_import():
+                        # 跨添加去重：同一 URL 可能出现在多个 playlist 或被重复添加，
+                        # 按 stable_source_id 过滤掉已导入的源，避免 uploaded_videos 累积重复项。
+                        existing_ids = {
+                            stable_source_id(upload.get_source())
+                            for upload in self.uploaded_videos
+                            if upload.get_source() is not None
+                        }
+                        fresh_sources = []
+                        for source in sources:
+                            source_id = stable_source_id(source)
+                            if source_id in existing_ids:
+                                continue
+                            existing_ids.add(source_id)
+                            fresh_sources.append(source)
                         for media_obj in media_uploads_for_sources(
-                            sources, "video" if self.is_video else "audio"
+                            fresh_sources, "video" if self.is_video else "audio"
                         ):
                             self.uploaded_videos.append(media_obj)
-                            self.update_listbox_add_video(scroll_to_bottom=True)
-                        count = len(sources)
+                        self.update_listbox_add_video(scroll_to_bottom=True)
+                        count = len(fresh_sources)
                         message = f"Successfully imported {count} video" + ("." if count == 1 else "s.")
                         if expansion_stats.get("expanded_parts"):
                             message += f" Expanded {expansion_stats['expanded_parts']} parts."
@@ -3363,27 +3377,10 @@ class VideoProcessorApp:
         self.video_listbox.pack()
 
     def update_listbox_add_video(self, scroll_to_bottom: bool = False):
-        current_items = {self.video_listbox.item(item_id, 'values')[
-            0]: item_id for item_id in self.video_listbox.get_children()}
-
-        for video in self.uploaded_videos:
-            video_path = video.get_path()
-            video_key = str(video_path) if video.get_is_url() else self._display_name(video_path)
-
-            if video_key not in current_items:
-                item_number = len(self.video_listbox.get_children())
-                self.video_listbox.insert(
-                    "", "end", item_number, values=(video_key,))
-            else:
-                del current_items[video_key]
-
-        for video_key, item_id in current_items.items():
-            self.video_listbox.delete(item_id)
-
-        if scroll_to_bottom:
-            self.video_listbox.yview_moveto(1.0)
-
-        self.video_listbox.pack()
+        # 全量重建，与 update_listbox 行为一致。旧实现用"快照去重 + 增量插入"，
+        # 快照不会随插入更新，导致 uploaded_videos 里同 key（同标题）的重复项被
+        # 逐个插入而反复倍增。
+        self.update_listbox(scroll_to_bottom=scroll_to_bottom)
 
     def move_selected_up(self):
         selected_index = self.video_listbox.selection()
