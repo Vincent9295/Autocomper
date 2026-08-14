@@ -24,6 +24,8 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
 | **Compile Progress Monitoring** | Live remote clip preparation, FFmpeg encoding progress, merge progress, speed, and ETA. |
 | **Max Download Concurrency** | Control how many remote clips are fetched at once while preparing a compilation (default 5). |
+| **Video-Name Timestamps** | Timestamps files now derive from your output video name — e.g. `myvideo_timestamps.txt`, `myvideo_timestamps_reverified.txt`, `myvideo_timestamps_selected.txt` — so detection, re-verify, and review selections stay grouped together. |
+| **Merge Batch Size** | Adjust how many clips each FFmpeg merge batch combines before the final concat. Lower it for laptops/weak CPUs; higher is faster on strong machines. |
 | **Improved UI** | Scrollable settings panel, stable Settings layout, clearer remote clip progress, and repositioned tooltips. |
 
 ### Technical Improvements vs. the Original
@@ -150,6 +152,8 @@ The **Remote Settings** panel controls how URL inputs are resolved and cached:
 - **Open Cache Folder** opens the current cache location in File Explorer.
 - **Clear Cache** removes AutoComper's detection, audio, and segment cache entries. It does not delete the original videos or ordinary user files.
 - **Max Download Concurrency** sets how many remote video clips are fetched at once while preparing a compilation (default 5). Each worker runs its own FFmpeg process, so higher values finish faster on fast connections but use more CPU/disk; lower this to 1-2 if the PC feels sluggish during "Preparing clips". The control is disabled while a run is in progress.
+- **Audio Cache Chunk Size (MiB)** sets how much audio each chunk download requests while an Audio Cache file is being fetched (default 4 MiB). Larger chunks mean fewer requests but slower restart on a dropped connection; smaller chunks resume more cheaply on flaky networks.
+- **Audio Cache Download Concurrency** controls how many chunks are fetched in parallel while building an Audio Cache file. More workers finish faster on fast links but raise CDN rate-limit pressure; lower it if you see HTTP 412 / 429 errors from Bilibili on big batches.
 
 #### Playlist Imports and Platform Rate Limits
 

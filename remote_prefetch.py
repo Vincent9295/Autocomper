@@ -1,7 +1,9 @@
 """Bounded in-memory HTTP range prefetching for YouTube audio streams."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 import time
+from typing import Mapping
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -86,6 +88,36 @@ def _default_request(url, start, end, headers, timeout):
         return response.read(), int(getattr(response, "status", response.getcode())), response_headers
 
 
+def _probe_real_size(url, headers, timeout=15, request_func=None):
+    """Return the real byte size of a range-capable stream, or None on failure.
+
+    bilibili (and occasionally YouTube) ``filesize_approx`` can be noticeably
+    off from the actual DASH stream size. Using the estimate to slice ranges
+    then walks past the real end: the boundary block returns a short 206 (which
+    fails the length check) and every later block 416s, stalling the download at
+    ~70-80% for a long time. Probing ``bytes=0-0`` gives the authoritative size
+    from ``Content-Range`` in one cheap request.
+    """
+    request = request_func or _default_request
+    try:
+        _data, status, response_headers = request(url, 0, 0, dict(headers), timeout)
+    except Exception:
+        return None
+    if int(status) != 206:
+        return None
+    if not isinstance(response_headers, Mapping):
+        return None
+    content_range = str(response_headers.get("content-range") or response_headers.get("Content-Range") or "")
+    m = re.match(r"bytes \d+-\d+/(\d+)", content_range)
+    if not m:
+        return None
+    try:
+        total = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
 def _default_hls_request(url, headers, timeout):
     request = Request(url, headers=dict(headers or {}))
     with urlopen(request, timeout=timeout) as response:
@@ -128,6 +160,19 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
         raise RangePrefetchError("range prefetch requires a positive known audio size")
     if not supports_range_prefetch(source):
         raise RangePrefetchError("source does not support range prefetch")
+
+    # 用真实流大小校正预估大小：filesize_approx 对 bilibili 偏差可能偏大
+    # （越界到实际末尾之后 → 末尾块长度不匹配 + 后续块 416，卡在 ~70-80%）
+    # 也可能偏小（漏掉实际尾部 → 下载文件缺尾部 box，ffprobe 报损坏）。
+    # 只要探测到的真实大小与预估不同，一律用真实值划分 ranges。
+    platform = str(getattr(source, "platform", "")).lower()
+    request = request_func or _default_request
+    headers = dict(getattr(source, "audio_headers", {}) or {})
+    if platform == "bilibili":
+        real_size = _probe_real_size(source.audio_url, headers, request_func=request)
+        if real_size is not None and real_size > 0 and real_size != size:
+            size = real_size
+
     try:
         start_offset = int(start_offset)
     except (TypeError, ValueError) as exc:
@@ -140,14 +185,15 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
     max_attempts = max(1, int(max_attempts))
     retry_delays = tuple(retry_delays or ())
 
-    platform = str(getattr(source, "platform", "")).lower()
     platform_label = "YouTube" if platform == "youtube" else "Bilibili"
+    # chunk 上限保护：超大 chunk（或用户误设成接近整文件）会让单个 range 请求变成
+    # 全文件级下载，一旦挂起就要等满 timeout 才能重试，历史上造成"永久卡住"。
+    # 这里只压上限到 64MiB；小 chunk 永远更安全，不需要下限。
+    chunk_size = min(int(chunk_size), 64 * 1024 * 1024)
     _log(logger, f"{platform_label} memory prefetch: {concurrency} workers, {chunk_size // (1024 * 1024)}MiB chunks")
-    request = request_func or _default_request
-    headers = dict(getattr(source, "audio_headers", {}) or {})
     ranges = [(start, min(size - 1, start + chunk_size - 1))
               for start in range(start_offset, size, chunk_size)]
-    worker_concurrency = 1 if platform == "bilibili" else concurrency
+    worker_concurrency = max(1, int(concurrency))
     window = max(1, worker_concurrency * 2)
 
     def fetch(index, start, end):
@@ -163,15 +209,26 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
                 if len(result) == 3 and result[2]:
                     response_headers = {str(key).lower(): str(value) for key, value in result[2].items()}
                 if int(status) != 206:
+                    if int(status) == 416:
+                        # 请求区间超出实际流末尾：后续所有块也会 416，直接按
+                        # "末尾已到"提前结束，不重试（filesize_approx 虚高场景）。
+                        return index, b"", -1
                     raise RangePrefetchError("range server returned a non-partial response")
                 expected_length = end - start + 1
                 short_final = platform == "bilibili" and index == len(ranges) - 1 and len(data) < expected_length
-                if len(data) != expected_length and not short_final:
+                content_range = response_headers.get("content-range", "")
+                # 长度不匹配但 Content-Range 前缀合法：说明这是实际末尾块（预估
+                # filesize 虚高），CDN 只返回了剩余真实数据。按实际长度接受，
+                # 避免长度校验把它当成坏块反复重试卡在 ~70-80%。
+                cr_matches = content_range.lower().startswith(f"bytes {start}-{start + len(data) - 1}/")
+                if len(data) != expected_length and not short_final and not cr_matches:
                     raise RangePrefetchError("range response length mismatch")
                 if short_final:
-                    content_range = response_headers.get("content-range", "")
-                    if content_range and not content_range.lower().startswith(f"bytes {start}-{start + len(data) - 1}/"):
+                    if content_range and not cr_matches:
                         raise RangePrefetchError("range response Content-Range mismatch")
+                if len(data) == 0:
+                    # 实际末尾已全部收完，后续块同样为空/416，提前正常结束
+                    return index, b"", -1
                 elapsed = max(time.monotonic() - started_at, 0.001)
                 speed = len(data) / elapsed / (1024 * 1024)
                 return index, bytes(data), speed
@@ -202,6 +259,7 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
     buffered = {}
     started_at = time.monotonic()
     completed_bytes = start_offset
+    end_reached = False
     try:
         while pending_index < len(ranges) and len(futures) < window:
             start, end = ranges[pending_index]
@@ -212,22 +270,26 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
             index = futures.pop(completed)
             result_index, data, speed = completed.result()
             buffered[result_index] = data
-            if speed_monitor is not None and speed_monitor.observe(speed):
+            if speed is not None and speed > 0 and speed_monitor is not None and speed_monitor.observe(speed):
                 if slow_callback is not None:
                     slow_callback(source, speed)
                 speed_monitor.reset()
+            if speed == -1:
+                end_reached = True
             while next_index in buffered:
                 data = buffered.pop(next_index)
                 completed_bytes += len(data)
                 if progress_callback is not None:
                     progress_callback(format_transfer_progress(
                         completed_bytes, size, time.monotonic() - started_at))
-                yield data
+                if data:
+                    yield data
                 next_index += 1
-            while pending_index < len(ranges) and len(futures) < window:
-                start, end = ranges[pending_index]
-                futures[executor.submit(fetch, pending_index, start, end)] = pending_index
-                pending_index += 1
+            if not end_reached:
+                while pending_index < len(ranges) and len(futures) < window:
+                    start, end = ranges[pending_index]
+                    futures[executor.submit(fetch, pending_index, start, end)] = pending_index
+                    pending_index += 1
     finally:
         for future in futures:
             future.cancel()

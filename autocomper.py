@@ -76,8 +76,9 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
 from remote_cache import CacheStore
 from remote_rate import LimitedRefresher, ResolveLimiter
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
-                     convert_quality_str_to_int, download_audio, download_video,
-                     get_bundle_filepath, kill_tracked_procs, run_tracked,
+                     cancel_clear, cancel_pending, convert_quality_str_to_int,
+                     download_audio, download_video, get_bundle_filepath,
+                     kill_tracked_procs, request_cancel, run_tracked,
                      run_tracked_progress, check_compile_disk_space)
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
@@ -125,6 +126,35 @@ REMOTE_CONCURRENCY_TOOLTIP_TEXT = (
 REMOTE_CONCURRENCY_DEFAULT = 5
 REMOTE_CONCURRENCY_MIN = 1
 REMOTE_CONCURRENCY_MAX = 16
+REMOTE_AUDIO_CHUNK_TOOLTIP_TEXT = (
+    "Audio Cache download chunk size, in MiB.\n"
+    "Smaller chunks recover faster when a single request hangs; larger chunks\n"
+    "make fewer requests. This setting depends heavily on your CDN and network:\n"
+    "if your connection is unstable, a large chunk can hang forever and stall the\n"
+    "whole batch. Keep 4 MiB unless you know your network handles it. Default: 4."
+)
+REMOTE_AUDIO_CONCURRENCY_TOOLTIP_TEXT = (
+    "How many Audio Cache audio streams to download at once (same style as YouTube).\n"
+    "More workers may finish faster on a good connection, but on an unstable or\n"
+    "rate-limited CDN more concurrent requests can trip protection and cause 403s\n"
+    "or stalls. Lower to 1-2 if a batch hangs partway. Default: 4."
+)
+REMOTE_AUDIO_CHUNK_DEFAULT = 4
+REMOTE_AUDIO_CHUNK_MIN = 1
+REMOTE_AUDIO_CHUNK_MAX = 64
+REMOTE_AUDIO_CONCURRENCY_DEFAULT = 4
+REMOTE_AUDIO_CONCURRENCY_MIN = 1
+REMOTE_AUDIO_CONCURRENCY_MAX = 16
+MERGE_BATCH_TOOLTIP_TEXT = (
+    "How many clips each FFmpeg merge batch combines before the final concat.\n"
+    "Smaller batches (e.g. 6) use less RAM per FFmpeg process and are safer on\n"
+    "weak machines or very large 4K clips. Larger batches (e.g. 12-20) produce\n"
+    "fewer intermediate files and finish faster on a capable PC. If a merge ever\n"
+    "runs out of memory, lower this. Default: 6."
+)
+MERGE_BATCH_DEFAULT = 6
+MERGE_BATCH_MIN = 1
+MERGE_BATCH_MAX = 50
 REMOTE_CACHE_TOOLTIP_TEXT = (
     "Remote Stream, Audio Cache, reverify, and downloaded segment files are stored here.\n"
     "Full Download does not necessarily use this cache. The cache can be cleared, but\n"
@@ -402,6 +432,36 @@ def normalize_remote_settings(data):
         elif concurrency > REMOTE_CONCURRENCY_MAX:
             concurrency = REMOTE_CONCURRENCY_MAX
         normalized["remote_download_concurrency"] = concurrency
+    if "remote_audio_chunk_size" in normalized:
+        try:
+            chunk = int(normalized["remote_audio_chunk_size"])
+        except (TypeError, ValueError):
+            chunk = REMOTE_AUDIO_CHUNK_DEFAULT
+        if chunk < REMOTE_AUDIO_CHUNK_MIN:
+            chunk = REMOTE_AUDIO_CHUNK_DEFAULT
+        elif chunk > REMOTE_AUDIO_CHUNK_MAX:
+            chunk = REMOTE_AUDIO_CHUNK_MAX
+        normalized["remote_audio_chunk_size"] = chunk
+    if "remote_audio_concurrency" in normalized:
+        try:
+            audio_concurrency = int(normalized["remote_audio_concurrency"])
+        except (TypeError, ValueError):
+            audio_concurrency = REMOTE_AUDIO_CONCURRENCY_DEFAULT
+        if audio_concurrency < REMOTE_AUDIO_CONCURRENCY_MIN:
+            audio_concurrency = REMOTE_AUDIO_CONCURRENCY_DEFAULT
+        elif audio_concurrency > REMOTE_AUDIO_CONCURRENCY_MAX:
+            audio_concurrency = REMOTE_AUDIO_CONCURRENCY_MAX
+        normalized["remote_audio_concurrency"] = audio_concurrency
+    if "merge_batch_size" in normalized:
+        try:
+            merge_batch = int(normalized["merge_batch_size"])
+        except (TypeError, ValueError):
+            merge_batch = MERGE_BATCH_DEFAULT
+        if merge_batch < MERGE_BATCH_MIN:
+            merge_batch = MERGE_BATCH_DEFAULT
+        elif merge_batch > MERGE_BATCH_MAX:
+            merge_batch = MERGE_BATCH_MAX
+        normalized["merge_batch_size"] = merge_batch
     normalized.pop("remote_cache_size", None)
     return normalized
 
@@ -731,6 +791,62 @@ def _mark_detection_failure(cache_store, source, precision, block_size, threshol
         pass
 
 
+def _handle_corrupt_audio_cache(cache_store, upload, audio_cache_paths,
+                                precision, block_size, threshold, focus_idx,
+                                model, reason):
+    """Audio Cache 检测失败：删除损坏的本地 m4a 缓存并记录失败标记。
+
+    下次 Audio Cache 循环的 resolve_cached_audio 会因文件缺失而重新下载该源；
+    配合 _retry_audio_cache_detection 可在本次运行内立即重下，实现自愈而不
+    需要用户手动清缓存或从头重跑。
+    """
+    source = upload.get_source()
+    if source is None or cache_store is None:
+        return
+    source_id = stable_source_id(source)
+    cached_path = audio_cache_paths.pop(source_id, None)
+    if cached_path:
+        try:
+            path = Path(cached_path)
+            path.unlink(missing_ok=True)
+            path.with_suffix(path.suffix + ".json").unlink(missing_ok=True)
+        except Exception:
+            pass
+    _mark_detection_failure(cache_store, source, precision, block_size,
+                            threshold, focus_idx, model, reason)
+
+
+def _retry_audio_cache_detection(upload, audio_cache_paths, cache_store,
+                                 refresh_func, chunk_size_mib, concurrency):
+    """Re-download a corrupt Audio Cache file once and return the new local path.
+
+    Returns the new m4a path on success, or None if the source has no usable
+    audio URL / the download failed. Raises on hard errors so the caller can
+    decide whether to abort the source.
+    """
+    source = upload.get_source()
+    if source is None:
+        return None
+    source_id = stable_source_id(source)
+    # 重新选择 audio candidate，确保用最新解析的候选池和当时的网络状况。
+    try:
+        select_audio_candidate(source, log_func=print)
+    except Exception as exc:
+        print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
+    new_cache = fetch_audio_cache(
+        source, cache_store, log_func=print, refresh_func=refresh_func,
+        prefetch_chunk_size=int(chunk_size_mib) * 1024 * 1024,
+        prefetch_concurrency=int(concurrency),
+    )
+    audio_cache_paths[source_id] = str(new_cache)
+    print(
+        f"Audio cache re-downloaded for "
+        f"{source.platform or 'unknown'}:{source.source_id or 'unknown'}: "
+        f"{Path(new_cache).name}"
+    )
+    return new_cache
+
+
 def refresh_remote_source(source, browser_cookies=None):
     """Resolve fresh stream URLs without logging signed URL or cookie details."""
     refreshed = resolve_source(source.source_url, browser_cookies=browser_cookies,
@@ -872,6 +988,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             fetch_kwargs = {}
             # 下载区间已在任务构建时按 padding 及相邻 clip 钳制好，
             # 这里直接以区间本身下载，不再追加 padding。
+            # 单个 clip 设 60s 总预算：某个 VOD 区间流不可用时，反复
+            # refresh/retry 会拖住整批 compile 几分钟。超预算即放弃该
+            # clip（fail_task），compile 跳过它继续，不阻塞整体。
+            fetch_kwargs["max_total_duration"] = 60
             if not is_video:
                 fetch_kwargs["audio_only"] = True
             if refresh_func is not None:
@@ -1150,12 +1270,29 @@ def convert_seconds_to_timestamp(seconds: float) -> str:
         minutes = 0
     return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
 
+def _resolve_txt_paths(output_video_path, configured_txt):
+    """Resolve the base timestamps path for a processing session.
+
+    Priority: 设置里自定义的 txt 名 > combine 影片名（去扩展名 + _timestamps.txt）
+    > 默认 <输出目录>/timestamps.txt。_reverified.txt / _selected.txt 都从该
+    base 派生，保证三个文件共享同一个基准名。
+    """
+    if configured_txt and configured_txt != "No file selected!":
+        return configured_txt
+    if output_video_path and not os.path.isdir(output_video_path):
+        base = os.path.splitext(str(output_video_path))[0]
+        return base + "_timestamps.txt"
+    folder = (output_video_path if os.path.isdir(output_video_path)
+              else os.path.dirname(output_video_path))
+    return os.path.join(folder, "timestamps.txt")
+
+
 def _save_selected_txt(dict_list, txt_path):
     """保存审核后勾选的片段到 {原名}_selected.txt（与 timestamps.txt 同目录）。"""
     if not txt_path or txt_path == "No file selected!" or not dict_list:
         return
     try:
-        selected_path = txt_path.rsplit('.', 1)[0] + '_selected.txt'
+        selected_path = txt_path.rsplit('.txt', 1)[0] + '_selected.txt'
         with open(selected_path, 'w', encoding='utf-8') as f:
             for entry in dict_list:
                 f.write(f"{get_source_persistence_name(entry['filename'])}\n")
@@ -1167,6 +1304,38 @@ def _save_selected_txt(dict_list, txt_path):
         print(f"{Fore.GREEN}Saved selected clips to {selected_path}")
     except Exception as e:
         print(f"{Fore.YELLOW}Could not save _selected.txt: {e}")
+
+
+def _write_timestamps_txt(dict_list, txt_path):
+    """Write the current dict_list timestamps to txt_path (UTF-8).
+
+    Reverify 会更新 dict_list（合并 source='new' 的 clips + auto-deselect），
+    因此 .txt 需要在 reverify 之后再写一次，才能反映最终编译用的片段。
+    新增的 reverify clips 用 "[new]" 后缀标记，方便下次 review 区分。
+    """
+    if not txt_path or txt_path == "No file selected!":
+        return False
+    timestamps_text = ""
+    found_timestamps = False
+    for entry in dict_list:
+        timestamps_text += f"{get_source_persistence_name(entry['filename'])}\n"
+        for ts in entry.get('timestamps', []):
+            marker = " [new]" if ts.get('source') == 'new' else ""
+            timestamps_text += (
+                f"{convert_seconds_to_timestamp(ts['start'])} - "
+                f"{convert_seconds_to_timestamp(ts['end'])}, "
+                f"confidence: {ts['pred']}{marker}\n"
+            )
+            found_timestamps = True
+        timestamps_text += "\n"
+    if not found_timestamps:
+        return False
+    try:
+        with open(txt_path, 'w', encoding="utf-8") as file:
+            file.write(timestamps_text)
+        return True
+    except OSError:
+        return False
 
 
 def _parse_timestamps_txt(txt_path):
@@ -1186,13 +1355,18 @@ def _parse_timestamps_txt(txt_path):
                 current_ts = []
                 continue
             m = re.match(
-                r'(\d+):(\d{2}):(\d{2})\s*-\s*(\d+):(\d{2}):(\d{2}),\s*confidence:\s*([\d.]+)',
+                r'(\d+):(\d{2}):(\d{2})\s*-\s*(\d+):(\d{2}):(\d{2}),\s*confidence:\s*([\d.]+)(?:\s*\[new\])?',
                 line)
             if m:
                 h1, m1, s1, h2, m2, s2, conf = m.groups()
                 s = int(h1) * 3600 + int(m1) * 60 + int(s1)
                 e = int(h2) * 3600 + int(m2) * 60 + int(s2)
-                current_ts.append({'start': s, 'end': e, 'pred': float(conf)})
+                ts = {'start': s, 'end': e, 'pred': float(conf)}
+                # 保留 reverify 的 "[new]" 标记：加载 _reverified.txt 后
+                # ReviewDialog 才能正确显示 New/Original 并做 auto-deselect。
+                if '[new]' in line:
+                    ts['source'] = 'new'
+                current_ts.append(ts)
             else:
                 current_file = line
     if current_file:
@@ -1382,6 +1556,8 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 new_timestamps = []
                 window_total = len(scan_windows)
                 for window_index, (ws, we) in enumerate(scan_windows):
+                    if cancel_pending():
+                        raise InterruptedError("Verify cancelled by user.")
                     print(
                         f"{Fore.CYAN}Verification: fetching audio "
                         f"[{window_index + 1}/{window_total}] "
@@ -1450,69 +1626,96 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 entry['timestamps'] = _merge_reverify_timestamps(original_ts + new_timestamps)
                 continue
 
-            full_audio = tempfile.NamedTemporaryFile(
-                suffix='.pcm', prefix='reverify-', dir=TEMP_DIR, delete=False)
-            full_audio.close()
-            try:
-                extract_cmd = [
-                    os.environ.get('FFMPEG_BINARY', 'ffmpeg'), '-y', '-hide_banner', '-loglevel', 'error',
-                    '-i', str(scan_filename), '-vn', '-f', 's16le', '-acodec', 'pcm_s16le',
-                    '-ar', str(sample_rate), '-ac', '1', full_audio.name]
-                source_label = (
-                    get_source_display_name(filename)
-                    if isinstance(filename, MediaSource) else os.path.basename(str(filename))
-                )
-                print(f"{Fore.CYAN}Verification: extracting full audio for {source_label}...")
+            source_label = (
+                get_source_display_name(filename)
+                if isinstance(filename, MediaSource) else os.path.basename(str(filename))
+            )
+            # 只扫描 clips 周围的窗口，绝不整片解码：几小时直播音频转成 PCM
+            # 写入临时文件要数十分钟（Audio Cache 全量 reverify 卡顿的根因）。
+            # 对每个合并窗口用 ffmpeg -ss/-to 精确提取小段，扫描后再丢弃。
+            max_dur = getattr(filename, "duration", None)
+            if max_dur is None:
+                try:
+                    max_dur = _get_video_duration(scan_filename)
+                except Exception:
+                    max_dur = None
+            scan_windows = []
+            for ts in original_ts:
+                ws = max(0.0, float(ts['start']) - window)
+                we = float(ts['end']) + window
+                if max_dur is not None:
+                    we = min(we, float(max_dur))
+                if we <= ws:
+                    continue
+                if scan_windows and ws <= scan_windows[-1][1] + 1:
+                    scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
+                else:
+                    scan_windows.append((ws, we))
+            if not scan_windows:
+                print(f"{Fore.YELLOW}Verification: no scan windows for {source_label}.")
+                continue
+            new_timestamps = []
+            window_total = len(scan_windows)
+            for window_index, (ws, we) in enumerate(scan_windows):
+                if cancel_pending():
+                    raise InterruptedError("Verify cancelled by user.")
+                print(
+                    f"{Fore.CYAN}Verification: extracting audio "
+                    f"[{window_index + 1}/{window_total}] "
+                    f"({ws:g}-{we:g}s) for {source_label}...")
                 if progress_callback is not None:
                     progress_callback({
                         "title": "Verification",
-                        "current_line": f"Extracting full audio for {source_label}...",
+                        "current_line": (
+                            f"Extracting audio [{window_index + 1}/{window_total}] "
+                            f"({ws:g}-{we:g}s) for {source_label}..."
+                        ),
                         "percent_line": "Progress: --",
                         "speed_line": "Speed: --",
                         "eta_line": "ETA: --",
                     })
-                run_tracked(extract_cmd)
-                if os.path.getsize(full_audio.name) == 0:
-                    continue
-                raw = __import__('numpy').memmap(full_audio.name, dtype='int16', mode='r')
-                if len(raw) == 0:
-                    continue
-                max_dur = len(raw) / sample_rate
-                scan_windows = []
-                for ts in original_ts:
-                    ws = max(0, ts['start'] - window)
-                    we = min(ts['end'] + window, max_dur - 0.1)
-                    if we <= ws:
+                window_audio = tempfile.NamedTemporaryFile(
+                    suffix='.pcm', prefix='reverify-', dir=TEMP_DIR, delete=False)
+                window_audio.close()
+                try:
+                    extract_cmd = [
+                        os.environ.get('FFMPEG_BINARY', 'ffmpeg'), '-y',
+                        '-hide_banner', '-loglevel', 'error',
+                        '-ss', str(ws), '-to', str(we),
+                        '-i', str(scan_filename), '-vn',
+                        '-f', 's16le', '-acodec', 'pcm_s16le',
+                        '-ar', str(sample_rate), '-ac', '1', window_audio.name]
+                    run_tracked(extract_cmd)
+                    if os.path.getsize(window_audio.name) == 0:
                         continue
-                    if scan_windows and ws <= scan_windows[-1][1] + 1:
-                        scan_windows[-1] = (scan_windows[-1][0], max(scan_windows[-1][1], we))
-                    else:
-                        scan_windows.append((ws, we))
-                new_timestamps = []
-                for ws, we in scan_windows:
+                    raw = __import__('numpy').memmap(
+                        window_audio.name, dtype='int16', mode='r')
+                    if len(raw) == 0:
+                        continue
+                    window_dur = len(raw) / sample_rate
                     found, scans, skipped, accepted, refused = _scan_reverify_audio(
-                        raw, [(ws, we)], precision, focus_idx, scan_threshold,
-                        ort_session, verify_block_size, direct_accept, logger,
-                        timestamp_offset=ws)
+                        raw, [(0.0, window_dur)], precision, focus_idx,
+                        scan_threshold, ort_session, verify_block_size,
+                        direct_accept, logger, timestamp_offset=ws)
                     new_timestamps.extend(found)
                     checked += scans
                     dskip += skipped
                     confirmed += accepted
                     rejected += refused
-                entry['timestamps'] = _merge_reverify_timestamps(original_ts + new_timestamps)
-                if cached_audio is not None:
-                    preserved = preserve_remote_result(entry, filename)
-                    entry.clear()
-                    entry.update(preserved)
-            finally:
-                try:
-                    del raw
-                except (NameError, UnboundLocalError):
-                    pass
-                try:
-                    os.remove(full_audio.name)
-                except OSError:
-                    pass
+                finally:
+                    try:
+                        del raw
+                    except (NameError, UnboundLocalError):
+                        pass
+                    try:
+                        os.remove(window_audio.name)
+                    except OSError:
+                        pass
+            entry['timestamps'] = _merge_reverify_timestamps(original_ts + new_timestamps)
+            if cached_audio is not None:
+                preserved = preserve_remote_result(entry, filename)
+                entry.clear()
+                entry.update(preserved)
             # 用完即删：reverify 处理完该源后释放临时音频。只删 Remote Stream
             # 的 reverify-stream-*.wav，绝不删 Audio Cache 模式的持久 m4a 缓存。
             if cached_audio is not None:
@@ -1638,7 +1841,9 @@ class ReviewDialog:
 
         self.win = tk.Toplevel(parent)
         self.win.title("Review Clips")
-        self.win.geometry("800x500")
+        # 窗口加宽到能容纳全部列（sel+time+file+conf+status ≈ 720px），
+        # 避免每次打开 status 栏被截断、需要手动拉宽才能看到。
+        self.win.geometry("1000x620")
         self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
         self.win.transient(parent)
         self.win.lift()
@@ -1740,6 +1945,13 @@ class ReviewDialog:
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Double-1>", self._on_double_click)
+        # 说明 preview 行为：远程源 preview 会先下载对应区间再播放，
+        # 因此会有短暂停顿，属正常现象。
+        CustomHovertip(
+            self.tree,
+            "Right-click: Play Audio / Open Video Clip\n"
+            "Remote clips must download first (may pause briefly)",
+        )
 
         bf = ttk.Frame(self.win)
         bf.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -1858,6 +2070,13 @@ class ReviewDialog:
         ss = max(0, f['start'] - bf)
         dur = (f['end'] + af) - ss
         self._preview_paths = getattr(self, '_preview_paths', [])
+        # cookies 配置属于主窗口（VideoProcessor），ReviewDialog 通过 parent
+        # 访问；无 parent（如测试单独构造）时回退为默认 "Auto"。
+        _preview_parent = getattr(self, 'parent', None)
+        _bc_var = getattr(_preview_parent, 'remote_browser_cookies', None)
+        _cf_var = getattr(_preview_parent, 'remote_cookies_file', None)
+        _bc_label = _bc_var.get() if _bc_var is not None else 'Auto'
+        _cf_path = _cf_var.get() if _cf_var is not None else ''
         tmp_path = None
         try:
             suf = '.mp4' if video else '.wav'
@@ -1875,8 +2094,8 @@ class ReviewDialog:
                         updated = refresh_remote_source(
                             source,
                             browser_cookies=browser_cookie_setting_value(
-                                self.remote_browser_cookies.get(),
-                                cookies_file=self.remote_cookies_file.get(),
+                                _bc_label,
+                                cookies_file=_cf_path,
                             ),
                         )
                         if updated is not None and updated is not source:
@@ -1892,8 +2111,8 @@ class ReviewDialog:
                     refresh_func=lambda source: refresh_remote_source(
                         source,
                         browser_cookies=browser_cookie_setting_value(
-                            self.remote_browser_cookies.get(),
-                            cookies_file=self.remote_cookies_file.get(),
+                            _bc_label,
+                            cookies_file=_cf_path,
                         ),
                     ),
                     logger=print)
@@ -2318,6 +2537,30 @@ class VideoProcessorApp:
             self.remote_concurrency_spinbox, REMOTE_CONCURRENCY_TOOLTIP_TEXT
         )
 
+        ttk.Label(self.remote_settings_frame, text="Audio Cache Chunk Size (MiB):").pack()
+        self.remote_audio_chunk_size = tk.IntVar(value=REMOTE_AUDIO_CHUNK_DEFAULT)
+        self.remote_audio_chunk_spinbox = ttk.Spinbox(
+            self.remote_settings_frame,
+            from_=REMOTE_AUDIO_CHUNK_MIN, to=REMOTE_AUDIO_CHUNK_MAX, width=5,
+            textvariable=self.remote_audio_chunk_size,
+        )
+        self.remote_audio_chunk_spinbox.pack(pady=(0, 8))
+        self.remote_audio_chunk_tooltip = CustomHovertip(
+            self.remote_audio_chunk_spinbox, REMOTE_AUDIO_CHUNK_TOOLTIP_TEXT
+        )
+
+        ttk.Label(self.remote_settings_frame, text="Audio Cache Download Concurrency:").pack()
+        self.remote_audio_concurrency = tk.IntVar(value=REMOTE_AUDIO_CONCURRENCY_DEFAULT)
+        self.remote_audio_concurrency_spinbox = ttk.Spinbox(
+            self.remote_settings_frame,
+            from_=REMOTE_AUDIO_CONCURRENCY_MIN, to=REMOTE_AUDIO_CONCURRENCY_MAX, width=5,
+            textvariable=self.remote_audio_concurrency,
+        )
+        self.remote_audio_concurrency_spinbox.pack(pady=(0, 8))
+        self.remote_audio_concurrency_tooltip = CustomHovertip(
+            self.remote_audio_concurrency_spinbox, REMOTE_AUDIO_CONCURRENCY_TOOLTIP_TEXT
+        )
+
         self.remote_cache_frame = ttk.LabelFrame(self.remote_settings_frame, text="Remote Cache")
         self.remote_cache_frame.pack(fill=tk.X, padx=4, pady=(0, 8))
         ttk.Label(self.remote_cache_frame, text="Cache Location:").pack(anchor="w", padx=6, pady=(5, 0))
@@ -2444,6 +2687,20 @@ class VideoProcessorApp:
         self.combine_checkbox = ttk.Checkbutton(
             self.checkbox_frame, text="Combine Input Media", variable=self.combine_vids, command=self.clear_output)
         self.combine_checkbox.pack(anchor=tk.W)
+
+        # Merge batch size (files per FFmpeg concat batch)
+        merge_batch_row = ttk.Frame(self.checkbox_frame)
+        merge_batch_row.pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(merge_batch_row, text="Merge Batch Size:").pack(side=tk.LEFT)
+        self.merge_batch_size = tk.IntVar(value=MERGE_BATCH_DEFAULT)
+        self.merge_batch_spinbox = ttk.Spinbox(
+            merge_batch_row, from_=MERGE_BATCH_MIN, to=MERGE_BATCH_MAX, width=5,
+            textvariable=self.merge_batch_size,
+        )
+        self.merge_batch_spinbox.pack(side=tk.LEFT, padx=(6, 0))
+        self.merge_batch_tooltip = CustomHovertip(
+            self.merge_batch_spinbox, MERGE_BATCH_TOOLTIP_TEXT
+        )
 
         # Normalize audio checkbox
         self.normalize_audio_checkbox = ttk.Checkbutton(
@@ -2722,6 +2979,9 @@ class VideoProcessorApp:
             self.remote_mode_dropdown,
             self.remote_browser_cookies_dropdown,
             self.remote_concurrency_spinbox,
+            self.remote_audio_chunk_spinbox,
+            self.remote_audio_concurrency_spinbox,
+            self.merge_batch_spinbox,
             self.remote_cache_open_button,
             self.remote_cache_clear_button,
             self.remote_cache_choose_button,
@@ -2958,8 +3218,9 @@ class VideoProcessorApp:
         dialog = tk.Toplevel(self.root)
         dialog.title("Review Playlist Entries")
         dialog.transient(self.root)
-        dialog.geometry("900x600")
-        dialog.minsize(900, 600)
+        # 窗口加宽到能容纳全部列（≈960px），避免 title/status 被截断。
+        dialog.geometry("1100x680")
+        dialog.minsize(1100, 680)
         dialog.resizable(True, True)
 
         selected_ids = set()
@@ -3561,6 +3822,17 @@ class VideoProcessorApp:
         self.remote_cache_size.set(
             f"Current size: {format_cache_size(self.remote_cache_store.get_cache_size())}")
 
+    def _maybe_refresh_cache_size(self):
+        # 下载新缓存期间实时更新 size，但节流到每 5s 最多一次，避免高频
+        # rglob 遍历拖慢后台线程。只能在主线程调用（UI 队列投递）。
+        now = time.monotonic()
+        if not hasattr(self, "_cache_size_last_refresh"):
+            self._cache_size_last_refresh = 0.0
+        if now - self._cache_size_last_refresh < 5.0:
+            return
+        self._cache_size_last_refresh = now
+        self.refresh_remote_cache_size()
+
     def choose_remote_cache(self):
         selected_path = filedialog.askdirectory(title="Choose Cache Folder")
         if not selected_path:
@@ -3762,7 +4034,11 @@ class VideoProcessorApp:
 
     def process_videos_multi(self):
         # Run video processing in new thread so the app doesn't hang
+        cancel_clear()
         self.active_thread = KThread(target=self.process_videos)
+        # daemon：用户取消/关闭后线程即使卡在 C 层阻塞（如 communicate），
+        # 主进程也能退出，不再留下僵尸 autocomper.exe + ffmpeg。
+        self.active_thread.daemon = True
         self.active_thread.start()
 
     def is_thread_active(self):
@@ -3778,6 +4054,10 @@ class VideoProcessorApp:
                                           f"The current job will be cancelled, losing all progress. Would you like to cancel?")
             if confirm:
                 try:
+                    # 先置合作式取消标志：run_tracked/run_tracked_progress 与
+                    # compile 的 executor 会在下一个循环立即 kill/停止排队，
+                    # 不再依赖 KThread.terminate（它对 C 层阻塞的线程无效）。
+                    request_cancel()
                     kill_tracked_procs()
                     self.active_thread.terminate()
                 finally:
@@ -4256,6 +4536,8 @@ class VideoProcessorApp:
                             print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
                         audio_cache_paths[stable_source_id(source)] = fetch_audio_cache(
                             source, cache_store, log_func=print, refresh_func=refresh_func,
+                            prefetch_chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024,
+                            prefetch_concurrency=self.remote_audio_concurrency.get(),
                             progress_callback=lambda sample, source=source, cache_index=cache_index:
                                 self._queue_transfer_progress(
                                     sample,
@@ -4263,6 +4545,9 @@ class VideoProcessorApp:
                                     f"{get_source_display_name(source)}",
                                 ),
                         )
+                        # 新缓存写入后节流刷新 size 显示（后台线程 → 主线程投递）
+                        if hasattr(self, "_ui_queue"):
+                            self._ui_queue.put((self._maybe_refresh_cache_size, ()))
                     except Exception as exc:
                         message = (
                             f"Could not cache audio for {get_source_display_name(source)}: {exc}"
@@ -4349,13 +4634,16 @@ class VideoProcessorApp:
             self.clear_transfer_progress("Transfers complete; getting timestamps...")
 
             # --- Check for existing timestamps.txt ---
-            # 候选路径与保存逻辑一致：设置里的路径优先，其次是默认位置
-            # （<输出目录>/timestamps.txt）——否则未设置 txt 路径时上次保存的
-            # timestamps.txt 永远找不到，用户会被迫重跑检测
+            # 候选路径与保存逻辑一致：设置里的路径优先，其次是影片名基准或
+            # 默认位置（<输出目录>/timestamps.txt）——否则未设置 txt 路径时
+            # 上次保存的 timestamps.txt 永远找不到，用户会被迫重跑检测
             txt_candidates = []
             _cfg_txt = self.output_text_path.get()
             if _cfg_txt and _cfg_txt != "No file selected!":
                 txt_candidates.append(_cfg_txt)
+            base_txt = _resolve_txt_paths(output_video_path, _cfg_txt)
+            if base_txt not in txt_candidates:
+                txt_candidates.append(base_txt)
             if os.path.isdir(output_video_path):
                 txt_candidates.append(os.path.join(output_video_path, "timestamps.txt"))
             else:
@@ -4458,13 +4746,24 @@ class VideoProcessorApp:
                                     continue
                             filtered.append(t)
                         entry['timestamps'] = filtered
+                    # Reverify 后生成 _reverified.txt：包含新发现的 clips（标 [new]）
+                    # 并反映 auto-deselect。仅在"勾了 reverify 且未勾 Review"时生成：
+                    # 勾了 Review 时由 ReviewDialog 写 _selected.txt，避免文件冗余。
+                    # timestamps.txt 保留纯检测/加载结果，不被 reverify 覆盖。
+                    # 派生文件统一基于影片名基准 base_txt（而非加载到的源文件），
+                    # 保证 {影片名}_timestamps_reverified.txt 命名符合用户预期。
+                    if self.use_verify.get() and save_timestamps and not self.use_review.get():
+                        rev_path = base_txt.rsplit('.txt', 1)[0] + '_reverified.txt'
+                        if _write_timestamps_txt(dict_list, rev_path):
+                            print(
+                                f"{Fore.GREEN}Saved re-verified timestamps to {rev_path}!")
                     pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                                   for e in dict_list}
                     if self.use_review.get():
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
                                           use_verify=self.use_verify.get(),
-                                          txt_path=self.output_text_path.get(),
+                                          txt_path=base_txt,
                                           cache_store=cache_store)
                         if dlg.result is None:
                             print(f"{Fore.YELLOW}Review cancelled.")
@@ -4480,7 +4779,7 @@ class VideoProcessorApp:
                                        if (round(iv[0], 3), round(iv[1], 3)) not in sel]
                             if removed:
                                 excluded.setdefault(source_key(fn), []).extend(removed)
-                        _save_selected_txt(dict_list, txt_path)
+                        _save_selected_txt(dict_list, base_txt)
                     ensure_temp_dir()
                     remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
                     remote_failures = []
@@ -4495,16 +4794,22 @@ class VideoProcessorApp:
                     # 不依赖 resolved_at 阈值：bilibili 签名 URL 的 deadline 可能远早于
                     # 30 分钟阈值判断（尤其 Audio Cache 大批次 + reverify 拖长流程后），
                     # 旧 URL 会直接 403。无条件刷新，靠 LimitedRefresher 限流器控节奏。
-                    for entry in dict_list:
-                        source = entry.get('filename')
-                        if not isinstance(source, MediaSource):
-                            continue
-                        try:
-                            updated = refresh_func(source)
-                            if isinstance(updated, MediaSource) and updated is not source:
-                                source.__dict__.update(updated.__dict__)
-                        except Exception as exc:
-                            print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
+                    # 逐源刷新每源至少间隔 2s，88 个源可能耗时数分钟——一次性首尾
+                    # 提示让用户知道程序在刷新而非卡死，避免逐源打印刷屏。
+                    _remote_sources = [e.get('filename') for e in dict_list
+                                       if isinstance(e.get('filename'), MediaSource)]
+                    if _remote_sources:
+                        _label = "VODs" if self.is_video else "Videos"
+                        print(f"{Fore.CYAN}Refreshing {len(_remote_sources)} {_label} "
+                              f"source(s), please be patient...")
+                        for source in _remote_sources:
+                            try:
+                                updated = refresh_func(source)
+                                if isinstance(updated, MediaSource) and updated is not source:
+                                    source.__dict__.update(updated.__dict__)
+                            except Exception as exc:
+                                print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
+                        print(f"{Fore.GREEN}Source refresh complete, continuing to compile...")
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
                         remote_failure_records = []
@@ -4527,7 +4832,8 @@ class VideoProcessorApp:
                                     combine, res, self.final_bar, normalize,
                                     self.is_video, None, excluded=excluded,
                                     progress_callback=lambda sample: self._queue_transfer_progress(
-                                        sample, "Compile"))
+                                        sample, "Compile"),
+                                    batch_size=self.merge_batch_size.get())
                     except Exception as exc:
                         raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
                     finally:
@@ -4622,7 +4928,51 @@ class VideoProcessorApp:
                                                      precision, current_block_size, threshold,
                                                      focus_idx, selected_model, str(exc))
                             return False
-                        raise
+                        if audio_cache and upload.get_is_url():
+                            # Audio Cache 模式的检测输入是本地缓存 m4a：文件损坏
+                            # 会导致检测异常。删除损坏缓存、记录失败，并立即重新
+                            # 下载一次再检测，避免整个程序崩溃退出、已检测结果丢失。
+                            failure = f"{get_source_display_name(upload)}: {exc}"
+                            incomplete_failures.append(failure)
+                            print(f"{Fore.YELLOW}Audio cache corrupt for {failure}; "
+                                  f"re-downloading once and retrying.")
+                            _handle_corrupt_audio_cache(
+                                cache_store, upload, audio_cache_paths,
+                                precision, current_block_size, threshold,
+                                focus_idx, selected_model, str(exc))
+                            try:
+                                retried_input = _retry_audio_cache_detection(
+                                    upload, audio_cache_paths, cache_store,
+                                    refresh_func, self.remote_audio_chunk_size.get(),
+                                    self.remote_audio_concurrency.get())
+                            except Exception as retry_exc:
+                                print(f"{Fore.YELLOW}  Audio cache re-download failed: {retry_exc}")
+                                return False
+                            if retried_input is None:
+                                return False
+                            input_video_path = retried_input
+                            # 重下后的文件仍可能损坏（下载再次中断）：重测也必须
+                            # 捕获异常，重下后仍失败则跳过该源，绝不让程序崩溃。
+                            try:
+                                timestamps, used_existing_data = get_timestamps(
+                                    input_video_path, precision, current_block_size,
+                                    threshold, focus_idx, selected_model, self.final_bar,
+                                    use_gpu=use_gpu, ort_session=shared_session,
+                                    cache_store=cache_store, refresh_func=refresh_func,
+                                    progress_callback=lambda sample, upload=upload, i=i:
+                                        self._queue_transfer_progress(
+                                            sample,
+                                            f"Remote Stream [{i + 1}/{len(processing_uploads)}] "
+                                            f"{get_source_display_name(upload)}",
+                                        ),
+                                )
+                            except Exception as retry_detect_exc:
+                                print(f"{Fore.YELLOW}  Audio cache re-detect failed after re-download: "
+                                      f"{retry_detect_exc}")
+                                return False
+                            # 走成功路径的收尾（strict FP / dict_list / cache 清除）
+                        else:
+                            raise
                     timestamps = {'filename': timestamps['filename'],
                                   'timestamps': [dict(t) for t in timestamps['timestamps']]}
                     source_for_result = upload.get_source() if audio_cache and upload.get_is_url() else input_video_path
@@ -4722,41 +5072,22 @@ class VideoProcessorApp:
 
                 self.final_bar.reset_total_progress(total_progress)
 
-                # Save txt file with timestamp info
+                # Save txt file with timestamp info (detection results)
                 if save_timestamps:
                     try:
-                        if self.output_text_path.get() != "No file selected!":
-                            txt_path = self.output_text_path.get()
-                            # 防御：如果保存路径的目录不存在（比如从别的 PC 继承的配置），回退
-                            txt_dir = os.path.dirname(txt_path) or '.'
-                            if not os.path.isdir(txt_dir):
-                                print(f"{Fore.YELLOW}Configured output directory missing: {txt_dir}")
-                                print(f"{Fore.YELLOW}Falling back to output video location.")
-                                txt_path = os.path.join(os.path.dirname(output_video_path), "timestamps.txt")
-                        elif os.path.isdir(output_video_path):
-                            txt_path = os.path.join(
-                                output_video_path, "timestamps.txt")
-                        else:
-                            txt_path = os.path.join(os.path.dirname(
-                                output_video_path), "timestamps.txt")
+                        txt_path = _resolve_txt_paths(
+                            output_video_path, self.output_text_path.get())
+                        # 防御：如果保存路径的目录不存在（比如从别的 PC 继承的配置），回退
+                        txt_dir = os.path.dirname(txt_path) or '.'
+                        if not os.path.isdir(txt_dir):
+                            print(f"{Fore.YELLOW}Configured output directory missing: {txt_dir}")
+                            print(f"{Fore.YELLOW}Falling back to output video location.")
+                            txt_path = os.path.join(os.path.dirname(output_video_path), "timestamps.txt")
 
-                        timestamps_text = ""
-                        found_timestamps = False
-                        for file in dict_list:
-                            timestamps_text += f"{get_source_persistence_name(file['filename'])}\n"
-
-                            for ts in file['timestamps']:
-                                timestamps_text += f"{convert_seconds_to_timestamp(ts['start'])} - {convert_seconds_to_timestamp(ts['end'])}, confidence: {ts['pred']}\n"
-                                found_timestamps = True
-
-                            timestamps_text += "\n"
-
-                        if found_timestamps:
-                            with open(txt_path, 'w', encoding="utf-8") as file:
-                                file.write(timestamps_text)
+                        if _write_timestamps_txt(dict_list, txt_path):
                             print(
                                 f"{Fore.GREEN}Saved timestamps to {txt_path}!")
-                    except:
+                    except Exception:
                         raise
 
                 # --- re-verify and/or review before final compile ---
@@ -4786,6 +5117,16 @@ class VideoProcessorApp:
                                 continue
                         filtered.append(t)
                     entry['timestamps'] = filtered
+                # Reverify 后生成 _reverified.txt：包含新发现的 clips（标 [new]）
+                # 并反映 auto-deselect，方便下次 review 与最终编译结果对准。
+                # 仅在"勾了 reverify 且未勾 Review"时生成：勾了 Review 时由
+                # ReviewDialog 写 _selected.txt（仅勾选片段），避免文件冗余。
+                # timestamps.txt 保留纯检测结果，不被 reverify 覆盖。
+                if self.use_verify.get() and save_timestamps and not self.use_review.get():
+                    rev_path = txt_path.rsplit('.txt', 1)[0] + '_reverified.txt'
+                    if _write_timestamps_txt(dict_list, rev_path):
+                        print(
+                            f"{Fore.GREEN}Saved re-verified timestamps to {rev_path}!")
                 pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                               for e in dict_list}
                 if self.use_review.get():
@@ -4842,7 +5183,8 @@ class VideoProcessorApp:
                                 combine, res, self.final_bar, normalize,
                                 self.is_video, None, excluded=excluded,
                                 progress_callback=lambda sample: self._queue_transfer_progress(
-                                    sample, "Compile"))
+                                    sample, "Compile"),
+                                batch_size=self.merge_batch_size.get())
                 except Exception as exc:
                     raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
                 finally:
@@ -4876,6 +5218,12 @@ class VideoProcessorApp:
             self.reenable_disabled_objects()
 
         except Exception as e:
+            if cancel_pending() or isinstance(e, InterruptedError):
+                # 用户取消：不弹错误框，静默收尾
+                cleanup_temp_children()
+                self.clear_transfer_progress("Cancelled")
+                self.reenable_disabled_objects()
+                return
             messagebox.showerror("Error", e)
             print(f"\n{Fore.RED}FAILURE: " + str(e))
             cleanup_temp_children()

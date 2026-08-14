@@ -4,6 +4,7 @@ import platform
 import shutil
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -14,6 +15,28 @@ from yt_dlp.utils import DownloadError
 from yt_dlp.networking.exceptions import TransportError
 
 _ACTIVE_PROCS = set()
+_cancel_requested = False
+_cancel_lock = threading.Lock()
+
+
+def request_cancel():
+    """Set the cooperative cancellation flag; long-running loops stop spawning work."""
+    global _cancel_requested
+    with _cancel_lock:
+        _cancel_requested = True
+
+
+def cancel_clear():
+    """Clear the cooperative cancellation flag for a fresh run."""
+    global _cancel_requested
+    with _cancel_lock:
+        _cancel_requested = False
+
+
+def cancel_pending():
+    """Whether a cancel was requested (thread-safe read)."""
+    with _cancel_lock:
+        return _cancel_requested
 
 
 class InsufficientDiskSpaceError(RuntimeError):
@@ -102,8 +125,47 @@ def run_tracked(cmd, timeout=None, text=False):
         opts['creationflags'] = 0x08000000
     p = subprocess.Popen(cmd, **opts)
     _ACTIVE_PROCS.add(p)
+    started_at = time.monotonic()
     try:
-        out, err = p.communicate(timeout=timeout)
+        if not hasattr(p, "poll"):
+            # 无 poll 的测试替身（FakeProcess）：communicate 语义保持不变，
+            # 避免在轮询里 read 消耗掉替身的有限输出流。
+            out, err = p.communicate(timeout=timeout)
+        else:
+            # communicate() 是 C 层阻塞，KThread.terminate 的 SystemExit 无法中断它，
+            # 导致取消后线程仍卡在这里、compile 继续排队。改为轮询等待进程退出，
+            # 期间检查全局取消标志：一旦取消立即 kill 子进程并清空输出管道。
+            out_buf = []
+            err_buf = []
+            while True:
+                if cancel_pending():
+                    p.kill()
+                try:
+                    chunk_out = p.stdout.read(65536)
+                except Exception:
+                    chunk_out = b""
+                if chunk_out:
+                    out_buf.append(chunk_out)
+                else:
+                    try:
+                        chunk_err = p.stderr.read(65536)
+                    except Exception:
+                        chunk_err = b""
+                    if chunk_err:
+                        err_buf.append(chunk_err)
+                if p.poll() is not None:
+                    break
+                if timeout is not None and time.monotonic() - started_at > timeout:
+                    p.kill()
+                    try:
+                        p.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                time.sleep(0.02)
+            p.wait()
+            out = b"".join(out_buf)
+            err = b"".join(err_buf)
     except subprocess.TimeoutExpired:
         p.kill()
         try:
@@ -153,6 +215,8 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
                                             progress_callback, started_at,
                                             timeout, stall_timeout, command)
         while True:
+            if cancel_pending():
+                p.kill()
             line = p.stdout.readline()
             if line:
                 text_line = line.decode("utf-8", errors="replace").strip()

@@ -419,6 +419,8 @@ def fetch_audio_cache(
     log_func: Callable[[str], Any] | None = None,
     refresh_func: Callable[[MediaSource], MediaSource | None] | None = None,
     progress_callback: Callable[[dict[str, Any]], Any] | None = None,
+    prefetch_chunk_size: int = 4 * 1024 * 1024,
+    prefetch_concurrency: int = 4,
 ) -> Path:
     """Fetch one compressed audio stream, persist it, and reuse it thereafter."""
     if cache_store is None:
@@ -488,7 +490,8 @@ def fetch_audio_cache(
                 try:
                     with temporary_path.open("ab" if partial_size else "wb") as handle:
                         for chunk in iter_range_bytes(
-                            source, chunk_size=4 * 1024 * 1024, concurrency=4, logger=log,
+                            source, chunk_size=prefetch_chunk_size,
+                            concurrency=prefetch_concurrency, logger=log,
                             progress_callback=progress_callback,
                             speed_monitor=speed_monitor,
                             slow_callback=recover_slow_prefetch,
@@ -533,7 +536,8 @@ def fetch_audio_cache(
             report(f"Twitch HLS audio cache prefetch for {cache_label}")
             with transport_path.open("wb") as handle:
                 for chunk in iter_hls_bytes(
-                    source, concurrency=4, logger=log, progress_callback=progress_callback
+                    source, concurrency=prefetch_concurrency, logger=log,
+                    progress_callback=progress_callback
                 ):
                     handle.write(chunk)
                 handle.flush()
@@ -877,12 +881,22 @@ def fetch_segment(
     logger: Callable[[str], Any] | None = None,
     progress_callback: Callable[..., Any] | None = None,
     stall_timeout: float = 30,
+    max_total_duration: float = 60,
 ) -> Path:
-    """Fetch a requested remote interval, optionally reusing covering cache."""
+    """Fetch a requested remote interval, optionally reusing covering cache.
+
+    ``max_total_duration`` bounds the WHOLE segment fetch (all retries, source
+    refreshes and backoff sleeps) so a persistently-failing clip (e.g. the VOD
+    stream for that interval is missing on the CDN) is abandoned after the
+    budget instead of stalling a large compile for many minutes. A healthy
+    segment downloads in seconds; 60 s is plenty for one refresh + a few
+    fast-fail retries.
+    """
     if padding_before < 0 or padding_after < 0:
         raise ValueError("segment padding must not be negative")
     if retries < 0:
         raise ValueError("retries must not be negative")
+    _fetch_started = time.monotonic()
 
     identity = stable_source_id(source)
     padding = float(padding_before) + float(padding_after)
@@ -923,6 +937,11 @@ def fetch_segment(
     attempt = 0
     allowed_attempts = int(retries) + 1
     while attempt < allowed_attempts:
+        if time.monotonic() - _fetch_started > max_total_duration:
+            raise SegmentFetchError(
+                f"Segment fetch for {start}-{end} exceeded "
+                f"{max_total_duration:g}s budget; giving up on this clip "
+                f"(the VOD stream for this interval may be unavailable).")
         try:
             command = build_segment_command(
                 source,

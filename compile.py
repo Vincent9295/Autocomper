@@ -13,7 +13,8 @@ import tempfile
 from colorama import Fore, Style
 
 from progress import format_compile_progress
-from utils import FFMPEG_PATH, run_tracked, run_tracked_progress
+from utils import (FFMPEG_PATH, run_tracked, run_tracked_progress,
+                   cancel_pending)
 import sys
 import os
 
@@ -262,7 +263,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206
         _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
                                fps=fps, progress_callback=progress_callback,
-                               total_duration=duration)
+                               total_duration=duration, batch_size=batch_size)
     finally:
         for sf in seg_files:
             try:
@@ -580,7 +581,7 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
 
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
-                excluded=None, progress_callback=None):
+                excluded=None, progress_callback=None, batch_size=6):
     output_format = ".mp4" if is_video else ".mp3"
 
     # 同进程二次运行会复用旧路径的 probe 结果（如 _seg0.mp4 已重写），
@@ -729,6 +730,9 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), max_parallel)) as executor:
                 running = {}
                 for task in tasks:
+                    if cancel_pending():
+                        executor.shutdown(cancel_futures=True)
+                        raise InterruptedError("Compile cancelled by user.")
                     n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur, copy_cut = task
                     f = executor.submit(cut_func, fn, ts, tmp,
                                         **({'res': cr, 'fps': fps,
@@ -747,6 +751,9 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 cut_done = 0
                 cut_total = len(running)
                 for future in concurrent.futures.as_completed(running):
+                    if cancel_pending():
+                        executor.shutdown(cancel_futures=True)
+                        raise InterruptedError("Compile cancelled by user.")
                     n, fn_stripped = running[future]
                     try:
                         future.result()
@@ -775,6 +782,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         tempfiles, output, res=res, normalize=normalize, fps=fps,
                         progress_callback=progress_callback,
                         temp_dir=temp_dir, total_duration=total_duration,
+                        batch_size=batch_size,
                     )
                 else:
                     concat_func(tempfiles, output, normalize=normalize,
