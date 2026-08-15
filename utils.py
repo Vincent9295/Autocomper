@@ -119,65 +119,97 @@ def check_compile_disk_space(output_location, total_seconds, max_height=None,
 
 
 def run_tracked(cmd, timeout=None, text=False):
-    """subprocess.run 等价物，注册进程以便取消时统一终止。"""
+    """subprocess.run 等价物，注册进程以便取消时统一终止。
+
+    输出在 daemon reader 线程上读取，主循环用 ``queue.get(timeout=...)``
+    非阻塞等待——避免 FFmpeg 探测命令在 CDN 半开连接上挂起时（无输出、
+    进程不退出）永久阻塞 ``read``，使 timeout 永远不触发（曾导致 Audio
+    Cache 的 CDN 探测卡死整个批次）。
+    """
     opts = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
     if sys.platform == 'win32':
         opts['creationflags'] = 0x08000000
     p = subprocess.Popen(cmd, **opts)
     _ACTIVE_PROCS.add(p)
     started_at = time.monotonic()
-    try:
-        if not hasattr(p, "poll"):
-            # 无 poll 的测试替身（FakeProcess）：communicate 语义保持不变，
-            # 避免在轮询里 read 消耗掉替身的有限输出流。
-            out, err = p.communicate(timeout=timeout)
-        else:
-            # communicate() 是 C 层阻塞，KThread.terminate 的 SystemExit 无法中断它，
-            # 导致取消后线程仍卡在这里、compile 继续排队。改为轮询等待进程退出，
-            # 期间检查全局取消标志：一旦取消立即 kill 子进程并清空输出管道。
-            out_buf = []
-            err_buf = []
-            while True:
-                if cancel_pending():
-                    p.kill()
-                try:
-                    chunk_out = p.stdout.read(65536)
-                except Exception:
-                    chunk_out = b""
-                if chunk_out:
-                    out_buf.append(chunk_out)
-                else:
-                    try:
-                        chunk_err = p.stderr.read(65536)
-                    except Exception:
-                        chunk_err = b""
-                    if chunk_err:
-                        err_buf.append(chunk_err)
-                if p.poll() is not None:
-                    break
-                if timeout is not None and time.monotonic() - started_at > timeout:
-                    p.kill()
-                    try:
-                        p.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-                time.sleep(0.02)
-            p.wait()
-            out = b"".join(out_buf)
-            err = b"".join(err_buf)
-    except subprocess.TimeoutExpired:
-        p.kill()
+    if not hasattr(p, "poll"):
+        # 无 poll 的测试替身（FakeProcess）：communicate 语义保持不变，
+        # 避免 reader 线程消耗掉替身的有限输出流。
         try:
-            p.wait(timeout=30)
+            out, err = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            # 进程卡在驱动层调用（如睡眠唤醒后 NVENC 死锁）时 TerminateProcess
-            # 也杀不掉，wait 会永久挂起冻结整个 app。放弃僵尸进程照常报错，
-            # 让上层回退/重试，僵尸由 OS 自行回收。
-            print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
-        raise
+            p.kill()
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
+            raise
+        finally:
+            _ACTIVE_PROCS.discard(p)
+        if text:
+            out = out.decode('utf-8', errors='replace') if out is not None else None
+            err = err.decode('utf-8', errors='replace') if err is not None else None
+        return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+    import queue as _queue
+    import threading as _threading
+
+    items = _queue.Queue()
+
+    def _reader(stream, name):
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    items.put((name, None))
+                    break
+                items.put((name, chunk))
+        except BaseException as exc:  # noqa: BLE001 - surface any read error
+            items.put((name, exc))
+
+    for stream, name in ((p.stdout, "out"), (p.stderr, "err")):
+        _threading.Thread(target=_reader, args=(stream, name), daemon=True).start()
+
+    out_parts = []
+    err_parts = []
+    remaining = {"out", "err"}
+    try:
+        while True:
+            if cancel_pending():
+                p.kill()
+            try:
+                wait = None
+                if timeout is not None:
+                    wait = max(0.0, timeout - (time.monotonic() - started_at))
+                item = items.get(timeout=wait)
+            except _queue.Empty:
+                p.kill()
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            name, data = item
+            if data is None:
+                remaining.discard(name)
+            elif isinstance(data, BaseException):
+                raise data
+            else:
+                (out_parts if name == "out" else err_parts).append(data)
+            if p.poll() is not None and not remaining:
+                break
+            if timeout is not None and time.monotonic() - started_at > timeout:
+                p.kill()
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
+                raise subprocess.TimeoutExpired(cmd, timeout)
     finally:
         _ACTIVE_PROCS.discard(p)
+    p.wait()
+    out = b"".join(out_parts)
+    err = b"".join(err_parts)
     if text:
         out = out.decode('utf-8', errors='replace') if out is not None else None
         err = err.decode('utf-8', errors='replace') if err is not None else None
@@ -210,32 +242,13 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
     p = subprocess.Popen(command, **opts)
     _ACTIVE_PROCS.add(p)
     try:
-        if stall_timeout is not None and stall_timeout > 0:
-            return _run_progress_with_stall(p, state, output, duration,
-                                            progress_callback, started_at,
-                                            timeout, stall_timeout, command)
-        while True:
-            if cancel_pending():
-                p.kill()
-            line = p.stdout.readline()
-            if line:
-                text_line = line.decode("utf-8", errors="replace").strip()
-                output.append(text_line)
-                if "=" in text_line:
-                    key, value = text_line.split("=", 1)
-                    state[key] = value
-                    if key == "out_time_ms" and progress_callback is not None:
-                        try:
-                            current = float(value) / 1_000_000
-                        except ValueError:
-                            continue
-                        progress_callback(current, duration, time.monotonic() - started_at)
-            elif p.poll() is not None:
-                break
-            if timeout is not None and time.monotonic() - started_at > timeout:
-                p.kill()
-                raise subprocess.TimeoutExpired(command, timeout)
-        return subprocess.CompletedProcess(command, p.returncode, "\n".join(output), "")
+        # 无显式 stall_timeout 时也走 stall 看门狗：readline 在 reader 线程，
+        # 主循环非阻塞等待，FFmpeg 在 CDN 半开连接上挂起时（无输出）能在
+        # stall_timeout 后 kill，而不是永远阻塞 timeout 检查。
+        effective_stall = stall_timeout if (stall_timeout is not None and stall_timeout > 0) else 30
+        return _run_progress_with_stall(p, state, output, duration,
+                                        progress_callback, started_at,
+                                        timeout, effective_stall, command)
     finally:
         _ACTIVE_PROCS.discard(p)
 
