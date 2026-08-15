@@ -988,10 +988,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             fetch_kwargs = {}
             # 下载区间已在任务构建时按 padding 及相邻 clip 钳制好，
             # 这里直接以区间本身下载，不再追加 padding。
-            # 单个 clip 设 60s 总预算：某个 VOD 区间流不可用时，反复
-            # refresh/retry 会拖住整批 compile 几分钟。超预算即放弃该
-            # clip（fail_task），compile 跳过它继续，不阻塞整体。
-            fetch_kwargs["max_total_duration"] = 60
+            # 不设总时长预算：慢速但稳定产出的下载（CDN 限速）应允许完成，
+            # 否则会误杀正常 clip 导致"第一次跳过很多"；真卡死的连接由
+            # fetch_segment 的 per-attempt stall_timeout 放弃（无数据即弃）。
+            # 区间流不可用的 clip 由 retries + refresh 快速失败后跳过。
             if not is_video:
                 fetch_kwargs["audio_only"] = True
             if refresh_func is not None:
@@ -4896,6 +4896,10 @@ class VideoProcessorApp:
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
                             use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
                             refresh_func=refresh_func,
+                            select_candidate_func=(
+                                lambda source: select_audio_candidate(source, log_func=print)
+                                if isinstance(source, MediaSource) else None
+                            ),
                             progress_callback=lambda sample, upload=upload, i=i:
                                 self._queue_transfer_progress(
                                     sample,

@@ -41,6 +41,18 @@ class SegmentFetchError(RemoteMediaError):
     """A requested remote media segment could not be materialized."""
 
 
+class _CdnSwitchSignal(Exception):
+    """Internal signal: an Audio Cache download switched CDN mid-transfer and
+    the caller should resume from the already-written bytes."""
+
+
+# Audio Cache: consecutive slow samples before probing/switching CDN, and the
+# max number of CDN switches per source (avoids infinite re-probing when every
+# CDN host is slow).
+_AUDIO_CACHE_SLOW_STREAK_SWITCH = 3
+_AUDIO_CACHE_MAX_CDN_SWITCHES = 3
+
+
 _FFMPEG_DETAIL_MAX = 400
 
 
@@ -473,16 +485,46 @@ def fetch_audio_cache(
             report(f"{platform_label} audio cache prefetch for {cache_label}")
             speed_monitor = SpeedMonitor()
 
+            slow_streak = [0]
+            cdn_switches = [0]
+
             def recover_slow_prefetch(stale_source, speed):
                 report(
                     f"{platform_label} audio cache speed low ({speed:.2f} MB/s); "
                     "refreshing source before continuing"
                 )
-                if refresh_func is None:
-                    return
-                updated = refresh_func(stale_source)
-                if isinstance(updated, MediaSource) and updated is not stale_source:
-                    stale_source.__dict__.update(updated.__dict__)
+                # 先尝试刷新签名 URL（URL 过期/限流时刷新可能直接恢复）。
+                if refresh_func is not None:
+                    try:
+                        updated = refresh_func(stale_source)
+                        if isinstance(updated, MediaSource) and updated is not stale_source:
+                            stale_source.__dict__.update(updated.__dict__)
+                    except Exception:
+                        pass
+                # 连续低速达到阈值 → 重新探测候选组并切换 CDN 节点
+                # （bilibili 的 audio_candidates 常含多个 cdn_host）。
+                # 切换成功后抛信号中断当前下载，让外层 resume 从已写字节续传，
+                # 100-500MB 的音频不从头重下。
+                slow_streak[0] += 1
+                if (slow_streak[0] >= _AUDIO_CACHE_SLOW_STREAK_SWITCH
+                        and cdn_switches[0] < _AUDIO_CACHE_MAX_CDN_SWITCHES):
+                    slow_streak[0] = 0
+                    cdn_switches[0] += 1
+                    try:
+                        chosen = select_audio_candidate(
+                            stale_source, min_realtime_speed=1.0,
+                            probe_duration=3, log_func=report)
+                        if chosen is not None:
+                            host = chosen.get("cdn_host") or chosen.get("url", "").split("/")[2] or "?"
+                            report(
+                                f"{platform_label} audio cache switched CDN "
+                                f"({cdn_switches[0]}/{_AUDIO_CACHE_MAX_CDN_SWITCHES}) "
+                                f"to {host}")
+                            raise _CdnSwitchSignal()
+                    except _CdnSwitchSignal:
+                        raise
+                    except Exception as exc:
+                        report(f"CDN switch probe failed: {type(exc).__name__}")
 
             resume_limit = 5
             for resume_attempt in range(resume_limit):
@@ -501,6 +543,14 @@ def fetch_audio_cache(
                         handle.flush()
                         os.fsync(handle.fileno())
                     break
+                except _CdnSwitchSignal:
+                    # CDN 已切换：续传（不消耗 resume_attempt 次数）
+                    if resume_attempt >= resume_limit - 1:
+                        raise
+                    report(
+                        f"{platform_label} audio cache CDN switched; "
+                        f"resuming at {partial_size} bytes"
+                    )
                 except Exception:
                     if resume_attempt >= resume_limit - 1:
                         raise
@@ -881,16 +931,17 @@ def fetch_segment(
     logger: Callable[[str], Any] | None = None,
     progress_callback: Callable[..., Any] | None = None,
     stall_timeout: float = 30,
-    max_total_duration: float = 60,
+    max_total_duration: float = 0,
 ) -> Path:
     """Fetch a requested remote interval, optionally reusing covering cache.
 
-    ``max_total_duration`` bounds the WHOLE segment fetch (all retries, source
-    refreshes and backoff sleeps) so a persistently-failing clip (e.g. the VOD
-    stream for that interval is missing on the CDN) is abandoned after the
-    budget instead of stalling a large compile for many minutes. A healthy
-    segment downloads in seconds; 60 s is plenty for one refresh + a few
-    fast-fail retries.
+    ``max_total_duration`` optionally bounds the WHOLE segment fetch (all
+    retries, source refreshes and backoff sleeps). It defaults to 0 (unbounded):
+    a clip whose download is merely slow (but steadily producing data) must be
+    allowed to finish rather than being killed by an arbitrary wall-clock
+    budget — the per-attempt ``stall_timeout`` already abandons a genuinely
+    hung connection (no data). Only a caller with a specific reason may pass a
+    positive budget.
     """
     if padding_before < 0 or padding_after < 0:
         raise ValueError("segment padding must not be negative")
@@ -937,7 +988,8 @@ def fetch_segment(
     attempt = 0
     allowed_attempts = int(retries) + 1
     while attempt < allowed_attempts:
-        if time.monotonic() - _fetch_started > max_total_duration:
+        if (max_total_duration and max_total_duration > 0
+                and time.monotonic() - _fetch_started > max_total_duration):
             raise SegmentFetchError(
                 f"Segment fetch for {start}-{end} exceeded "
                 f"{max_total_duration:g}s budget; giving up on this clip "

@@ -214,7 +214,7 @@ def _is_http_input(source) -> bool:
 def load_audio(file: str | MediaSource, sr: int, frame_count: int,
                prefetch_chunk_size=DEFAULT_CHUNK_SIZE,
                prefetch_concurrency=DEFAULT_CONCURRENCY, progress_callback=None,
-               refresh_func=None):
+               refresh_func=None, select_candidate_func=None):
     # Bilibili range responses can fail after earlier PCM has already been
     # yielded. Use the restartable direct FFmpeg path for Remote Stream.
     if (isinstance(file, MediaSource)
@@ -242,7 +242,8 @@ def load_audio(file: str | MediaSource, sr: int, frame_count: int,
         duration = _get_audio_duration(file)
         if duration is not None and duration > 0:
             yield from _load_audio_bilibili_blocks(
-                file, sr, frame_count, duration, progress_callback, refresh_func
+                file, sr, frame_count, duration, progress_callback, refresh_func,
+                select_candidate_func
             )
             return
     if isinstance(file, MediaSource) and str(file.platform).lower() == "twitch":
@@ -391,10 +392,15 @@ def _exception_in_flight() -> bool:
 
 
 def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
-                                progress_callback=None, refresh_func=None):
+                                progress_callback=None, refresh_func=None,
+                                select_candidate_func=None):
     block_duration = frame_count / sr
     block_count = _duration_block_count(duration, block_duration)
     attempts = scaled_retry_attempts(duration)
+    # 连续失败达到阈值才切换 CDN（CDN 探测有成本，频繁探测反而触发限流）。
+    # 每次失败先 refresh（换签名），连续失败说明不是签名问题而是节点慢。
+    cdn_switches = 0
+    consecutive_failures = 0
     for index in range(block_count):
         start_time = index * block_duration
         segment_duration = min(block_duration, max(0, duration - start_time))
@@ -413,9 +419,11 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
                 for chunk_start in range(0, len(block), frame_count * 2):
                     yield bytes(block[chunk_start:chunk_start + frame_count * 2])
                 last_error = None
+                consecutive_failures = 0
                 break
             except Exception as exc:
                 last_error = exc
+                consecutive_failures += 1
                 if attempt >= attempts - 1:
                     raise
                 time.sleep(retry_backoff(attempt))
@@ -423,6 +431,17 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
                     updated = refresh_func(source)
                     if isinstance(updated, MediaSource) and updated is not source:
                         source.__dict__.update(updated.__dict__)
+                # 连续失败且仍可切换 CDN → 重新探测候选组换节点
+                if (select_candidate_func is not None
+                        and consecutive_failures >= 3
+                        and cdn_switches < 2):
+                    cdn_switches += 1
+                    consecutive_failures = 0
+                    try:
+                        select_candidate_func(source)
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "Block CDN switch probe failed: %s", str(exc))
         if last_error is not None:
             raise last_error
 
@@ -575,7 +594,8 @@ def _detection_cache_args(source, model, precision, block_size, threshold, focus
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_gpu=True, cache_store=None, progress_callback=None,
-                   refresh_func=None, save_audio_path=None):
+                   refresh_func=None, save_audio_path=None,
+                   select_candidate_func=None):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -633,6 +653,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         file, SAMPLE_RATE, SAMPLE_RATE * block_size,
         progress_callback=progress_callback if is_remote else None,
         refresh_func=refresh_func if is_remote else None,
+        select_candidate_func=select_candidate_func if is_remote else None,
     )
     _dur = _get_audio_duration(file)
     block_count = 1
