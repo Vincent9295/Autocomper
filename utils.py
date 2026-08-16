@@ -151,6 +151,43 @@ def run_tracked(cmd, timeout=None, text=False):
             err = err.decode('utf-8', errors='replace') if err is not None else None
         return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
+    if timeout is None:
+        # 快速路径（无 timeout 需求，如 reverify 本地 m4a 窗口提取）：
+        # 主线程阻塞 read —— FFmpeg 退出后管道立即 EOF，read 立刻返回，
+        # 无需 reader 线程 / queue 的固定开销。若走 reader 线程路径，
+        # Windows 上 FFmpeg 退出后子进程继承的管道句柄会让 read 不即时
+        # EOF，items.get(timeout=30) 会卡满整个 timeout（每窗口 30s 的
+        # reverify 变慢根因）。
+        out_buf = []
+        err_buf = []
+        while True:
+            if cancel_pending():
+                p.kill()
+            try:
+                chunk = p.stdout.read(65536)
+            except Exception:
+                chunk = b""
+            if chunk:
+                out_buf.append(chunk)
+            else:
+                try:
+                    chunk_err = p.stderr.read(65536)
+                except Exception:
+                    chunk_err = b""
+                if chunk_err:
+                    err_buf.append(chunk_err)
+            if p.poll() is not None:
+                break
+            time.sleep(0.02)
+        p.wait()
+        out = b"".join(out_buf)
+        err = b"".join(err_buf)
+        _ACTIVE_PROCS.discard(p)
+        if text:
+            out = out.decode('utf-8', errors='replace') if out is not None else None
+            err = err.decode('utf-8', errors='replace') if err is not None else None
+        return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
     import queue as _queue
     import threading as _threading
 
@@ -177,12 +214,23 @@ def run_tracked(cmd, timeout=None, text=False):
         while True:
             if cancel_pending():
                 p.kill()
+            exited = p.poll() is not None
             try:
-                wait = None
-                if timeout is not None:
+                # 进程已退出后只作短暂轮询：不再依赖 reader 线程的 EOF。
+                # 旧实现等 remaining 清空才 break，Windows 上 FFmpeg 可能
+                # spawn 子进程继承管道句柄 → 管道永不 EOF → reader 永久
+                # 阻塞在 read，主循环 items.get(timeout=None) 永久挂死
+                # （reverify 第一个窗口必现卡住的回归）。
+                wait = None if not exited else 0.1
+                if timeout is not None and wait is not None:
+                    wait = min(wait, max(0.0, timeout - (time.monotonic() - started_at)))
+                elif timeout is not None:
                     wait = max(0.0, timeout - (time.monotonic() - started_at))
                 item = items.get(timeout=wait)
             except _queue.Empty:
+                if p.poll() is not None:
+                    # 进程已退出但 reader 未 EOF：关闭管道唤醒后收尾。
+                    break
                 p.kill()
                 try:
                     p.wait(timeout=30)
@@ -196,7 +244,9 @@ def run_tracked(cmd, timeout=None, text=False):
                 raise data
             else:
                 (out_parts if name == "out" else err_parts).append(data)
-            if p.poll() is not None and not remaining:
+            if p.poll() is not None:
+                # 进程已退出：drain 已到达的剩余输出（reader 线程可能刚 put 完
+                # 数据还没到 EOF），再收尾。短超时保证卡住的 reader 不阻塞。
                 break
             if timeout is not None and time.monotonic() - started_at > timeout:
                 p.kill()
@@ -205,7 +255,34 @@ def run_tracked(cmd, timeout=None, text=False):
                 except subprocess.TimeoutExpired:
                     print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
                 raise subprocess.TimeoutExpired(cmd, timeout)
+        # 进程已退出：短暂 drain 剩余输出（reader 线程可能刚 put 完数据还没
+        # 到 EOF）；短超时保证卡住的 reader 永不阻塞主流程。
+        while True:
+            try:
+                item = items.get(timeout=0.1)
+            except _queue.Empty:
+                break
+            name, data = item
+            if data is None:
+                remaining.discard(name)
+                if not remaining:
+                    break
+            elif isinstance(data, BaseException):
+                raise data
+            else:
+                (out_parts if name == "out" else err_parts).append(data)
     finally:
+        # 进程已退出：关闭管道，让仍阻塞在 read 的 reader 线程立刻返回
+        # （否则 daemon reader 永久占用，且可能拖住解释器收尾）。
+        if p.poll() is not None:
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+            try:
+                p.stderr.close()
+            except Exception:
+                pass
         _ACTIVE_PROCS.discard(p)
     p.wait()
     out = b"".join(out_parts)

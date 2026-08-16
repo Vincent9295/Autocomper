@@ -51,6 +51,10 @@ class _CdnSwitchSignal(Exception):
 # CDN host is slow).
 _AUDIO_CACHE_SLOW_STREAK_SWITCH = 3
 _AUDIO_CACHE_MAX_CDN_SWITCHES = 3
+# Candidate probing: bail out of select_audio_candidate after this many
+# consecutive candidate-groups all fail to produce a speed (network/CDN
+# unhealthy) instead of wasting ~5s per probe across all candidates.
+_PROBE_MAX_FAILED_GROUPS = 2
 
 
 _FFMPEG_DETAIL_MAX = 400
@@ -263,6 +267,7 @@ def select_audio_candidate(
     index = 0
     chose = False
     chosen_candidate = None
+    probe_fail_groups = 0
     while index < len(candidates):
         candidate = candidates[index]
         group = [candidate]
@@ -288,7 +293,19 @@ def select_audio_candidate(
 
         usable = [(speed, candidate) for speed, candidate in measured if speed is not None]
         if not usable:
+            # 整组候选探测全失败（unknown/timeout/403）：连续失败说明网络或
+            # CDN 不健康，继续测剩余候选只会白等（每个超时 5s，×12 候选/源
+            # 在大批次上累计数小时）。连续 2 组失败即提前放弃探测。
+            probe_fail_groups += 1
+            if probe_fail_groups >= _PROBE_MAX_FAILED_GROUPS:
+                if log_func is not None:
+                    log_func(
+                        "CDN probe failed repeatedly; keeping the default audio "
+                        "URL (download may be slower)"
+                    )
+                break
             continue
+        probe_fail_groups = 0
         fastest_speed, fastest_candidate = max(usable, key=lambda item: item[0])
         if fastest_speed >= threshold:
             apply_audio_candidate(source, fastest_candidate)

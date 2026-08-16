@@ -724,29 +724,46 @@ def resolve_remote_uploads(
             continue
         resolved_count += 1
         source = upload.get_source()
+        was_attached = source is not None
         try:
-            if limiter is not None:
-                limiter.wait()
             if source is None:
+                # 真正需要 resolve 才受限流器控制（防 yt-dlp 412 限流）
+                if limiter is not None:
+                    limiter.wait()
                 source_url = upload.get_url() or upload.get_path()
-                if browser_cookies is None:
-                    if max_height is not None:
-                        source = resolver(source_url, max_height=max_height)
-                    else:
-                        source = resolver(source_url)
-                elif max_height is not None:
-                    source = resolver(source_url, browser_cookies=browser_cookies,
-                                      max_height=max_height)
-                else:
-                    source = resolver(source_url, browser_cookies=browser_cookies)
+                # resolve 失败重试 2 次（网络抖动/瞬时 412），仍失败才跳过
+                last_exc = None
+                for attempt in range(3):
+                    if attempt > 0:
+                        time.sleep(2.0 * attempt)
+                    try:
+                        if browser_cookies is None:
+                            if max_height is not None:
+                                source = resolver(source_url, max_height=max_height)
+                            else:
+                                source = resolver(source_url)
+                        elif max_height is not None:
+                            source = resolver(source_url, browser_cookies=browser_cookies,
+                                              max_height=max_height)
+                        else:
+                            source = resolver(source_url, browser_cookies=browser_cookies)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                if last_exc is not None:
+                    raise last_exc
             elif max_height is not None and source.max_height != max_height:
                 source = apply_video_quality_limit(source, max_height)
             upload.set_source(source)
             upload.set_path(source.display_name or source.source_url)
             remote_sources.append((upload, source))
             if logger is not None:
+                # 已 attach source（import 时 resolve 过）：标注"已解析"而非
+                # "Resolving"，避免误导用户以为每次都在重新 resolve 全部 URL。
+                verb = "Using resolved source" if was_attached else "Resolving remote source"
                 logger(
-                    f"Resolving remote source [{resolved_count}/{total_remote}]: "
+                    f"{verb} [{resolved_count}/{total_remote}]: "
                     f"{source.display_name or source.source_id or source.source_url}"
                 )
         except Exception as exc:
@@ -1678,9 +1695,16 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                     suffix='.pcm', prefix='reverify-', dir=TEMP_DIR, delete=False)
                 window_audio.close()
                 try:
+                    # 本地 m4a（cached_audio）窗口提取：run_tracked 无 timeout
+                    # 走快速路径（主线程阻塞 read，FFmpeg 退出即 EOF），避免
+                    # reader 线程路径每窗口卡满 timeout 的变慢。
+                    # -rw_timeout 兜底远程 URL 场景（加载分支 filename 未映射
+                    # 为 MediaSource 时）：FFmpeg 网络读 30s 超时，防止半开
+                    # 连接永久卡住。
                     extract_cmd = [
                         os.environ.get('FFMPEG_BINARY', 'ffmpeg'), '-y',
                         '-hide_banner', '-loglevel', 'error',
+                        '-rw_timeout', '30000000',
                         '-ss', str(ws), '-to', str(we),
                         '-i', str(scan_filename), '-vn',
                         '-f', 's16le', '-acodec', 'pcm_s16le',
@@ -4488,6 +4512,9 @@ class VideoProcessorApp:
                 print(f"{Fore.YELLOW}Cookie preflight warning: {preflight_failure}")
             max_height = convert_quality_str_to_int(self.max_quality.get())
             _resolve_limiter = ResolveLimiter()
+            # 探测限流器独立于 resolve：CDN 探测是 FFmpeg 请求，可容忍更短
+            # 间隔（1s），而 yt-dlp resolve 需要 2s 间隔防 412 限流。
+            _probe_limiter = ResolveLimiter(min_interval=1.0)
             refresh_func = LimitedRefresher(
                 lambda source: refresh_remote_source(
                     source, browser_cookies=browser_cookies
@@ -4530,7 +4557,11 @@ class VideoProcessorApp:
                             continue
                         # 逐源选择 audio candidate：只在真正缓存该源前探测，
                         # 避免开跑前对所有源一次性探测导致排尾 URL 过期。
+                        # 探测也受限流器控制：185 源 × 12 候选 = 上千次 FFmpeg
+                        # 探测请求会触发 bilibili CDN 限流（speed=unknown +
+                        # 后续 compile 全 403），串行 + 间隔能显著缓解。
                         try:
+                            _probe_limiter.wait()
                             select_audio_candidate(source, log_func=print)
                         except Exception as exc:
                             print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
@@ -4887,7 +4918,9 @@ class VideoProcessorApp:
                                 print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
                         # 逐源选择 audio candidate：只在真正检测该源前探测，
                         # 保证用的是最新解析的候选池和当时的网络状况，且 audio_url 只在读取前一刻钉死。
+                        # 探测受限流器控制，防止大批次探测触发 CDN 限流。
                         try:
+                            _probe_limiter.wait()
                             select_audio_candidate(input_video_path, log_func=print)
                         except Exception as exc:
                             print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
