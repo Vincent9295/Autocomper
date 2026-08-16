@@ -214,18 +214,15 @@ def run_tracked(cmd, timeout=None, text=False):
         while True:
             if cancel_pending():
                 p.kill()
-            exited = p.poll() is not None
             try:
-                # 进程已退出后只作短暂轮询：不再依赖 reader 线程的 EOF。
-                # 旧实现等 remaining 清空才 break，Windows 上 FFmpeg 可能
-                # spawn 子进程继承管道句柄 → 管道永不 EOF → reader 永久
-                # 阻塞在 read，主循环 items.get(timeout=None) 永久挂死
-                # （reverify 第一个窗口必现卡住的回归）。
-                wait = None if not exited else 0.1
-                if timeout is not None and wait is not None:
+                # 短轮询（0.1s）：进程退出后立即 break，不依赖 reader 线程的 EOF。
+                # 旧实现未退出时 wait = timeout（如 10s），进程快速退出但 reader
+                # EOF 有延迟（Windows 管道）时 items.get 会卡满整个 timeout——
+                # 每个 ffprobe 卡 10s（concat 前 595 个片段 → 99 分钟假死）。
+                # 短轮询下进程退出（p.poll() 非 None）在下一次迭代立即 break。
+                wait = 0.1
+                if timeout is not None:
                     wait = min(wait, max(0.0, timeout - (time.monotonic() - started_at)))
-                elif timeout is not None:
-                    wait = max(0.0, timeout - (time.monotonic() - started_at))
                 item = items.get(timeout=wait)
             except _queue.Empty:
                 if p.poll() is not None:

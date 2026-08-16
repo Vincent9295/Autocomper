@@ -1004,6 +1004,10 @@ def fetch_segment(
     refreshed = False
     attempt = 0
     allowed_attempts = int(retries) + 1
+    # 持续失败预算：只针对"反复失败无进展"的片段。慢速但稳定产出的下载
+    # 有数据（stall 不触发）不会被误杀；连续失败累计超过该秒数则放弃，
+    # 避免 materialize 卡在单个坏片段上无限 refresh 探测。
+    _fail_budget_started: float | None = None
     while attempt < allowed_attempts:
         if (max_total_duration and max_total_duration > 0
                 and time.monotonic() - _fetch_started > max_total_duration):
@@ -1069,12 +1073,23 @@ def fetch_segment(
                 from remote_cache import CacheStore
                 saver = CacheStore.save_file
             saver(destination, data)
+            _fail_budget_started = None
             return destination
         except Exception as exc:
             last_error = exc if isinstance(exc, SegmentFetchError) else SegmentFetchError(
                 f"Could not fetch remote segment {start}-{end}: "
                 f"{_sanitize_ffmpeg_detail(exc)}"
             )
+            # 持续失败预算：连续失败累计超 90s 仍无成功 → 放弃该片段。
+            # 防止单个坏片段（VOD 区间流不可用）无限 refresh 探测，拖住
+            # 整个 materialize（Addendum 17 移除总时长预算后无兜底）。
+            if _fail_budget_started is None:
+                _fail_budget_started = time.monotonic()
+            elif time.monotonic() - _fail_budget_started > 90:
+                raise SegmentFetchError(
+                    f"Segment fetch for {start}-{end} kept failing for 90s; "
+                    f"giving up on this clip (the VOD stream for this interval "
+                    f"may be unavailable).")
             if refresh_func is not None and not refreshed:
                 refreshed = True
                 try:

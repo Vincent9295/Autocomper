@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -496,6 +496,9 @@ def restore_remote_cache_path(app, selected_path, warning_func=None) -> CacheSto
 
     app.remote_cache_store = store
     app.remote_cache_path.set(str(store.root))
+    # preset 导入换缓存目录后立即刷新 size 显示，避免显示旧缓存目录的 size
+    if hasattr(app, "refresh_remote_cache_size"):
+        app.refresh_remote_cache_size()
     return store
 
 
@@ -1166,7 +1169,14 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                 executor.submit(fetch_task, task): (task[0], task[1])
                 for task in submit_tasks
             }
-            for future in futures:
+            # 停滞检测：某些远程片段反复下载失败且 refresh 探测耗时较长时，
+            # completed 长时间不增长。每 120s 检查一次，若无进展则打印一次
+            # 已收集的失败摘要（Could not fetch ... interval X-Y: <error>），
+            # 让用户能看到卡在哪、为什么失败，而不刷屏（仅停滞时打印一次）。
+            _last_stall_check = time.monotonic()
+            _last_completed = 0
+            _stall_notified = False
+            for future in as_completed(futures):
                 key = futures[future]
                 try:
                     result = future.result()
@@ -1174,6 +1184,25 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                     result = None
                 if result is not None:
                     results_by_task[key] = result
+                # 停滞检测：completed 已含成功+失败。若 120s 无任何进展，
+                # 打印已记录的失败摘要（这些失败正在被 refresh 重试或已静默记录）。
+                now = time.monotonic()
+                with completed_lock:
+                    current = state["completed"]
+                if now - _last_stall_check >= 120.0:
+                    _last_stall_check = now
+                    if current == _last_completed and not _stall_notified:
+                        _stall_notified = True
+                        print(
+                            f"{Fore.YELLOW}No remote clip progress for 120s "
+                            f"({current}/{state['total']} clips finished). "
+                            f"Some clips may be repeatedly failing:")
+                        for msg in list(failures)[-10:]:
+                            print(f"{Fore.YELLOW}  {msg}{Style.RESET_ALL}")
+                    _last_completed = current
+                elif current != _last_completed:
+                    _last_completed = current
+                    _stall_notified = False
 
     materialized = []
     for kind, payload in result_plan:
@@ -4820,20 +4849,23 @@ class VideoProcessorApp:
                         remote_temp,
                         _total_clip_seconds(dict_list, padding),
                         convert_quality_str_to_int(self.max_quality.get()))
-                    # 检测可能已耗时 1-3 小时：compile 前对所有远程源做一次前瞻刷新，
+                    # 检测可能已耗时 1-3 小时：compile 前对过期远程源做一次前瞻刷新，
                     # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
-                    # 不依赖 resolved_at 阈值：bilibili 签名 URL 的 deadline 可能远早于
-                    # 30 分钟阈值判断（尤其 Audio Cache 大批次 + reverify 拖长流程后），
-                    # 旧 URL 会直接 403。无条件刷新，靠 LimitedRefresher 限流器控节奏。
-                    # 逐源刷新每源至少间隔 2s，88 个源可能耗时数分钟——一次性首尾
-                    # 提示让用户知道程序在刷新而非卡死，避免逐源打印刷屏。
+                    # 只刷新 resolved_at 超过阈值（30 分钟）的源：若 URL 刚 resolve
+                    # （如 import 后立即加载 timestamps → compile，未跑长流程），跳过
+                    # 刷新纯省时间（与 materialize 内部 stale 判断一致，避免重复刷新）。
                     _remote_sources = [e.get('filename') for e in dict_list
                                        if isinstance(e.get('filename'), MediaSource)]
-                    if _remote_sources:
+                    _stale_sources = []
+                    for source in _remote_sources:
+                        resolved_at = getattr(source, "resolved_at", None)
+                        if resolved_at is None or time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD:
+                            _stale_sources.append(source)
+                    if _stale_sources:
                         _label = "VODs" if self.is_video else "Videos"
-                        print(f"{Fore.CYAN}Refreshing {len(_remote_sources)} {_label} "
+                        print(f"{Fore.CYAN}Refreshing {len(_stale_sources)} {_label} "
                               f"source(s), please be patient...")
-                        for source in _remote_sources:
+                        for source in _stale_sources:
                             try:
                                 updated = refresh_func(source)
                                 if isinstance(updated, MediaSource) and updated is not source:
@@ -4841,6 +4873,8 @@ class VideoProcessorApp:
                             except Exception as exc:
                                 print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
                         print(f"{Fore.GREEN}Source refresh complete, continuing to compile...")
+                    else:
+                        print(f"{Fore.GREEN}All remote sources freshly resolved; skipping refresh, continuing to compile...")
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
                         remote_failure_records = []
