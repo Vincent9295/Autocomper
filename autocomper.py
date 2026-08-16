@@ -551,6 +551,14 @@ REMOTE_REFRESH_THRESHOLD = 1800.0
 # 预览前，若源已超过该秒数（5 分钟）未刷新则主动重新解析，避免用过期的
 # signed URL 拉预览段导致 403。
 PREVIEW_REFRESH_THRESHOLD = 300.0
+# 预览下载预算：单个 ffmpeg 抓取（timeout）与整个 fetch（max_total_duration，
+# 含 refresh/重试）都限定在该秒数内。坏网络/慢 CDN 下预览会在 ~90s 内明确
+# 报错，而不是卡满 600s × 多次重试的十几分钟假死。
+PREVIEW_FETCH_BUDGET = 90.0
+# 预览段抓取的 stall 看门狗：ffmpeg 连续该秒数无任何输出（CDN 半开连接）即杀进程。
+PREVIEW_STALL_TIMEOUT = 30.0
+# 预览进度标签的刷新间隔（秒），避免每行 out_time_ms 都刷一次 UI。
+PREVIEW_PROGRESS_INTERVAL = 2.0
 # Reverify 扫描的置信度下限：主检测 threshold 很低（0.2-0.5）时，threshold*0.6
 # 会跌进 98% 假阳率的噪声带（实测 <0.5 置信度 98% 是 FP）。加一个独立下限，
 # reverify 只补充"清晰可辨的 argmax burp"，不把噪声当新 clip。
@@ -1923,6 +1931,8 @@ class ReviewDialog:
         if suspect_count > 0:
             t += f"  |  Suspect: {suspect_count}"
         ttk.Label(info_frame, text=t).pack(side=tk.LEFT)
+        self._preview_status = ttk.Label(info_frame, text="", foreground='#4caf50')
+        self._preview_status.pack(side=tk.LEFT, padx=12)
         ttk.Label(info_frame,
                   text="Right-click for preview  |  Click row to toggle",
                   foreground='gray').pack(side=tk.RIGHT)
@@ -2003,7 +2013,9 @@ class ReviewDialog:
         CustomHovertip(
             self.tree,
             "Right-click: Play Audio / Open Video Clip\n"
-            "Remote clips must download first (may pause briefly)",
+            "Audio Cache: audio preview is instant (reads cached audio).\n"
+            "Remote Stream: audio preview re-downloads each time.\n"
+            "Video preview always downloads from the source.",
         )
 
         bf = ttk.Frame(self.win)
@@ -2117,6 +2129,55 @@ class ReviewDialog:
         if idx is not None:
             self._preview(idx, video=True)
 
+    def _set_preview_status(self, text):
+        status = getattr(self, '_preview_status', None)
+        if status is None:
+            return
+        try:
+            status.config(text=text)
+            self.win.update_idletasks()
+        except Exception:
+            pass
+
+    def _preview_progress_cb(self):
+        last = [0.0]
+
+        def cb(current, total, elapsed):
+            now = time.monotonic()
+            if now - last[0] < PREVIEW_PROGRESS_INTERVAL:
+                return
+            last[0] = now
+            if total:
+                self._set_preview_status(
+                    f"Downloading preview... {current:.1f}s / {total:.1f}s")
+            else:
+                self._set_preview_status(
+                    f"Downloading preview... {current:.1f}s")
+
+        return cb
+
+    def _extract_and_open(self, src_path, ss, dur, video, tmp_path):
+        """从本地文件/缓存音频切出预览窗口并打开播放器。"""
+        ff = os.environ.get('FFMPEG_BINARY', 'ffmpeg')
+        if video:
+            cmd = ([ff, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', str(ss), '-t', str(dur), '-i', str(src_path)]
+                   + get_video_codec() +
+                   ['-c:a', 'aac', '-b:a', '128k', tmp_path])
+        else:
+            cmd = [ff, '-y', '-hide_banner', '-loglevel', 'error',
+                   '-ss', str(ss), '-t', str(dur), '-i', str(src_path),
+                   '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
+                   tmp_path]
+        run_tracked(cmd, timeout=30)
+        if sys.platform == 'win32':
+            os.startfile(tmp_path)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', tmp_path])
+        else:
+            subprocess.Popen(['xdg-open', tmp_path])
+        getattr(self, '_preview_paths', []).append(tmp_path)
+
     def _preview(self, idx, video):
         f = self.flat[idx]
         bf, af = self.padding
@@ -2156,19 +2217,39 @@ class ReviewDialog:
                         print(f"Preview source refreshed ({source.display_name})")
                     except Exception as exc:
                         print(f"{Fore.YELLOW}Preview source refresh failed: {exc}")
-                fetch_result = fetch_segment(
-                    f['filename'], ss, ss + dur, tmp.name,
-                    cache_store=cache_store, allow_covering_cache=False,
-                    audio_only=not video,
-                    codec='pcm_s16le' if not video else None,
-                    refresh_func=lambda source: refresh_remote_source(
-                        source,
-                        browser_cookies=browser_cookie_setting_value(
-                            _bc_label,
-                            cookies_file=_cf_path,
+                # 音频预览优先读本地整段音频（Audio Cache 模式）：零 CDN、零限流，
+                # 改时间也从本地缓存直接切窗口。未命中（Remote Stream / 无缓存）
+                # 才回退 fetch_segment 打 CDN。
+                if not video:
+                    local_audio = None
+                    try:
+                        local_audio = resolve_cached_audio(source, cache_store)
+                    except Exception:
+                        local_audio = None
+                    if local_audio is not None and Path(local_audio).is_file():
+                        self._extract_and_open(local_audio, ss, dur, False, tmp.name)
+                        return
+                self._set_preview_status("Downloading preview...")
+                try:
+                    fetch_result = fetch_segment(
+                        f['filename'], ss, ss + dur, tmp.name,
+                        cache_store=cache_store, allow_covering_cache=False,
+                        audio_only=not video,
+                        codec='pcm_s16le' if not video else None,
+                        refresh_func=lambda source: refresh_remote_source(
+                            source,
+                            browser_cookies=browser_cookie_setting_value(
+                                _bc_label,
+                                cookies_file=_cf_path,
+                            ),
                         ),
-                    ),
-                    logger=print)
+                        logger=print,
+                        timeout=PREVIEW_FETCH_BUDGET,
+                        max_total_duration=PREVIEW_FETCH_BUDGET,
+                        stall_timeout=PREVIEW_STALL_TIMEOUT,
+                        progress_callback=self._preview_progress_cb())
+                finally:
+                    self._set_preview_status("")
                 playable = preview_playable_path(fetch_result, tmp.name)
                 if sys.platform == 'win32':
                     os.startfile(playable)
@@ -2181,25 +2262,7 @@ class ReviewDialog:
                 else:
                     Path(tmp.name).unlink(missing_ok=True)
                 return
-            ff = os.environ.get('FFMPEG_BINARY', 'ffmpeg')
-            if video:
-                cmd = ([ff, '-y', '-hide_banner', '-loglevel', 'error',
-                        '-ss', str(ss), '-t', str(dur), '-i', f['filename']]
-                       + get_video_codec() +
-                       ['-c:a', 'aac', '-b:a', '128k', tmp.name])
-            else:
-                cmd = [ff, '-y', '-hide_banner', '-loglevel', 'error',
-                       '-ss', str(ss), '-t', str(dur), '-i', f['filename'],
-                       '-vn', '-acodec', 'pcm_s16le', '-ar', '32000', '-ac', '1',
-                       tmp.name]
-            run_tracked(cmd, timeout=30)
-            if sys.platform == 'win32':
-                os.startfile(tmp.name)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', tmp.name])
-            else:
-                subprocess.Popen(['xdg-open', tmp.name])
-            getattr(self, '_preview_paths', []).append(tmp.name)
+            self._extract_and_open(f['filename'], ss, dur, video, tmp.name)
         except Exception as e:
             if tmp_path:
                 Path(tmp_path).unlink(missing_ok=True)
@@ -2989,7 +3052,10 @@ class VideoProcessorApp:
             'With Re-verify enabled, Remote Stream mode re-downloads the small window around each clip for the scan.\n'
             'Audio Cache mode keeps the stored audio and reuses it for the scan, so nothing extra is downloaded.')
         review_tooltip = CustomHovertip(
-            self.review_checkbox, 'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.')
+            self.review_checkbox,
+            'Before compiling, open a dialog to preview, check/uncheck, and edit each clip individually.\n\n'
+            'Audio preview: Audio Cache mode reads the cached audio instantly (no download).\n'
+            'Remote Stream mode re-downloads the window each time. Video preview always downloads.')
         strict_fp_tooltip = CustomHovertip(
             self.strict_fp_checkbox, 'Drop clips where another sound class (speech/scream/etc.) scores higher than burp.\nReduces false positives for noisy streamers, but may rarely miss real burps mixed with loud talking.\nSuspect clips are also shown pre-deselected in Review regardless of this option.')
         skip_auto_tooltip = CustomHovertip(

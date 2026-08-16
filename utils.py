@@ -228,12 +228,19 @@ def run_tracked(cmd, timeout=None, text=False):
                 if p.poll() is not None:
                     # 进程已退出但 reader 未 EOF：关闭管道唤醒后收尾。
                     break
-                p.kill()
-                try:
-                    p.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
-                raise subprocess.TimeoutExpired(cmd, timeout)
+                if timeout is not None and time.monotonic() - started_at >= timeout:
+                    # 真实超时：到点仍无输出且进程未退出才杀。
+                    p.kill()
+                    try:
+                        p.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                # 进程仍在运行且未到 timeout：继续短轮询等待。0.1s 内无输出不
+                # 代表挂起——NVENC 探测等命令全程无输出且需 >0.1s 才退出，
+                # 这里直接 kill 会误判超时（曾导致 NVENC 探测 0.17s 被误杀、
+                # 编译回退 x264）。
+                continue
             name, data = item
             if data is None:
                 remaining.discard(name)
