@@ -570,6 +570,13 @@ REVERIFY_MARGIN = 1.15
 # 低于该值说明 clip 区间内几乎是静音——模型不靠静音也能给 58 分，但该 clip
 # 在成片里就是"没有声音"的假阳。直接砍掉。
 REVERIFY_ENERGY_FLOOR = 0.01
+# Reverify 合并 original vs new 时的两条几何规则阈值（整秒，避免亚秒误差误判）：
+# _REVERIFY_NEAR_TIE_EPS：部分重叠时，new 只比 original 长 ≤1s 视为近等长，
+#   保留 original（防止 reverify 把边界轻微移位就顶掉已检测好的 clip）；
+# _REVERIFY_ADJ_GAP：original 与 new 相邻（间隔 ≤1s）时合并成一个 union clip，
+#   而不是二选一（避免相邻片段被丢弃/重复）。
+_REVERIFY_NEAR_TIE_EPS = 1.0
+_REVERIFY_ADJ_GAP = 1.0
 
 
 def ensure_temp_dir():
@@ -1328,8 +1335,8 @@ def _resolve_txt_paths(output_video_path, configured_txt):
     """Resolve the base timestamps path for a processing session.
 
     Priority: 设置里自定义的 txt 名 > combine 影片名（去扩展名 + _timestamps.txt）
-    > 默认 <输出目录>/timestamps.txt。_reverified.txt / _selected.txt 都从该
-    base 派生，保证三个文件共享同一个基准名。
+    > 默认 <输出目录>/timestamps.txt。检测、reverify、review 都写回同一个
+    base 文件（reverify 保留 [new] 标记），避免派生文件在输出目录越积越多。
     """
     if configured_txt and configured_txt != "No file selected!":
         return configured_txt
@@ -1342,22 +1349,24 @@ def _resolve_txt_paths(output_video_path, configured_txt):
 
 
 def _save_selected_txt(dict_list, txt_path):
-    """保存审核后勾选的片段到 {原名}_selected.txt（与 timestamps.txt 同目录）。"""
+    """保存审核后勾选的片段到 timestamps 基础文件（与检测/reverify 同一文件，
+    仅含用户勾选的片段）。"""
     if not txt_path or txt_path == "No file selected!" or not dict_list:
         return
     try:
-        selected_path = txt_path.rsplit('.txt', 1)[0] + '_selected.txt'
+        selected_path = txt_path
         with open(selected_path, 'w', encoding='utf-8') as f:
             for entry in dict_list:
                 f.write(f"{get_source_persistence_name(entry['filename'])}\n")
                 for ts in entry['timestamps']:
                     s = convert_seconds_to_timestamp(ts['start'])
                     e = convert_seconds_to_timestamp(ts['end'])
-                    f.write(f"{s} - {e}, confidence: {ts['pred']}\n")
+                    marker = " [new]" if ts.get('source') == 'new' else ""
+                    f.write(f"{s} - {e}, confidence: {ts['pred']}{marker}\n")
                 f.write("\n")
         print(f"{Fore.GREEN}Saved selected clips to {selected_path}")
     except Exception as e:
-        print(f"{Fore.YELLOW}Could not save _selected.txt: {e}")
+        print(f"{Fore.YELLOW}Could not save selected timestamps: {e}")
 
 
 def _write_timestamps_txt(dict_list, txt_path):
@@ -1416,7 +1425,7 @@ def _parse_timestamps_txt(txt_path):
                 s = int(h1) * 3600 + int(m1) * 60 + int(s1)
                 e = int(h2) * 3600 + int(m2) * 60 + int(s2)
                 ts = {'start': s, 'end': e, 'pred': float(conf)}
-                # 保留 reverify 的 "[new]" 标记：加载 _reverified.txt 后
+                # 保留 reverify 的 "[new]" 标记：加载同一个 timestamps 基础文件后
                 # ReviewDialog 才能正确显示 New/Original 并做 auto-deselect。
                 if '[new]' in line:
                     ts['source'] = 'new'
@@ -1508,28 +1517,57 @@ def _merge_reverify_timestamps(timestamps):
                 merged.append(ts)
         return merged
 
+    def resolve_pair(a, b):
+        """Resolve two connected clips where a.start <= b.start.
+
+        Cross-source (original vs new) uses coverage/adjacency rules so a
+        reverify re-detection can never shift a good original's boundary worse:
+        - new fully covers original -> keep new (superset refinement)
+        - adjacent (new.start >= orig.end, within gap) -> merge into one union
+        - partial overlap -> keep the longer; near-tie (<=1s) -> keep original
+        Same-source pairs keep the legacy "longer wins" behaviour.
+        Returns the clip to keep (a, b, or a merged dict).
+        """
+        a_orig = a.get('source') == 'original'
+        b_orig = b.get('source') == 'original'
+        if a_orig != b_orig:
+            orig, new = (a, b) if a_orig else (b, a)
+            if new['start'] <= orig['start'] and new['end'] >= orig['end']:
+                return new
+            if new['start'] >= orig['end']:
+                merged = dict(new)
+                merged['start'] = min(orig['start'], new['start'])
+                merged['end'] = max(orig['end'], new['end'])
+                merged['pred'] = max(orig.get('pred', 0), new.get('pred', 0))
+                merged['source'] = 'new'
+                return merged
+            d_orig = orig['end'] - orig['start']
+            d_new = new['end'] - new['start']
+            if d_new > d_orig + _REVERIFY_NEAR_TIE_EPS:
+                return new
+            return orig
+        d_a = a['end'] - a['start']
+        d_b = b['end'] - b['start']
+        return a if d_a >= d_b else b
+
     originals = merge_group([t for t in timestamps if t.get('source') == 'original'])
     news = merge_group([t for t in timestamps if t.get('source') == 'new'])
     result = originals + news
     result.sort(key=lambda item: item['start'])
-    # 反复去重直到没有相邻重叠。删除区间后必须重新检查前一个区间，
-    # 否则一次循环会漏掉删除后新暴露出的重叠（例如长 clip 与内部残留区间）。
-    changed = True
-    while changed:
-        changed = False
-        i = 0
-        while i < len(result) - 1:
-            if result[i]['end'] > result[i + 1]['start']:
-                duration_i = result[i]['end'] - result[i]['start']
-                duration_j = result[i + 1]['end'] - result[i + 1]['start']
-                # 保留更长的区间；等长时保留前一个（与历史行为一致）
-                if duration_i >= duration_j:
-                    result.pop(i + 1)
-                else:
-                    result.pop(i)
-                changed = True
-                continue
+    i = 0
+    while i < len(result) - 1:
+        a, b = result[i], result[i + 1]
+        if b['start'] > a['end'] + _REVERIFY_ADJ_GAP:
             i += 1
+            continue
+        kept = resolve_pair(a, b)
+        if kept is a:
+            result.pop(i + 1)
+        elif kept is b:
+            result.pop(i)
+        else:
+            result[i] = kept
+            result.pop(i + 1)
     return [t for t in result if t['end'] - t['start'] > 0.5]
 
 
@@ -2320,9 +2358,9 @@ class ReviewDialog:
                     }
         self.result = result
 
-        # 保存勾选的 timestamps 到 _selected.txt
+        # 保存勾选的 timestamps 到同一个基础文件（不再派生 _selected.txt）
         if self.txt_path and self.txt_path != "No file selected!":
-            selected_path = self.txt_path.rsplit('.txt', 1)[0] + '_selected.txt'
+            selected_path = self.txt_path
             lines = []
             for entry in result:
                 lines.append(get_source_persistence_name(entry['filename']))
@@ -2331,7 +2369,8 @@ class ReviewDialog:
                     e = ts['end']
                     start_str = self._fmt(s)
                     end_str = self._fmt(e)
-                    lines.append(f"{start_str} - {end_str}, confidence: {ts.get('pred', 0):.2f}")
+                    marker = " [new]" if ts.get('source') == 'new' else ""
+                    lines.append(f"{start_str} - {end_str}, confidence: {ts.get('pred', 0):.2f}{marker}")
                 lines.append('')
             if lines:
                 with open(selected_path, 'w', encoding='utf-8') as f:
@@ -4624,12 +4663,12 @@ class VideoProcessorApp:
             remote_failures = []
             if any(x.get_is_url() for x in self.uploaded_videos) and full_download:
                 self.handle_url_downloads()
-            elif any(x.get_is_url() for x in self.uploaded_videos) and resolve_remote and not audio_cache:
+            elif resolve_remote and not audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
                 )
-            elif any(x.get_is_url() for x in self.uploaded_videos) and audio_cache:
+            elif audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
@@ -4872,17 +4911,14 @@ class VideoProcessorApp:
                                     continue
                             filtered.append(t)
                         entry['timestamps'] = filtered
-                    # Reverify 后生成 _reverified.txt：包含新发现的 clips（标 [new]）
-                    # 并反映 auto-deselect。仅在"勾了 reverify 且未勾 Review"时生成：
-                    # 勾了 Review 时由 ReviewDialog 写 _selected.txt，避免文件冗余。
-                    # timestamps.txt 保留纯检测/加载结果，不被 reverify 覆盖。
-                    # 派生文件统一基于影片名基准 base_txt（而非加载到的源文件），
-                    # 保证 {影片名}_timestamps_reverified.txt 命名符合用户预期。
+                    # Reverify 后写回同一个 timestamps 基础文件（保留 [new] 标记），
+                    # 避免 _reverified.txt 等派生文件在输出目录里越积越多。
+                    # 仅在"勾了 reverify 且未勾 Review"时写：勾了 Review 时由
+                    # ReviewDialog 同样写回基础文件（仅勾选片段）。
                     if self.use_verify.get() and save_timestamps and not self.use_review.get():
-                        rev_path = base_txt.rsplit('.txt', 1)[0] + '_reverified.txt'
-                        if _write_timestamps_txt(dict_list, rev_path):
+                        if _write_timestamps_txt(dict_list, base_txt):
                             print(
-                                f"{Fore.GREEN}Saved re-verified timestamps to {rev_path}!")
+                                f"{Fore.GREEN}Saved re-verified timestamps to {base_txt}!")
                     pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                                   for e in dict_list}
                     if self.use_review.get():
@@ -5254,16 +5290,13 @@ class VideoProcessorApp:
                                 continue
                         filtered.append(t)
                     entry['timestamps'] = filtered
-                # Reverify 后生成 _reverified.txt：包含新发现的 clips（标 [new]）
-                # 并反映 auto-deselect，方便下次 review 与最终编译结果对准。
-                # 仅在"勾了 reverify 且未勾 Review"时生成：勾了 Review 时由
-                # ReviewDialog 写 _selected.txt（仅勾选片段），避免文件冗余。
-                # timestamps.txt 保留纯检测结果，不被 reverify 覆盖。
+                # Reverify 后写回同一个 timestamps 基础文件（保留 [new] 标记），
+                # 避免 _reverified.txt 等派生文件越积越多。仅在"勾了 reverify 且
+                # 未勾 Review"时写：勾了 Review 时由 ReviewDialog 写回基础文件。
                 if self.use_verify.get() and save_timestamps and not self.use_review.get():
-                    rev_path = txt_path.rsplit('.txt', 1)[0] + '_reverified.txt'
-                    if _write_timestamps_txt(dict_list, rev_path):
+                    if _write_timestamps_txt(dict_list, txt_path):
                         print(
-                            f"{Fore.GREEN}Saved re-verified timestamps to {rev_path}!")
+                            f"{Fore.GREEN}Saved re-verified timestamps to {txt_path}!")
                 pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                               for e in dict_list}
                 if self.use_review.get():
