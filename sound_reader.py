@@ -290,6 +290,42 @@ def _subprocess_options():
     return subprocess_options
 
 
+class AudioDecodeError(subprocess.CalledProcessError):
+    """FFmpeg exited non-zero while loading audio; carries the exit code and a
+    stderr tail so the caller can see the real reason (403 / timeout / crash)."""
+
+    def __str__(self):
+        tail = getattr(self, "stderr", None)
+        extra = ""
+        if tail:
+            text = tail[-1024:] if isinstance(tail, bytes) else str(tail)[-1024:]
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="replace")
+            extra = f"\n  ffmpeg stderr tail: {text.strip()}"
+        return f"ffmpeg exited with status {self.returncode} while loading audio{extra}"
+
+
+def _read_process_stderr(process, max_bytes=2048):
+    """Collect up to ``max_bytes`` of process stderr without risking a hang
+    (on Windows a grandchild holding the pipe handle can delay EOF)."""
+    parts = []
+
+    def _collect():
+        try:
+            while True:
+                chunk = process.stderr.read(65536)
+                if not chunk:
+                    break
+                parts.append(chunk)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_collect, daemon=True)
+    thread.start()
+    thread.join(timeout=2)
+    return b"".join(parts)[-max_bytes:]
+
+
 def _load_audio_direct(file, sr, frame_count, start_time=None, duration=None,
                        stall_timeout=None):
     cmd = build_audio_command(
@@ -300,14 +336,14 @@ def _load_audio_direct(file, sr, frame_count, start_time=None, duration=None,
     register_proc(process)
     try:
         if stall_timeout is not None and stall_timeout > 0:
-            yield from _read_audio_with_stall(process, chunk_size, stall_timeout)
+            yield from _read_audio_with_stall(process, chunk_size, stall_timeout, cmd)
         else:
-            yield from _read_audio_plain(process, chunk_size)
+            yield from _read_audio_plain(process, chunk_size, cmd)
     finally:
         unregister_proc(process)
 
 
-def _read_audio_plain(process, chunk_size):
+def _read_audio_plain(process, chunk_size, cmd):
     try:
         while True:
             chunk = process.stdout.read(chunk_size)
@@ -321,12 +357,10 @@ def _read_audio_plain(process, chunk_size):
     process.stdout.close()
     return_code = process.wait()
     if return_code:
-        if process.returncode != 0:
-            raise Exception("Failed to process the file. Either the file does not exist or is corrupted.")
-        raise subprocess.CalledProcessError(return_code, [])
+        raise AudioDecodeError(return_code, cmd, stderr=_read_process_stderr(process))
 
 
-def _read_audio_with_stall(process, chunk_size, stall_timeout):
+def _read_audio_with_stall(process, chunk_size, stall_timeout, cmd):
     """Read FFmpeg stdout with a no-data stall watchdog.
 
     If no bytes arrive within ``stall_timeout`` seconds the process is killed
@@ -383,7 +417,7 @@ def _read_audio_with_stall(process, chunk_size, stall_timeout):
             return
         return_code = process.wait()
         if return_code and not _exception_in_flight():
-            raise subprocess.CalledProcessError(return_code, [])
+            raise AudioDecodeError(return_code, cmd, stderr=_read_process_stderr(process))
 
 
 def _exception_in_flight() -> bool:

@@ -195,12 +195,27 @@ def apply_audio_candidate(source: MediaSource, candidate: Mapping[str, Any]) -> 
     return source
 
 
+def _probe_failure_detail(result_or_exc) -> str:
+    """Return a concise failure detail (returncode + stderr tail) for a probe."""
+    rc = getattr(result_or_exc, "returncode", None)
+    stderr = getattr(result_or_exc, "stderr", None) or ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    lines = [str(line).strip() for line in str(stderr).splitlines() if str(line).strip()]
+    tail = "\n".join(lines[-3:])[-300:]
+    detail = f"rc={rc}" if rc is not None else type(result_or_exc).__name__
+    if tail:
+        detail += f" stderr={tail}"
+    return detail
+
+
 def probe_audio_candidate(
     source: MediaSource,
     candidate: Mapping[str, Any],
     duration: float = 3,
     timeout: float = 5,
     run_func: Callable[..., Any] | None = None,
+    log_func: Callable[[str], Any] | None = None,
 ) -> float | None:
     """Probe a bounded portion of an audio candidate and return FFmpeg speed.
 
@@ -229,11 +244,15 @@ def probe_audio_candidate(
     runner = run_func or run_tracked
     try:
         result = runner(command, timeout=timeout_value, text=True)
-    except Exception:
+    except Exception as exc:
+        if log_func is not None:
+            log_func(f"Audio probe failed ({_probe_failure_detail(exc)}); skipping candidate")
         return None
     if isinstance(result, (int, float)):
         return float(result)
     if getattr(result, "returncode", 0) not in (0, None):
+        if log_func is not None:
+            log_func(f"Audio probe failed ({_probe_failure_detail(result)}); skipping candidate")
         return None
     output = "\n".join(str(value or "") for value in (
         getattr(result, "stderr", ""), getattr(result, "stdout", "")
@@ -258,6 +277,13 @@ def select_audio_candidate(
     one for the whole batch.
     """
     candidates = list(source.audio_candidates or [])
+    if str(source.platform or "").strip().lower() not in {"bilibili", "bilibiliweb"}:
+        # audio_candidates 对非 Bilibili 只是不同码率的音频格式，不是 CDN 镜像；
+        # 对它们做"速度探测 + 选路"毫无意义，还可能凭空多打几次 CDN 请求
+        # （YouTube 每个格式一次探测），并产生误导性的 "CDN probe failed
+        # repeatedly"。CDN 候选切换（apply_audio_candidate 改 audio_url）只对
+        # Bilibili 的多 CDN 候选有效。
+        return None
     if not candidates:
         return None
     try:
@@ -281,7 +307,9 @@ def select_audio_candidate(
 
         measured = []
         for candidate in group:
-            speed = probe_audio_candidate(source, candidate, duration=probe_duration, run_func=run_func)
+            speed = probe_audio_candidate(
+                source, candidate, duration=probe_duration, run_func=run_func,
+                log_func=log_func)
             measured.append((speed, candidate))
             if log_func is not None:
                 format_id = candidate.get("format_id") or "unknown"
