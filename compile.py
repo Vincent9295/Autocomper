@@ -161,7 +161,7 @@ def _fallback_to_x264():
 
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 fps=None, preserve_duration=False, progress_callback=None,
-                duration=None, copy_cut=False):
+                duration=None, copy_cut=False, batch_size=6):
     if not timestamps:
         return False
 
@@ -739,6 +739,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                                             'preserve_duration': preserve_duration,
                                             'duration': dur,
                                             'copy_cut': copy_cut,
+                                            'batch_size': batch_size,
                                             'progress_callback': progress_callback}
                                             if is_video else {}),
                                        normalize=normalize,
