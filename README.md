@@ -17,14 +17,14 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Edit Times** | Double-click any row in the review dialog to manually adjust start/end times (HH:MM:SS or seconds). |
 | **Re-verify Clips** | DRC scan near each clip to find missed sounds. Threshold syncs to main detection. New/original clips shown separately. High-score DRC hits skip P3 confirmation. |
 | **Add Folder** | Recursively scan a folder for video/audio files — no need to pick files one by one. |
-| **Save Selected** | Review dialog exports checked clips to `{original}_selected.txt` for future re-use. |
+| **Save Selected** | Review dialog exports the checked clips back to a fixed `timestamps_selected.txt` (overwritten each run) for future re-use. |
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat. |
 | **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
 | **Remote VOD Processing** | Process Bilibili, YouTube, and Twitch VODs from remote audio; fetch only selected video segments. |
 | **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
 | **Compile Progress Monitoring** | Live remote clip preparation, FFmpeg encoding progress, merge progress, speed, and ETA. |
 | **Max Download Concurrency** | Control how many remote clips are fetched at once while preparing a compilation (default 5). |
-| **Video-Name Timestamps** | Timestamps files now derive from your output video name — e.g. `myvideo_timestamps.txt`, `myvideo_timestamps_reverified.txt`, `myvideo_timestamps_selected.txt` — so detection, re-verify, and review selections stay grouped together. |
+| **Fixed Timestamps Files** | Timestamps are always saved as fixed names — `timestamps.txt` (detection), with re-verify writing `timestamps_reverified.txt` and review writing `timestamps_selected.txt`. Each is overwritten per run, so nothing piles up across videos. |
 | **Merge Batch Size** | Adjust how many clips each FFmpeg merge batch combines before the final concat. Lower it for laptops/weak CPUs; higher is faster on strong machines. |
 | **Improved UI** | Scrollable settings panel, stable Settings layout, clearer remote clip progress, and repositioned tooltips. |
 

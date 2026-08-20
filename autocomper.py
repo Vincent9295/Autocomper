@@ -1334,27 +1334,32 @@ def convert_seconds_to_timestamp(seconds: float) -> str:
 def _resolve_txt_paths(output_video_path, configured_txt):
     """Resolve the base timestamps path for a processing session.
 
-    Priority: 设置里自定义的 txt 名 > combine 影片名（去扩展名 + _timestamps.txt）
-    > 默认 <输出目录>/timestamps.txt。检测、reverify、review 都写回同一个
-    base 文件（reverify 保留 [new] 标记），避免派生文件在输出目录越积越多。
+    Priority: 设置里自定义的 txt 名 > 默认 <输出目录>/timestamps.txt。
+    检测写入 base 文件；reverify/review 写入派生的固定文件名
+    （timestamps_reverified.txt / timestamps_selected.txt），每次覆盖，
+    不按影片名命名，避免文件在输出目录里越积越多。
     """
     if configured_txt and configured_txt != "No file selected!":
         return configured_txt
-    if output_video_path and not os.path.isdir(output_video_path):
-        base = os.path.splitext(str(output_video_path))[0]
-        return base + "_timestamps.txt"
+    output_video_path = output_video_path or "."
     folder = (output_video_path if os.path.isdir(output_video_path)
               else os.path.dirname(output_video_path))
     return os.path.join(folder, "timestamps.txt")
 
 
+def _txt_suffixed_path(txt_path, suffix):
+    """Derive a fixed-suffix timestamps path (e.g. timestamps_reverified.txt)."""
+    root, _ext = os.path.splitext(str(txt_path) or "")
+    return root + suffix + ".txt"
+
+
 def _save_selected_txt(dict_list, txt_path):
-    """保存审核后勾选的片段到 timestamps 基础文件（与检测/reverify 同一文件，
+    """保存审核后勾选的片段到固定的 timestamps_selected.txt（派生自 base 文件，
     仅含用户勾选的片段）。"""
     if not txt_path or txt_path == "No file selected!" or not dict_list:
         return
     try:
-        selected_path = txt_path
+        selected_path = _txt_suffixed_path(txt_path, "_selected")
         with open(selected_path, 'w', encoding='utf-8') as f:
             for entry in dict_list:
                 f.write(f"{get_source_persistence_name(entry['filename'])}\n")
@@ -2358,9 +2363,9 @@ class ReviewDialog:
                     }
         self.result = result
 
-        # 保存勾选的 timestamps 到同一个基础文件（不再派生 _selected.txt）
+        # 保存勾选的 timestamps 到固定的 timestamps_selected.txt（派生自 base）
         if self.txt_path and self.txt_path != "No file selected!":
-            selected_path = self.txt_path
+            selected_path = _txt_suffixed_path(self.txt_path, "_selected")
             lines = []
             for entry in result:
                 lines.append(get_source_persistence_name(entry['filename']))
@@ -4911,14 +4916,15 @@ class VideoProcessorApp:
                                     continue
                             filtered.append(t)
                         entry['timestamps'] = filtered
-                    # Reverify 后写回同一个 timestamps 基础文件（保留 [new] 标记），
-                    # 避免 _reverified.txt 等派生文件在输出目录里越积越多。
+                    # Reverify 后写入固定的 timestamps_reverified.txt（保留 [new] 标记），
+                    # 由 base 文件派生固定名，每次覆盖，不按影片名堆积。
                     # 仅在"勾了 reverify 且未勾 Review"时写：勾了 Review 时由
-                    # ReviewDialog 同样写回基础文件（仅勾选片段）。
+                    # ReviewDialog 写入 timestamps_selected.txt（仅勾选片段）。
                     if self.use_verify.get() and save_timestamps and not self.use_review.get():
-                        if _write_timestamps_txt(dict_list, base_txt):
+                        reverified_path = _txt_suffixed_path(base_txt, "_reverified")
+                        if _write_timestamps_txt(dict_list, reverified_path):
                             print(
-                                f"{Fore.GREEN}Saved re-verified timestamps to {base_txt}!")
+                                f"{Fore.GREEN}Saved re-verified timestamps to {reverified_path}!")
                     pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                                   for e in dict_list}
                     if self.use_review.get():
@@ -5290,13 +5296,15 @@ class VideoProcessorApp:
                                 continue
                         filtered.append(t)
                     entry['timestamps'] = filtered
-                # Reverify 后写回同一个 timestamps 基础文件（保留 [new] 标记），
-                # 避免 _reverified.txt 等派生文件越积越多。仅在"勾了 reverify 且
-                # 未勾 Review"时写：勾了 Review 时由 ReviewDialog 写回基础文件。
+                # Reverify 后写入固定的 timestamps_reverified.txt（保留 [new] 标记），
+                # 由 base 文件派生固定名，每次覆盖。仅在"勾了 reverify 且未勾
+                # Review"时写：勾了 Review 时由 ReviewDialog 写入
+                # timestamps_selected.txt（仅勾选片段）。
                 if self.use_verify.get() and save_timestamps and not self.use_review.get():
-                    if _write_timestamps_txt(dict_list, txt_path):
+                    reverified_path = _txt_suffixed_path(txt_path, "_reverified")
+                    if _write_timestamps_txt(dict_list, reverified_path):
                         print(
-                            f"{Fore.GREEN}Saved re-verified timestamps to {txt_path}!")
+                            f"{Fore.GREEN}Saved re-verified timestamps to {reverified_path}!")
                 pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                               for e in dict_list}
                 if self.use_review.get():
@@ -5319,7 +5327,7 @@ class VideoProcessorApp:
                                    if (round(iv[0], 3), round(iv[1], 3)) not in sel]
                         if removed:
                             excluded.setdefault(source_key(fn), []).extend(removed)
-                    # 保存 _selected.txt（仅勾选的片段）
+                    # 保存固定名 timestamps_selected.txt（仅勾选的片段）
                     _save_selected_txt(dict_list, txt_path)
 
                 print(
