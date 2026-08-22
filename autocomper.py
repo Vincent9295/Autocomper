@@ -3,7 +3,6 @@ import os
 import shutil
 import queue
 import re
-import shutil
 import sys
 import subprocess
 import tempfile
@@ -65,7 +64,7 @@ from custom_tooltip import CustomHovertip
 from sound_reader import (RemoteAudioIncompleteError, RemoteAudioStallError,
                           get_timestamps, _detection_cache_args)
 from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
-                           PlaylistDescriptor, PlaylistEntry, describe_input,
+                           PlaylistDescriptor, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
                            stable_source_id, SourceResolveError,
                            apply_video_quality_limit,
@@ -1885,17 +1884,17 @@ def _smart_sort_key(filepath):
     # 3a. Part FIRST: "p0-title" or "0-title" (Bilibili)
     m = re.search(r'^p?(\d{1,2})[\s_\-]+(.+)$', name_no_ext, re.IGNORECASE)
     if m:
-        return (fkey, 1, m[2].strip().lower(), int(m[1]))
+        return (fkey, 1, m[2].strip().lower(), int(m[1]), _of(name))
     # 3b. Part LAST: "video_p1", "video part 2", "movie (3)"
     m = re.search(r'^(.*?)[\s_\-]+p(?:art[\s_]*)?(\d+)$', name_no_ext, re.IGNORECASE)
     if not m:
         m = re.search(r'^(.*?)\s*\((\d+)\)\s*$', name_no_ext)
     if m:
         base = re.sub(r'[\s_\-]+$', '', m[1].strip().lower())
-        return (fkey, 1, base, int(m[2]))
-    # 4. Natural sort fallback
+        return (fkey, 1, base, int(m[2]), _of(name))
+    # 4. Natural sort fallback（- Original 后缀同样排在本体之后，与日期分支一致）
     parts = re.split(r'(\d+)', name)
-    return (fkey, 2, tuple(int(p) if p.isdigit() else p.lower() for p in parts))
+    return (fkey, 2, _of(name), tuple(int(p) if p.isdigit() else p.lower() for p in parts))
 
 
 def preview_playable_path(fetch_result, fallback_path):
@@ -3666,8 +3665,11 @@ class VideoProcessorApp:
                     ),
                 )
             except Exception as exc:
+                # exc 在 except 块结束时被 Python 删除；延迟执行的 lambda 必须引用
+                # 块内捕获的局部副本，否则回调触发时抛 NameError、错误弹窗永不显示。
+                invalid_url_error = f"Invalid URL: {url}\nError: {exc}"
                 self.root.after(0, lambda: messagebox.showerror(
-                    "Error", f"Invalid URL: {url}\nError: {exc}"
+                    "Error", invalid_url_error
                 ))
                 self.root.after(0, lambda: url_entry.config(state=tk.NORMAL))
                 self.root.after(0, lambda: setattr(self, "thread_active", False))
@@ -4078,7 +4080,7 @@ class VideoProcessorApp:
                 sample = format_compile_progress(
                     current, total, elapsed, "Converting external audio"
                 )
-                self.root.after(0, self._queue_transfer_progress, sample, "Import")
+                self._schedule_ui(self._queue_transfer_progress, sample, "Import")
 
             codec_args = ["-c:a", "copy"] if audio_codec in {"aac", "mp4a"} else [
                 "-c:a", "aac", "-b:a", "192k"
@@ -4104,12 +4106,12 @@ class VideoProcessorApp:
                 metadata=metadata,
             )
             temporary_path = None
-            self.root.after(0, self._finish_external_audio_import,
-                            source.display_name or source.source_id)
+            self._schedule_ui(self._finish_external_audio_import,
+                              source.display_name or source.source_id)
         except Exception as exc:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-            self.root.after(0, self._fail_external_audio_import, str(exc))
+            self._schedule_ui(self._fail_external_audio_import, str(exc))
 
     def _finish_external_audio_import(self, display_name):
         self._restore_external_audio_button_state()

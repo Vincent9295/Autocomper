@@ -288,7 +288,17 @@ def run_tracked(cmd, timeout=None, text=False):
             except Exception:
                 pass
         _ACTIVE_PROCS.discard(p)
-    p.wait()
+    # 正常路径也可能在进程未退出时到达这里（双流 EOF 但进程仍存活，
+    # 如 FFmpeg 关闭流后卡死在驱动调用）。有界等待 + 强杀兜底，
+    # 与 kill 路径的加固一致，绝不永久阻塞主流程。
+    try:
+        p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print(f"WARNING: process would not die after kill (stuck in driver call?), abandoning: {cmd[0]}")
     out = b"".join(out_parts)
     err = b"".join(err_parts)
     if text:
@@ -562,17 +572,12 @@ def get_urls(base_url: str):
             if attempts >= 3:
                 raise
             time.sleep(1)
-        except Exception:
-            raise
 
     return list(flatten(check_video(info_dict)))
 
 
 def get_number_of_vids_in_playlist(playlist_url: str) -> int:
-    try:
-        return len(get_urls(playlist_url))
-    except:
-        raise
+    return len(get_urls(playlist_url))
 
 
 def is_valid_yt_dlp_url(base_url: str, max_quality: str = None):
