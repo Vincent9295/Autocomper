@@ -245,6 +245,7 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
                             nonlocal_headers = dict(getattr(source, "audio_headers", {}) or {})
                             headers.clear()
                             headers.update(nonlocal_headers)
+                            _log(logger, f"{platform_label} range request failed; retrying with refreshed URL")
                         except Exception:
                             pass
                     delay = retry_delays[min(attempt, len(retry_delays) - 1)] if retry_delays else 0

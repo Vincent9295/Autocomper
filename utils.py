@@ -366,6 +366,9 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
     thread.start()
     try:
         while True:
+            if cancel_pending():
+                p.kill()
+                raise InterruptedError("Operation cancelled by user.")
             try:
                 item = items.get(timeout=stall_timeout)
             except _queue.Empty:

@@ -235,6 +235,10 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                              progress_callback=progress_callback, duration=dur,
                              stage="Encoding clip")
         if result.returncode != 0 and 'h264_nvenc' in video_codec:
+            # 取消导致的 rc!=0 不是 NVENC 故障：不能触发 x264 回退重试，
+            # 否则取消后编译会以 CPU 编码继续跑完（用户报告的假取消）。
+            if cancel_pending():
+                raise InterruptedError("Compile cancelled by user.")
             _fallback_to_x264()
             codec = list(_X264_CODEC)
             if fps and fps > 0:
@@ -367,6 +371,9 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         # NVENC 卡死（如睡眠唤醒后驱动死锁）：永久回退 x264 重试一次
         result = None
     if result is None or (result.returncode != 0 and 'h264_nvenc' in video_codec):
+        # 同上：取消导致的失败不是 NVENC 故障，禁止整段合并的 x264 重试。
+        if cancel_pending():
+            raise InterruptedError("Compile cancelled by user.")
         _fallback_to_x264()
         result = _run_ffmpeg(build_cmd(list(_X264_CODEC)), timeout=concat_timeout,
                              progress_callback=progress_callback, duration=total_dur,
@@ -772,6 +779,10 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 tempfiles = [t for t in [task[4] for task in tasks] if os.path.exists(t)]
                 if not tempfiles:
                     raise Exception("All clip writes failed; nothing to combine.")
+                # 切片完成后、合并启动前的边界检查：此刻取消不应再开始
+                # 一段可能长达数小时的整片重编码。
+                if cancel_pending():
+                    raise InterruptedError("Compile cancelled by user.")
                 print("Combining individual media, please do not close the program...", end="")
                 if is_video:
                     # 真实总长 = 所有 clip 的已裁剪时长之和（含 padding），

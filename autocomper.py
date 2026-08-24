@@ -71,6 +71,7 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            resolve_cached_audio,
                            source_from_hydrated_entry,
                            preflight_cookie_source,
+                           ProbeCooldown,
                            _audio_cache_format_identity)
 from remote_cache import CacheStore
 from remote_rate import LimitedRefresher, ResolveLimiter
@@ -881,11 +882,48 @@ def _retry_audio_cache_detection(upload, audio_cache_paths, cache_store,
     return new_cache
 
 
-def refresh_remote_source(source, browser_cookies=None):
-    """Resolve fresh stream URLs without logging signed URL or cookie details."""
+def refresh_stale_remote_sources(entries, refresh_func, label="Videos"):
+    """compile 前对过期远程源做一次前瞻刷新（两条 compile 路径共用）。
+
+    检测可能已耗时数小时：materialize 开始前把 resolved_at 超过阈值
+    （30 分钟）的源逐个刷新，保证使用的 video_url/audio_url 是新鲜的。
+    刚 resolve 的源跳过刷新（纯省时间）；单个源刷新失败不中断批次，
+    沿用现有 URL 由后续重试兜底。日志不回显签名 URL。
+    """
+    sources = [e.get('filename') for e in entries
+               if isinstance(e.get('filename'), MediaSource)]
+    stale_sources = []
+    for source in sources:
+        resolved_at = getattr(source, "resolved_at", None)
+        if resolved_at is None or time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD:
+            stale_sources.append(source)
+    if not stale_sources:
+        print(f"{Fore.GREEN}All remote sources freshly resolved; skipping refresh, "
+              f"continuing to compile...")
+        return
+    print(f"{Fore.CYAN}Refreshing {len(stale_sources)} {label} "
+          f"source(s), please be patient...")
+    for source in stale_sources:
+        try:
+            updated = refresh_func(source)
+            if isinstance(updated, MediaSource) and updated is not source:
+                source.__dict__.update(updated.__dict__)
+        except Exception as exc:
+            print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
+    print(f"{Fore.GREEN}Source refresh complete, continuing to compile...")
+
+
+def refresh_remote_source(source, browser_cookies=None, probe_candidates=True):
+    """Resolve fresh stream URLs without logging signed URL or cookie details.
+
+    ``probe_candidates=False`` 跳过刷新内层的 bilibili 候选探测——供"刷新后
+    马上会再做外层探测"的调用方（Audio Cache staleness 刷新）使用，把过期
+    尾部源的探测请求数减半（内层探测原本完全静默，还会加剧 CDN 限流）。
+    下载中途的 refresh 保留默认探测：那里内层探测是唯一为新 URL 选节点的机会。
+    """
     refreshed = resolve_source(source.source_url, browser_cookies=browser_cookies,
                                max_height=source.max_height)
-    if refreshed.platform in {"bilibili", "bilibiliweb"}:
+    if probe_candidates and refreshed.platform in {"bilibili", "bilibiliweb"}:
         try:
             select_audio_candidate(refreshed, probe_duration=1, log_func=None)
         except Exception:
@@ -4681,6 +4719,19 @@ class VideoProcessorApp:
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
                 )
                 failed_remote_ids = set()
+                _audio_probe_cooldown = ProbeCooldown()
+                # staleness 刷新专用变体：跳过 refresh_remote_source 的内层候选
+                # 探测（外层马上会探测，内层纯冗余且完全静默）。共享同一个
+                # resolve 限流器与退避策略。
+                _stale_refresh_func = LimitedRefresher(
+                    lambda stale_source: refresh_remote_source(
+                        stale_source, browser_cookies=browser_cookies,
+                        probe_candidates=False,
+                    ),
+                    limiter=_resolve_limiter,
+                    retries=3,
+                    logger=print,
+                )
                 for cache_index, (upload, source) in enumerate(remote_entries):
                     try:
                         # 音频已缓存时不再逐个探测 CDN 候选：Audio Cache 大批次
@@ -4696,16 +4747,46 @@ class VideoProcessorApp:
                                 f"{Path(cached_audio_path).name}"
                             )
                             continue
-                        # 逐源选择 audio candidate：只在真正缓存该源前探测，
-                        # 避免开跑前对所有源一次性探测导致排尾 URL 过期。
-                        # 探测也受限流器控制：185 源 × 12 候选 = 上千次 FFmpeg
-                        # 探测请求会触发 bilibili CDN 限流（speed=unknown +
-                        # 后续 compile 全 403），串行 + 间隔能显著缓解。
+                        # 大批量解析在开跑前一次性完成：排到后面时签名 URL 可能
+                        # 已过期（>30min），探测前先做与检测路径相同的过期检查，
+                        # 避免尾部源整组 403。
+                        resolved_at = getattr(source, "resolved_at", None)
+                        if (resolved_at is None
+                                or time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD):
+                            _refresh_started = time.monotonic()
+                            print(f"{Fore.CYAN}Refreshing stale remote source for "
+                                  f"{get_source_display_name(source)}...")
+                            try:
+                                updated = _stale_refresh_func(source)
+                                if isinstance(updated, MediaSource) and updated is not source:
+                                    source.__dict__.update(updated.__dict__)
+                                print(f"{Fore.CYAN}  Source refreshed in "
+                                      f"{time.monotonic() - _refresh_started:.1f}s")
+                            except Exception as exc:
+                                print(f"{Fore.YELLOW}  Source refresh failed ({exc}); "
+                                      f"using existing URL.")
+                        # 即时进度样本：立刻把进度条切到当前源（Progress: --），
+                        # 消除上一个文件 100% / ETA 00:00 的冻结假象；探测与
+                        # 冷却期间用户也能看出程序在推进。每源恰好一条。
+                        self._queue_transfer_progress(
+                            format_transfer_progress(0.0, None, 0.0),
+                            f"Audio Cache [{cache_index + 1}/{len(remote_entries)}] "
+                            f"{get_source_display_name(source)}")
+                        print(f"{Fore.CYAN}Probing CDN mirrors for "
+                              f"{get_source_display_name(source)}...")
+                        # 连续多个源的候选组探测全失败（403/超时）说明 CDN 正在
+                        # 限流：下一个源探测前先冷却，让限流窗口过去。任何一次
+                        # 探测成功即清零；不减少镜像覆盖，只是放慢节奏。
+                        _audio_probe_cooldown.wait_if_needed(log_func=print)
                         try:
+                            _probe_stats = {}
                             _probe_limiter.wait()
-                            select_audio_candidate(source, log_func=print)
+                            select_audio_candidate(source, log_func=print,
+                                                   stats=_probe_stats)
                         except Exception as exc:
                             print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
+                            _probe_stats = {}
+                        _audio_probe_cooldown.observe(_probe_stats)
                         audio_cache_paths[stable_source_id(source)] = fetch_audio_cache(
                             source, cache_store, log_func=print, refresh_func=refresh_func,
                             prefetch_chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024,
@@ -4961,30 +5042,10 @@ class VideoProcessorApp:
                         convert_quality_str_to_int(self.max_quality.get()))
                     # 检测可能已耗时 1-3 小时：compile 前对过期远程源做一次前瞻刷新，
                     # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
-                    # 只刷新 resolved_at 超过阈值（30 分钟）的源：若 URL 刚 resolve
-                    # （如 import 后立即加载 timestamps → compile，未跑长流程），跳过
-                    # 刷新纯省时间（与 materialize 内部 stale 判断一致，避免重复刷新）。
-                    _remote_sources = [e.get('filename') for e in dict_list
-                                       if isinstance(e.get('filename'), MediaSource)]
-                    _stale_sources = []
-                    for source in _remote_sources:
-                        resolved_at = getattr(source, "resolved_at", None)
-                        if resolved_at is None or time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD:
-                            _stale_sources.append(source)
-                    if _stale_sources:
-                        _label = "VODs" if self.is_video else "Videos"
-                        print(f"{Fore.CYAN}Refreshing {len(_stale_sources)} {_label} "
-                              f"source(s), please be patient...")
-                        for source in _stale_sources:
-                            try:
-                                updated = refresh_func(source)
-                                if isinstance(updated, MediaSource) and updated is not source:
-                                    source.__dict__.update(updated.__dict__)
-                            except Exception as exc:
-                                print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
-                        print(f"{Fore.GREEN}Source refresh complete, continuing to compile...")
-                    else:
-                        print(f"{Fore.GREEN}All remote sources freshly resolved; skipping refresh, continuing to compile...")
+                    # 与首次全流程 compile 路径共用同一逻辑。
+                    refresh_stale_remote_sources(
+                        dict_list, refresh_func,
+                        label="VODs" if self.is_video else "Videos")
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
                         remote_failure_records = []
@@ -5342,12 +5403,19 @@ class VideoProcessorApp:
                     remote_temp,
                     _total_clip_seconds(dict_list, padding),
                     convert_quality_str_to_int(self.max_quality.get()))
+                # 首次全流程的检测可能耗时数小时：compile 前对过期远程源做前瞻
+                # 刷新，并给 materialize 传入 refresh_func 兜底——否则尾部源
+                # URL 过期导致整批 403、片段被跳过（与跳过检测路径共用逻辑）。
+                refresh_stale_remote_sources(
+                    dict_list, refresh_func,
+                    label="VODs" if self.is_video else "Videos")
                 try:
                     self.clear_transfer_progress("Preparing remote clips...")
                     remote_failure_records = []
                     compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
+                            refresh_func=refresh_func,
                             progress_callback=self._show_remote_clip_progress,
                             max_parallel=self.remote_download_concurrency.get(),
                             failure_records=remote_failure_records)

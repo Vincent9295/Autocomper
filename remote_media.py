@@ -261,12 +261,50 @@ def probe_audio_candidate(
     return float(match.group(1)) if match else None
 
 
+class ProbeCooldown:
+    """跨源探测连败冷却：CDN 持续 403 时放慢探测节奏，等限流窗口过去。
+
+    连续 ``threshold`` 个源的候选组全部探测失败（403/超时）时，下一个源
+    探测前先等待 ``cooldown`` 秒；任何一次有候选测出有效速度即清零。
+    不减少镜像探测覆盖，只在大批次尾部自动放慢，避免越跑越多 403。
+    """
+
+    def __init__(self, threshold: int = 2, cooldown: float = 30.0):
+        self.threshold = max(1, int(threshold))
+        self.cooldown = float(cooldown)
+        self._streak = 0
+
+    def wait_if_needed(self, sleep_func=time.sleep, log_func=None) -> bool:
+        if self._streak < self.threshold:
+            return False
+        if log_func is not None:
+            log_func(
+                f"Bilibili CDN probes failed for {self._streak} sources in a row; "
+                f"cooling down {self.cooldown:g}s before the next source")
+        sleep_func(self.cooldown)
+        self._streak = 0
+        return True
+
+    def observe(self, stats: Mapping[str, int] | None) -> None:
+        if not stats:
+            return
+        groups = int(stats.get("groups") or 0)
+        failed = int(stats.get("failed_groups") or 0)
+        if groups <= 0:
+            return
+        if failed >= groups:
+            self._streak += 1
+        else:
+            self._streak = 0
+
+
 def select_audio_candidate(
     source: MediaSource,
     min_realtime_speed: float = 1.0,
     probe_duration: float = 3,
     run_func: Callable[..., Any] | None = None,
     log_func: Callable[[str], Any] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
     """Keep the best audio unless a bounded probe shows a slower candidate is needed.
 
@@ -274,7 +312,9 @@ def select_audio_candidate(
     (its resolve-time ``audio_url``) and ``None`` is returned instead of silently
     re-applying the first candidate — a probe that can't complete tells us nothing
     about which CDN is usable, and forcing a URL here can pin a stale/rate-limited
-    one for the whole batch.
+    one for the whole batch. ``stats`` optionally receives probe outcome counts
+    (``groups`` measured, ``failed_groups`` fully failed) for callers that adapt
+    pacing to CDN health.
     """
     candidates = list(source.audio_candidates or [])
     if str(source.platform or "").strip().lower() not in {"bilibili", "bilibiliweb"}:
@@ -290,6 +330,7 @@ def select_audio_candidate(
         threshold = float(min_realtime_speed)
     except (TypeError, ValueError):
         threshold = 1.0
+    stats_state = {"groups": 0, "failed_groups": 0}
     index = 0
     chose = False
     chosen_candidate = None
@@ -306,6 +347,7 @@ def select_audio_candidate(
             index += 1
 
         measured = []
+        stats_state["groups"] += 1
         for candidate in group:
             speed = probe_audio_candidate(
                 source, candidate, duration=probe_duration, run_func=run_func,
@@ -325,6 +367,7 @@ def select_audio_candidate(
             # CDN 不健康，继续测剩余候选只会白等（每个超时 5s，×12 候选/源
             # 在大批次上累计数小时）。连续 2 组失败即提前放弃探测。
             probe_fail_groups += 1
+            stats_state["failed_groups"] += 1
             if probe_fail_groups >= _PROBE_MAX_FAILED_GROUPS:
                 if log_func is not None:
                     log_func(
@@ -347,6 +390,8 @@ def select_audio_candidate(
             break
         if log_func is not None:
             log_func(f"Audio candidate speed below {threshold:.1f}x; trying next candidate")
+    if stats is not None:
+        stats.update(stats_state)
     if not chose:
         return None
     return chosen_candidate
@@ -583,6 +628,7 @@ def fetch_audio_cache(
                             speed_monitor=speed_monitor,
                             slow_callback=recover_slow_prefetch,
                             start_offset=partial_size,
+                            refresher=refresh_func,
                         ):
                             handle.write(chunk)
                         handle.flush()
@@ -596,6 +642,8 @@ def fetch_audio_cache(
                         f"{platform_label} audio cache CDN switched; "
                         f"resuming at {partial_size} bytes"
                     )
+                except InterruptedError:
+                    raise
                 except Exception:
                     if resume_attempt >= resume_limit - 1:
                         raise
@@ -618,6 +666,9 @@ def fetch_audio_cache(
                 f"{registered.stat().st_size} bytes"
             )
             return Path(registered)
+        except InterruptedError:
+            temporary_path.unlink(missing_ok=True)
+            raise
         except Exception as exc:
             last_error = exc
             temporary_path.unlink(missing_ok=True)
@@ -1103,6 +1154,8 @@ def fetch_segment(
             saver(destination, data)
             _fail_budget_started = None
             return destination
+        except InterruptedError:
+            raise
         except Exception as exc:
             last_error = exc if isinstance(exc, SegmentFetchError) else SegmentFetchError(
                 f"Could not fetch remote segment {start}-{end}: "

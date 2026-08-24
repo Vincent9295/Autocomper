@@ -296,6 +296,10 @@ class ProgressWidgetAdapter:
         current = sample.get("current", 0)
         if total:
             self.bar["value"] = min(100.0, float(current) / float(total) * 100)
+        elif sample.get("stage") == "transferring" and not current:
+            # 起始样本（新文件开跑、文件大小未知，total 为 None）：把条形图
+            # 归零。否则条会保留上一个文件的 100% 满格，看起来像卡死。
+            self.bar["value"] = 0
         lines = [sample.get("title", ""), sample.get("current_line", ""),
                  sample.get("percent_line", ""), sample.get("speed_line", ""),
                  sample.get("eta_line", "")]
