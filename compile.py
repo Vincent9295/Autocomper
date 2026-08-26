@@ -20,6 +20,15 @@ import os
 
 MERGE_THRESHOLD = 2  # seconds
 
+# 音频输出编码组。concat 链条里的任何 AAC 输入都会让 concat filter 的音频时间线
+# 相对视频每段拉伸 ~20ms（AAC priming 残留，实测真实远程段 A-V 中位数 +21.3ms，
+# 940 段批次尾部累积近 20s——"整体逐渐错位"根因）。因此：
+#   - 进入后续 concat 的所有中间产物（cut 临时 clip、_batchL* 批次文件）
+#     必须写 FLAC（无编码延迟、时长精确）；
+#   - 只有最终输出的那一次编码才用 AAC。
+_FLAC_AUDIO = ['-c:a', 'flac']
+_AAC_AUDIO_OUT = ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
+
 _FFMPEG_DETAIL_MAX = 400
 
 
@@ -106,6 +115,41 @@ def _get_frame_rate(input_file: str):
     return 30.0
 
 
+def _mixed_resolution_target(file_list):
+    """混合分辨率检测（_ffmpeg_concat / _ffmpeg_concat_batched 共用）。
+
+    返回目标 (w, h)；无混合或全部探测失败时返回 None。目标取出现次数最多的
+    尺寸。显著低于目标的输入会被放大拼接——放大无法恢复细节，成片里这些
+    片段偏软是源本身分辨率/码率不足（Bilibili 部分回放只给 360x640 低码率流），
+    不是编码问题；日志明确点名，避免误判为编译退化。
+    """
+    sizes = {}
+    for fp in file_list:
+        w, h = _get_video_size(fp)
+        if w and h:
+            sizes.setdefault((w, h), []).append(os.path.basename(fp))
+    if not sizes:
+        print("  No resolvable input resolutions; keeping source size.")
+        return None
+    if len(sizes) == 1:
+        return None
+    size_text = ", ".join(f"{w}x{h}" for w, h in sorted(sizes))
+    print(f"{Fore.YELLOW}Mixed resolutions ({size_text}) -> re-encoding for sync...")
+    # 目标取出现次数最多的尺寸；平票取面积更大的（宁可放大低清源，
+    # 也不要把原生高分辨率内容降采样丢细节）。
+    target = max(sizes, key=lambda k: (len(sizes[k]), k[0] * k[1]))
+    print(f"  Target resolution: {target[0]}x{target[1]}")
+    area = target[0] * target[1]
+    upscaled = [name for (w, h), names in sizes.items()
+                if w * h * 2 < area for name in names]
+    if upscaled:
+        preview = ", ".join(upscaled[:3]) + ("..." if len(upscaled) > 3 else "")
+        print(f"{Fore.YELLOW}  NOTE: {len(upscaled)} clip(s) are much lower-resolution "
+              f"sources and will be upscaled; their softness is a source limitation, "
+              f"not an encoding issue: {preview}{Style.RESET_ALL}")
+    return target
+
+
 def _get_video_duration(input_file: str):
     """Return total duration of the media file in seconds, or None."""
     stderr = _ffprobe(input_file)
@@ -183,11 +227,29 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         # audio overlap/desync。帧率/音量等归一化交给后续 concat（combine 模式）。
         full_range = s <= 0.05 and (duration is None or e >= duration - 0.1)
         if full_range:
+            # 远程段（AAC 源）的音频轨普遍比视频长 ~21ms（AAC priming 残留，
+            # 实测真实缓存段 A-V 中位数 +21.3ms）。concat filter 把视频帧序列
+            # 和音频采样列各自独立拼接，这个差值会逐段线性累积（940 段 ≈ 尾部
+            # 错位 20s）。因此 remux 时把音频精确裁到 min(请求时长, 视频实际时长)。
+            target_dur = max(0.0, e - s)
+            probe = _ffprobe(input_file)
+            has_audio = re.search(r'Stream #0:\d+.*Audio:', probe) is not None
+            dm = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', probe)
+            if dm:
+                h, mi, sd_, msd = map(int, dm.groups())
+                vdur = h * 3600 + mi * 60 + sd_ + msd / 100
+                if vdur > 0:
+                    target_dur = min(target_dur or vdur, vdur)
+            af = None
+            if has_audio and target_dur > 0:
+                af = f'atrim=end={target_dur:.6f},asetpts=PTS-STARTPTS'
             cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
                    '-i', input_file, '-map', '0:v:0', '-map', '0:a:0?',
-                   '-c:v', 'copy', '-c:a', 'flac',
-                   '-avoid_negative_ts', 'make_zero',
-                   '-movflags', '+faststart', output_file]
+                   '-c:v', 'copy', '-c:a', 'flac']
+            if af:
+                cmd += ['-af', af]
+            cmd += ['-avoid_negative_ts', 'make_zero',
+                    '-movflags', '+faststart', output_file]
             result = _run_ffmpeg(cmd, timeout=300,
                                  progress_callback=progress_callback,
                                  duration=duration, stage="Remuxing clip")
@@ -264,10 +326,13 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                         preserve_duration=preserve_duration,
                         progress_callback=progress_callback, duration=duration)
         # 必须走 batched：单视频上千 segment 时 _ffmpeg_concat 会把所有 -i
-        # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206
+        # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206。
+        # 该产物会继续进入 compile_vid 的最终 concat，必须写 FLAC 音频
+        # （AAC 中间产物会让 concat 音频时间线逐边界拉伸 ~20ms）。
         _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
                                fps=fps, progress_callback=progress_callback,
-                               total_duration=duration, batch_size=batch_size)
+                               total_duration=duration, batch_size=batch_size,
+                               audio_out=_FLAC_AUDIO)
     finally:
         for sf in seg_files:
             try:
@@ -278,7 +343,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
 
 
 def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
-                    progress_callback=None, total_duration=None):
+                   progress_callback=None, total_duration=None, audio_out=None):
     """Concatenate using concat FILTER (frame-level, not demuxer)."""
     if not file_list:
         return False
@@ -288,24 +353,7 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         return True
 
     if not res and len(file_list) > 1:
-        sizes = set()
-        for fp in file_list:
-            w, h = _get_video_size(fp)
-            if w and h:
-                sizes.add((w, h))
-        if len(sizes) > 1:
-            size_text = ", ".join(f"{w}x{h}" for w, h in sorted(sizes))
-            print(f"{Fore.YELLOW}Mixed resolutions ({size_text}) -> re-encoding for sync...")
-            size_counts = {}
-            for fp in file_list:
-                sz = _get_video_size(fp)
-                if sz and sz[0] and sz[1]:
-                    size_counts[sz] = size_counts.get(sz, 0) + 1
-            if size_counts:
-                res = max(size_counts, key=size_counts.get)
-                print(f"  Target resolution: {res[0]}x{res[1]}")
-            else:
-                print("  No resolvable input resolutions; keeping source size.")
+        res = _mixed_resolution_target(file_list)
 
     n = len(file_list)
     parts = []
@@ -313,8 +361,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         w, h = res
         for i in range(n):
             parts.append(f'[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,'
-                        f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1:1,'
-                        f'setpts=PTS-STARTPTS[v{i}]')
+                         f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1:1,'
+                         f'setpts=PTS-STARTPTS[v{i}]')
             parts.append(f'[{i}:a]asetpts=PTS-STARTPTS[a{i}]')
     else:
         for i in range(n):
@@ -336,7 +384,7 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
             c += ['-i', fp]
         c += ['-filter_complex', filter_complex,
               '-map', '[outv]', '-map', '[outa]'] + codec + \
-             ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
+             (audio_out or _AAC_AUDIO_OUT)
         if fps and fps > 0:
             c += ['-r', str(int(fps))]
         c += ['-vsync', 'cfr', '-shortest', output_file]
@@ -397,9 +445,14 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
 
 def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6,
                            fps=None, _lvl=0, progress_callback=None,
-                           temp_dir=None, total_duration=None):
+                           temp_dir=None, total_duration=None, audio_out=None):
     """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
-    保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。"""
+    保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。
+
+    中间产物 _batchL* 一律写 FLAC 音频（AAC 中间件会让下一层 concat 的音频
+    时间线每边界拉伸 ~20ms，逐层累积成"整体逐渐错位"）；只有产出 output_file
+    的那一次编码使用 audio_out（调用方不传则为最终输出的 AAC）。
+    """
     if not file_list:
         return False
     if len(file_list) == 1 and not res and not normalize:
@@ -408,29 +461,12 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
         return True
 
     if not res and len(file_list) > 1:
-        sizes = set()
-        for fp in file_list:
-            w, h = _get_video_size(fp)
-            if w and h:
-                sizes.add((w, h))
-        if len(sizes) > 1:
-            size_text = ", ".join(f"{w}x{h}" for w, h in sorted(sizes))
-            print(f"{Fore.YELLOW}Mixed resolutions ({size_text}) -> re-encoding for sync...")
-            size_counts = {}
-            for fp in file_list:
-                sz = _get_video_size(fp)
-                if sz and sz[0] and sz[1]:
-                    size_counts[sz] = size_counts.get(sz, 0) + 1
-            if size_counts:
-                res = max(size_counts, key=size_counts.get)
-                print(f"  Target resolution: {res[0]}x{res[1]}")
-            else:
-                print("  No resolvable input resolutions; keeping source size.")
+        res = _mixed_resolution_target(file_list)
 
     if len(file_list) <= batch_size:
         return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize, fps=fps,
                               progress_callback=progress_callback,
-                              total_duration=total_duration)
+                              total_duration=total_duration, audio_out=audio_out)
 
     # 中间文件默认与输出同盘；调用方可传入 compile 的临时目录，避免大批量
     # 合并时 _batchL* 中间件 flood 用户输出文件夹。
@@ -448,7 +484,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                 ))
             ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps,
                                 progress_callback=progress_callback,
-                                total_duration=total_duration)
+                                total_duration=total_duration,
+                                audio_out=_FLAC_AUDIO)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
         print(f"  Final merge ({len(batch_files)} files)...")
@@ -461,9 +498,11 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                                           fps=fps, _lvl=_lvl + 1,
                                           progress_callback=progress_callback,
                                           temp_dir=temp_dir,
-                                          total_duration=total_duration)
+                                          total_duration=total_duration,
+                                          audio_out=audio_out)
         _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps,
-                       progress_callback=progress_callback, total_duration=total_duration)
+                       progress_callback=progress_callback, total_duration=total_duration,
+                       audio_out=audio_out)
     finally:
         for bf in batch_files:
             try:
