@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import time
 import tempfile
@@ -234,6 +235,8 @@ def probe_audio_candidate(
         return None
     if duration_value <= 0 or timeout_value <= 0:
         return None
+    if not (math.isfinite(duration_value) and math.isfinite(timeout_value)):
+        return None
     headers = candidate.get("http_headers") or source.audio_headers or source.http_headers
     command = [
         str(FFMPEG_PATH), "-hide_banner", "-loglevel", "info", "-t", format(duration_value, ".12g"),
@@ -408,6 +411,9 @@ def build_audio_cache_command(source: MediaSource, output_file: str | Path) -> l
         "-hide_banner",
         "-loglevel",
         "error",
+        # 网络读守卫：半开的 CDN 连接不能永久挂住 worker（与取段命令对齐）。
+        "-rw_timeout",
+        "60000000",
     ]
     headers = source.audio_headers or source.http_headers
     if headers:
@@ -455,7 +461,11 @@ def _audio_cache_timeout(source: MediaSource, timeout: float | None) -> float:
         duration = float(source.duration) if source.duration is not None else 0
     except (TypeError, ValueError):
         duration = 0
-    return max(1800.0, duration * 3) if duration > 0 else 1800.0
+    # 非/无限时长（JSON 缓存可往返 Infinity 字面量）按未知处理；
+    # 上限 24h：inf*3 若不加守卫会让 run_tracked 的 timeout 失效（永不超时）。
+    if duration <= 0 or not math.isfinite(duration):
+        return 1800.0
+    return min(24 * 3600.0, max(1800.0, duration * 3))
 
 
 def _audio_cache_format_identity(source: MediaSource) -> dict[str, Any]:
@@ -851,7 +861,8 @@ def build_segment_command(
     """Build an argv-only FFmpeg command for one remote time interval."""
     start_value = float(start)
     end_value = float(end)
-    if start_value < 0 or end_value <= start_value:
+    if (start_value < 0 or end_value <= start_value
+            or not math.isfinite(start_value) or not math.isfinite(end_value)):
         raise ValueError("segment end must be greater than a non-negative start")
 
     if audio_only and not source.audio_url:

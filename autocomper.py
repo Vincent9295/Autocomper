@@ -1,4 +1,5 @@
 import configparser
+import math
 import os
 import shutil
 import queue
@@ -153,7 +154,9 @@ MERGE_BATCH_TOOLTIP_TEXT = (
     "runs out of memory, lower this. Default: 6."
 )
 MERGE_BATCH_DEFAULT = 6
-MERGE_BATCH_MIN = 1
+# 下限 2：batch_size=1 时 _ffmpeg_concat_batched 每批只剩单文件、递归无法
+# 收缩工作集（实测 151 层直到 RecursionError，默认栈深下表现为数小时 IO 空转）。
+MERGE_BATCH_MIN = 2
 MERGE_BATCH_MAX = 50
 REMOTE_CACHE_TOOLTIP_TEXT = (
     "Remote Stream, Audio Cache, reverify, and downloaded segment files are stored here.\n"
@@ -931,6 +934,26 @@ def refresh_remote_source(source, browser_cookies=None, probe_candidates=True):
     return refreshed
 
 
+def _video_stream_end(source):
+    """单个分P/视频的视频流可用终点（yt-dlp 报告的时长）；未知返回 None。
+
+    直播回放常见"视频推流提前结束、音频继续录"：实测缓存 181/181 个源的
+    音频轨都长于视频可用范围（最长差 64 分钟）。Audio Cache 模式的检测跑在
+    完整音频上，尾部事件会落在无画面的时间段；视频编译取段前用它做边界，
+    避免注定失败的下载重试和误导性的跳过原因。
+
+    非/无限值（inf、NaN、非正数、垃圾数据）一律视为未知——JSON 缓存可能
+    往返 Infinity 字面量，不能让脏数据杀死整个批次。
+    """
+    try:
+        value = float(getattr(source, "duration", None) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
 def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                                selected_intervals=None, cache_store=None, padding=None,
                                is_video=True, refresh_func=None, failures=None,
@@ -1157,6 +1180,8 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
         clips_total = len(timestamps)
         n_ts = len(timestamps)
         prev_eff_end = None
+        # 视频流可用终点：每个 source 只算一次（duration 不可变）。
+        source_video_end = _video_stream_end(source) if is_video else None
         for interval_index, ts in enumerate(timestamps):
             start, end = float(ts['start']), float(ts['end'])
             # 计算带 padding 但不会与相邻 clip 重叠的有效区间：
@@ -1172,6 +1197,45 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             eff_start = start - before
             if prev_eff_end is not None:
                 eff_start = max(eff_start, prev_eff_end)
+
+            # 视频编译：把区间钳到视频流可用终点内。音频轨比视频长时，
+            # 尾部检测到的事件没有对应画面——完全越界的直接跳过（省掉
+            # 必然失败的 90s 重试），跨界的保留可观看前缀。
+            if source_video_end is not None:
+                hard_end = source_video_end - 0.25
+                dropped_beyond = False
+                if eff_start >= hard_end:
+                    dropped_beyond = True
+                else:
+                    if eff_end > hard_end:
+                        eff_end = hard_end
+                    if eff_end - eff_start < 1.0:
+                        dropped_beyond = True
+                if dropped_beyond:
+                    # 原因文案惰性构造：只有真正丢弃时才格式化时间戳
+                    beyond_reason = (
+                        "Detection lies beyond the available video stream "
+                        f"(video track ends around "
+                        f"{convert_seconds_to_timestamp(source_video_end)} while the "
+                        "recording's audio ran longer); there is no footage for "
+                        "this interval."
+                    )
+                    message = (
+                        f"Could not fetch {get_source_display_name(source)} "
+                        f"interval {eff_start:g}-{eff_end:g}: {beyond_reason}"
+                    )
+                    if failures is not None:
+                        failures.append(message)
+                    if failure_records is not None:
+                        failure_records.append({
+                            "name": get_source_display_name(source),
+                            "url": getattr(source, "source_url", None) or str(source),
+                            "start": eff_start,
+                            "end": eff_end,
+                            "reason": beyond_reason,
+                        })
+                    continue
+
             prev_eff_end = eff_end
             duration = eff_end - eff_start
             extension = "mp4" if is_video else "m4a"
@@ -1291,6 +1355,9 @@ def _summarize_remote_failures(failures, max_examples=3):
             cause = "disk full (Errno 28)"
         elif "-138" in reason or "error number -138" in lowered:
             cause = "connection failed (-138)"
+        elif ("beyond the available video stream" in lowered
+              or "no footage" in lowered):
+            cause = "detection beyond video end (recording's video track ended early)"
         else:
             cause = "other error"
         counts[cause] = counts.get(cause, 0) + 1
@@ -1344,8 +1411,13 @@ def _write_skipped_report(records, output_video_path):
         url = record.get("url") or "unknown URL"
         start = record.get("start")
         end = record.get("end")
-        interval = f"{start:g}-{end:g}s" if isinstance(start, (int, float)) and isinstance(end, (int, float)) else "?"
-        lines.append(f"[{interval}] {name}")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            # 与 timestamps.txt 一致的 H:MM:SS，方便对照查找原片位置。
+            interval = (f"({convert_seconds_to_timestamp(start)} - "
+                        f"{convert_seconds_to_timestamp(end)})")
+        else:
+            interval = "?"
+        lines.append(f"{interval} {name}")
         lines.append(f"  URL: {url}")
         lines.append(f"  Reason: {record.get('reason')}")
         lines.append("")
@@ -1445,12 +1517,21 @@ def _write_timestamps_txt(dict_list, txt_path):
 
 def _parse_timestamps_txt(txt_path):
     """Parse timestamps.txt -> (with videos, without videos)"""
+    import locale
     with_videos = []
     without_videos = []
     current_file = None
     current_ts = []
-    with open(txt_path, 'r', encoding='utf-8') as f:
-        for line in f:
+    try:
+        # utf-8-sig 兼容记事本保存出的 BOM；GBK 等旧编码回退本地编码并提示。
+        f = open(txt_path, 'r', encoding='utf-8-sig')
+    except UnicodeDecodeError:
+        fallback = locale.getpreferredencoding(False) or 'utf-8'
+        print(f"WARNING: {txt_path} is not UTF-8; retrying as {fallback}. "
+              f"Please re-save it as UTF-8.")
+        f = open(txt_path, 'r', encoding=fallback, errors='replace')
+    with f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 if current_file:
@@ -1464,15 +1545,51 @@ def _parse_timestamps_txt(txt_path):
                 line)
             if m:
                 h1, m1, s1, h2, m2, s2, conf = m.groups()
+                # 用户手编文件常见三类脏数据：分钟/秒越界、区间倒置、
+                # conf 是 "1.2.3" 这类 float() 会炸的串。全部跳过并告警，
+                # 不让一行垃圾中断整个批次加载。
+                if int(m1) > 59 or int(s1) > 59 or int(m2) > 59 or int(s2) > 59:
+                    print(f"WARNING: skipping line {line_no} (minute/second out of "
+                          f"range): {line!r}")
+                    continue
                 s = int(h1) * 3600 + int(m1) * 60 + int(s1)
                 e = int(h2) * 3600 + int(m2) * 60 + int(s2)
-                ts = {'start': s, 'end': e, 'pred': float(conf)}
+                if e <= s:
+                    print(f"WARNING: skipping line {line_no} (end <= start): {line!r}")
+                    continue
+                try:
+                    pred = float(conf)
+                except ValueError:
+                    print(f"WARNING: skipping line {line_no} (malformed confidence): "
+                          f"{line!r}")
+                    continue
+                ts = {'start': s, 'end': e, 'pred': pred}
                 # 保留 reverify 的 "[new]" 标记：加载同一个 timestamps 基础文件后
                 # ReviewDialog 才能正确显示 New/Original 并做 auto-deselect。
                 if '[new]' in line:
                     ts['source'] = 'new'
                 current_ts.append(ts)
             else:
+                # 残缺行此前会被静默当作新标题，把前一段的所有 clip 改挂到
+                # 这行文字上（整段历史丢失且无任何提示）。现在先落袋前一段，
+                # 再接受新标题并显式告警。
+                if current_file is not None and current_ts:
+                    with_videos.append(
+                        {'filename': current_file, 'timestamps': current_ts})
+                    print(f"WARNING: line {line_no} does not look like an interval; "
+                          f"previous clips were saved under "
+                          f"{current_file!r} and a NEW media title starts here: "
+                          f"{line!r}")
+                    current_ts = []
+                elif current_file is not None:
+                    print(f"WARNING: replacing empty section header: "
+                          f"{current_file!r} -> {line!r}")
+                elif current_ts:
+                    target = with_videos if current_ts else without_videos
+                    target.append({'filename': None, 'timestamps': current_ts})
+                    print(f"WARNING: clips appeared before any URL/media title at "
+                          f"line {line_no}; they were kept but have no source.")
+                    current_ts = []
                 current_file = line
     if current_file:
         target = with_videos if current_ts else without_videos
@@ -1826,7 +1943,12 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                         '-i', str(scan_filename), '-vn',
                         '-f', 's16le', '-acodec', 'pcm_s16le',
                         '-ar', str(sample_rate), '-ac', '1', window_audio.name]
-                    run_tracked(extract_cmd)
+                    # timeout=30：走 reader-thread 路径。Addendum 21 的 0.1s
+                    # 短轮询已消除当年"每窗固定等满 30s"的代价（实测快速退出
+                    # ~0.1-0.3s 返回），换回子进程孙进程持有管道句柄时的死锁
+                    # 免疫（Addendum 15 类事故；审计实测无超时快路径会被
+                    # 孤儿句柄阻塞 6s+，无限大的场景即永久挂起）。
+                    run_tracked(extract_cmd, timeout=30)
                     if os.path.getsize(window_audio.name) == 0:
                         continue
                     raw = __import__('numpy').memmap(
@@ -2387,7 +2509,12 @@ class ReviewDialog:
                         abs(f['end'] - ts['end']) < 0.01 and
                         self.checks[i].get()):
                         kept.append({'start': ts['start'], 'end': ts['end'],
-                                     'pred': ts.get('pred', 0)})
+                                     'pred': ts.get('pred', 0),
+                                     # 保留 [new] 来源标记：_selected 文件里
+                                     # 才能区分 New/Original（与 reverify 写回
+                                     # 行为一致），否则手编往返时来源信息丢失。
+                                     'source': ts.get('source'),
+                                     'suspect': ts.get('suspect')})
                         break
             if kept:
                 result.append({'filename': fn, 'timestamps': kept})

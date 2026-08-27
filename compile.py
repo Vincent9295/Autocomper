@@ -265,7 +265,6 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     if fps and fps > 0:
         video_codec += ['-r', str(int(fps))]
     audio_codec_tmp = ['-c:a', 'flac']      # FLAC 无编码延迟，时长精确
-    audio_codec_out = ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100']
     mem_opts = ['-threads', '2']
 
     if n == 1:
@@ -317,9 +316,12 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
 
     seg_files = []
     seg_dir = os.path.dirname(output_file)
+    # 文件名带 output stem：音频模式 max_parallel=5 时多个 source 并发切分，
+    # 共享目录下同名 _segN.mp4 会互相覆盖（产物静默串源）。
+    seg_stem = os.path.splitext(os.path.basename(output_file))[0]
     try:
         for i, (s, e) in enumerate(timestamps):
-            seg_file = os.path.join(seg_dir, f"_seg{i}.mp4")
+            seg_file = os.path.join(seg_dir, f"_{seg_stem}_seg{i}.mp4")
             seg_files.append(seg_file)
             _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None,
                         normalize=normalize, fps=fps,
@@ -390,8 +392,10 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         c += ['-vsync', 'cfr', '-shortest', output_file]
         return c
 
-    # 验证所有输入文件有视频流；顺带累加总时长用于动态超时
-    # （固定 1200s 会误杀多小时合集的健康编码）
+    # 验证所有输入文件有视频+音频流；顺带累加总时长用于动态超时
+    # （固定 1200s 会误杀多小时合集的健康编码）。
+    # 缺音频的输入会让下方 filter_complex 绑定 [i:a] 失败——在昂贵的
+    # 合并启动前点名报错，而不是让 ffmpeg 抛出难懂的 stream specifier 错误。
     total_dur = 0.0
     for i, fp in enumerate(file_list):
         if not os.path.exists(fp):
@@ -399,6 +403,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         probe = _ffprobe(fp)
         if re.search(r'Stream #0:\d+.*Video:.*?(\d{2,})x(\d{2,})', probe) is None:
             raise Exception(f"FFmpeg concat: file {i} has no video stream: {fp}")
+        if re.search(r'Stream #0:\d+.*Audio:', probe) is None:
+            raise Exception(f"FFmpeg concat: file {i} has no audio stream: {fp}")
         dm = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', probe)
         if dm:
             h, mi, s, ms = map(int, dm.groups())
@@ -452,9 +458,18 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
     中间产物 _batchL* 一律写 FLAC 音频（AAC 中间件会让下一层 concat 的音频
     时间线每边界拉伸 ~20ms，逐层累积成"整体逐渐错位"）；只有产出 output_file
     的那一次编码使用 audio_out（调用方不传则为最终输出的 AAC）。
+
+    batch_size < 2 时无法收缩工作集（单元素批次递归自身）→ 实测无限递归
+    直到 RecursionError/数小时 IO 空转。入口强制钳到 ≥2。
     """
     if not file_list:
         return False
+    try:
+        batch_size = int(batch_size)
+    except (TypeError, ValueError):
+        batch_size = 6
+    if batch_size < 2:
+        batch_size = 2
     if len(file_list) == 1 and not res and not normalize:
         shutil.copy2(file_list[0], output_file)
         os.remove(file_list[0])
@@ -552,9 +567,13 @@ def _ffmpeg_cut_audio(input_file, timestamps, output_file, normalize=False,
     # encoder delay 在 concat 时逐段累积（实测 20 段 +0.85s → 0）。
     seg_files = []
     seg_dir = os.path.dirname(output_file)
+    # 文件名必须带 output stem 唯一化：音频模式 max_parallel=5，两个以上
+    # 多段 source 并发时共享目录里同名 _asegN.flac / concat_list.txt 会互相
+    # 覆盖 → 成片静默串入别的 VOD 的音频。这是审计发现的高危缺陷。
+    seg_stem = os.path.splitext(os.path.basename(output_file))[0]
     try:
         for i, (s, e) in enumerate(timestamps):
-            seg_file = os.path.join(seg_dir, f"_aseg{i}.flac")
+            seg_file = os.path.join(seg_dir, f"_{seg_stem}_aseg{i}.flac")
             seg_files.append(seg_file)
             cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-threads', '2',
                    '-ss', str(s - min(_SEEK_PAD, s)), '-i', input_file,
@@ -584,7 +603,10 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
     if not file_list:
         return False
     temp_dir = os.path.dirname(file_list[0])
-    list_path = os.path.join(temp_dir, 'concat_list.txt')
+    # 列表文件随首个输入 stem 唯一化（并发 audio cut 时共享的 concat_list.txt
+    # 会被兄弟任务截断/删除，见 _ffmpeg_cut_audio 的 stem 注释）。
+    first_stem = os.path.splitext(os.path.basename(file_list[0]))[0]
+    list_path = os.path.join(temp_dir, f"{first_stem}_concat_list.txt")
     durations = []
     for fp in file_list:
         dur = _get_video_duration(fp)
@@ -638,17 +660,21 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
     _out_dir = output if os.path.isdir(output) else os.path.dirname(output)
     if _out_dir and os.path.isdir(_out_dir):
         for _stale in os.listdir(_out_dir):
-            if re.fullmatch(r'(_batchL\d+_\d+|_seg\d+|_aseg\d+)\.(mp4|mp3|flac)', _stale):
+            # 新命名带 output stem（并发唯一化）：_<stem>_segN/_asegN；
+            # 旧命名保留匹配，覆盖升级前崩溃的残留。
+            if re.fullmatch(r'(_batchL\d+_\d+|(?:_[^\\/]{0,120})?_seg\d+|'
+                            r'(?:_[^\\/]{0,120})?_aseg\d+)\.(mp4|mp3|flac)', _stale):
                 try:
                     os.remove(os.path.join(_out_dir, _stale))
                 except OSError:
                     pass
-        _stale_list = os.path.join(_out_dir, 'concat_list.txt')
-        if os.path.exists(_stale_list):
-            try:
-                os.remove(_stale_list)
-            except OSError:
-                pass
+        for _stale in os.listdir(_out_dir):
+            if _stale == 'concat_list.txt' or (
+                    _stale.startswith('_') and _stale.endswith('_concat_list.txt')):
+                try:
+                    os.remove(os.path.join(_out_dir, _stale))
+                except OSError:
+                    pass
 
     if is_video:
         cut_func, concat_func = _ffmpeg_cut, _ffmpeg_concat

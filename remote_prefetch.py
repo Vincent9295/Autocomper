@@ -1,6 +1,7 @@
 """Bounded in-memory HTTP range prefetching for YouTube audio streams."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 import re
 import time
 from typing import Mapping
@@ -58,9 +59,13 @@ def _size_from(source):
     for item in ((active,) if active is not None else (metadata,)):
         for key in ("filesize", "filesize_approx", "clen"):
             value = item.get(key)
+            # int(inf) 抛 OverflowError（不是 ValueError）；先做有限性过滤，
+            # 防 JSON 缓存往返的 Infinity 字面量炸掉调用方。
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
             try:
                 value = int(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if value > 0:
                 return value
@@ -138,6 +143,10 @@ def _scaled_range_attempts(source, base=DEFAULT_RANGE_ATTEMPTS, maximum=12):
     try:
         duration = float(getattr(source, "duration", 0) or 0)
     except (TypeError, ValueError):
+        duration = 0.0
+    # 非/无限（含 JSON 往返的 Infinity）按未知处理：回落到 base，
+    # 避免旧的 int(inf) OverflowError 逃逸窄 except。
+    if not math.isfinite(duration) or duration < 0:
         duration = 0.0
     hours = max(0.0, duration / 3600.0)
     return min(maximum, base + int(hours))

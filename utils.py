@@ -396,7 +396,19 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
                 p.kill()
                 raise subprocess.TimeoutExpired(command, timeout)
     finally:
-        p.wait(timeout=10)
+        # U1 同款兜底：EOF 后进程仍可能楔死（v1.0.9 NVENC 驱动类）。裸
+        # wait(10) 会把"已完成编码"误报为失败且永不清理进程。
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print("run_tracked_progress: wedged FFmpeg survived kill; abandoning it.")
         thread.join(timeout=1)
     return subprocess.CompletedProcess(command, p.returncode, "\n".join(output), "")
 
