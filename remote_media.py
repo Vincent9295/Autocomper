@@ -89,6 +89,10 @@ _REMOTE_SEEK_PAD = 10.0
 # 每个条目都可能触发一次 hydration（4 并发），慢网络下 90s/条会堆积大量后台
 # 线程；缩短到 30s 避免翻页时资源膨胀。
 _PLAYLIST_HYDRATION_TIMEOUT = 30.0
+# 大型合集列表实测 2000+。导入走 extract_flat（轻量、无逐视频 metadata），
+# 旧 1000 上限是全量 metadata 时代的保守值；仍保留一个天花板防止病态列表
+# 冻死选择树 UI。autocomper.MAX_PLAYLIST_ENTRIES 即本常量的再导出。
+MAX_PLAYLIST_ENTRIES = 5000
 
 
 def _segment_is_http(url) -> bool:
@@ -1789,7 +1793,7 @@ def _descriptor_from_info(
             continue
         seen_entry_ids.add(entry.entry_id)
         entries.append(entry)
-        if len(entries) >= 1000:
+        if len(entries) >= MAX_PLAYLIST_ENTRIES:
             break
     if platform.casefold().startswith("bilibili") and len(entries) > 1:
         part_count = len(entries)
@@ -1852,7 +1856,7 @@ def _single_entry_from_info(url: str, info: Mapping[str, Any]) -> PlaylistEntry:
 def _text_descriptor(urls: list[str], source_url: str) -> PlaylistDescriptor:
     entries = [
         PlaylistEntry("text", url, url, url, index=index, metadata={"source": "text-list"})
-        for index, url in enumerate(urls[:1000])
+        for index, url in enumerate(urls[:MAX_PLAYLIST_ENTRIES])
     ]
     return PlaylistDescriptor("text", source_url, "URL list", len(entries), _entries=entries)
 

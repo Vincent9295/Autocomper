@@ -73,6 +73,7 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            source_from_hydrated_entry,
                            preflight_cookie_source,
                            ProbeCooldown,
+                           MAX_PLAYLIST_ENTRIES,
                            _audio_cache_format_identity)
 from remote_cache import CacheStore
 from remote_rate import LimitedRefresher, ResolveLimiter
@@ -99,10 +100,8 @@ DEFAULT_SETTINGS = {
 REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
 REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge", "Cookies File…")
 PLAYLIST_PAGE_SIZE = 30
-# 5000：大型合集列表实测可达 2000+。导入走 extract_flat（轻量、无逐视频
-# metadata），旧 1000 上限是全量 metadata 时代的保守值；仍保留上限防止
-# 病态列表冻死选择树 UI。
-MAX_PLAYLIST_ENTRIES = 5000
+# 单一常量源 remote_media.MAX_PLAYLIST_ENTRIES（=5000，见其注释）：
+# 提取循环的 break、文本列表切片、这里的分页校验共用同一上限。
 REMOTE_MODE_TOOLTIP_TEXT = (
     "Remote Stream: read remote audio directly and fetch video only when needed.\n"
     "Audio Cache: download compressed audio once, then detect from the local cache.\n"
