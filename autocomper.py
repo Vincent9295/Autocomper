@@ -99,7 +99,10 @@ DEFAULT_SETTINGS = {
 REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
 REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge", "Cookies File…")
 PLAYLIST_PAGE_SIZE = 30
-MAX_PLAYLIST_ENTRIES = 1000
+# 5000：大型合集列表实测可达 2000+。导入走 extract_flat（轻量、无逐视频
+# metadata），旧 1000 上限是全量 metadata 时代的保守值；仍保留上限防止
+# 病态列表冻死选择树 UI。
+MAX_PLAYLIST_ENTRIES = 5000
 REMOTE_MODE_TOOLTIP_TEXT = (
     "Remote Stream: read remote audio directly and fetch video only when needed.\n"
     "Audio Cache: download compressed audio once, then detect from the local cache.\n"
@@ -1439,6 +1442,25 @@ def convert_seconds_to_timestamp(seconds: float) -> str:
         hours += 1
         minutes = 0
     return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
+
+
+def format_detection_eta(done, total, recent_elapsed, window=10):
+    """检测阶段逐 VOD 完成行里的进度估算后缀；无法估算时返回空串。
+
+    recent_elapsed 取最近 window 个成功 VOD 的耗时（秒）——自适应
+    缓存命中/未命中的阶段变化；失败的 VOD（快速失败）不计时也不计入，
+    避免污染均值。done >= total（批已完成）或没有成功样本时不显示。
+    """
+    if total <= 0 or done <= 0 or done >= total or not recent_elapsed:
+        return ""
+    recent = list(recent_elapsed)[-window:]
+    avg = sum(recent) / len(recent)
+    remaining = int((total - done) * avg)
+    h, rem = divmod(remaining, 3600)
+    m, s = divmod(rem, 60)
+    eta = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+    return f"(avg {int(avg // 60)}m{int(avg % 60):02d}s/VOD · estimated remaining ~{eta})"
+
 
 def _resolve_txt_paths(output_video_path, configured_txt):
     """Resolve the base timestamps path for a processing session.
@@ -5385,8 +5407,18 @@ class VideoProcessorApp:
                     return True
 
                 failed_uploads = []
+                detection_timings = []
                 for i, upload in enumerate(processing_uploads):
+                    t0 = time.monotonic()
                     ok = run_detection(upload, i)
+                    if ok:
+                        detection_timings.append(time.monotonic() - t0)
+                        eta = format_detection_eta(
+                            len(detection_timings), len(processing_uploads),
+                            detection_timings)
+                        if eta:
+                            print(f"{Fore.CYAN}[{i + 1}/{len(processing_uploads)}] "
+                                  f"{eta}{Style.RESET_ALL}")
                     if not ok and upload.get_is_url():
                         failed_uploads.append(upload)
 

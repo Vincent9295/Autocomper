@@ -276,6 +276,12 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             af += ',loudnorm'
 
         def build_cmd(codec):
+            # -t 而不是 -shortest：-shortest 会在音频 filtergraph EOF 时立即
+            # 中止调度，而 NVENC lookahead 还压着 ~15 帧（实测两流各被截短
+            # 恰好 500ms、且残留 +20ms/段的音频落后漂移——切点与输入 EOF
+            # 重合时必现，reverify 合并出的多时间戳条目全部命中）。显式
+            # -t {dur} 让编码器自然排水并精确封顶：视频 CFR 填满到 dur、
+            # 音频 atrim 精确到 dur → A=V=dur，无截短、无漂移。
             c = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
                 '-accurate_seek',
                 '-ss', str(s - pad),
@@ -283,7 +289,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 '-ss', str(pad), '-to', str(pad + dur),
                 '-af', af,
                 '-avoid_negative_ts', 'make_zero',
-                '-vsync', 'cfr', '-shortest',
+                '-vsync', 'cfr', '-t', f'{dur:.6f}',
             ] + codec + audio_codec_tmp
             if res:
                 w, h = res
@@ -389,14 +395,23 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
              (audio_out or _AAC_AUDIO_OUT)
         if fps and fps > 0:
             c += ['-r', str(int(fps))]
-        c += ['-vsync', 'cfr', '-shortest', output_file]
+        # -t 而不是 -shortest（与切段路径同理）：-shortest 在任一 filtergraph
+        # EOF 时经 sync queue 中止，NVENC lookahead 压着的尾帧会让末尾被截。
+        # 输入在切段修复后 A=V 精确等长 → 输出自然在 Σdur 结束；-t 只是
+        # probe 总和 +1s 的安全封顶（探测不全时退回 -shortest）。
+        if probes_complete and total_dur > 0:
+            c += ['-t', f'{total_dur + 1.0:.3f}']
+        else:
+            c += ['-shortest']
+        c += ['-vsync', 'cfr', output_file]
         return c
 
     # 验证所有输入文件有视频+音频流；顺带累加总时长用于动态超时
-    # （固定 1200s 会误杀多小时合集的健康编码）。
+    # （固定 1200s 会误杀多小时合集的健康编码）和 -t 封顶。
     # 缺音频的输入会让下方 filter_complex 绑定 [i:a] 失败——在昂贵的
     # 合并启动前点名报错，而不是让 ffmpeg 抛出难懂的 stream specifier 错误。
     total_dur = 0.0
+    probes_complete = True
     for i, fp in enumerate(file_list):
         if not os.path.exists(fp):
             raise Exception(f"FFmpeg concat: file {i} missing: {fp}")
@@ -409,6 +424,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         if dm:
             h, mi, s, ms = map(int, dm.groups())
             total_dur += h * 3600 + mi * 60 + s + ms / 100
+        else:
+            probes_complete = False
     concat_timeout = max(1800, int(total_dur * 2) + 600)
     # 进度显示用调用方传入的真实总长（含 padding），否则 probe 到的片段时长
     # 会低于实际输出，让 Encoded: X / Y 看起来像超时。
