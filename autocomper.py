@@ -1,6 +1,7 @@
 import configparser
 import math
 import os
+import socket
 import shutil
 import queue
 import re
@@ -1459,6 +1460,99 @@ def format_detection_eta(done, total, recent_elapsed, window=10):
     m, s = divmod(rem, 60)
     eta = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
     return f"(avg {int(avg // 60)}m{int(avg % 60):02d}s/VOD · estimated remaining ~{eta})"
+
+
+# 网络中断耐心循环：测试者实测"断网一小会儿 → 整批 VOD 瞬间跳过"。
+# 网络类失败（RST/超时/DNS）是立即返回的，没有任何等待，断网几十秒就会
+# 烧穿整个批次。耐心循环按阶梯等待（总计 ~8.7 分钟）并在网络恢复后重试
+# 失败集；永久性失败（VOD 已删等）照旧跳过。
+_OUTAGE_WAIT_STEPS = (10, 30, 60, 120, 300)
+_PROBE_HOSTS = {
+    "twitch": ("twitch.tv", "www.twitch.tv"),
+    "youtube": ("www.youtube.com", "youtube.com"),
+    "bilibili": ("api.bilibili.com", "www.bilibili.com"),
+}
+_PROBE_HOSTS_DEFAULT = ("www.youtube.com", "twitch.tv", "www.bilibili.com")
+
+
+def _probe_hosts_for(uploads):
+    """从失败 upload 集合推断探测用的平台域名（用于网络连通性探针）。"""
+    hosts = []
+    for upload in uploads:
+        try:
+            if not upload.get_is_url():
+                continue
+            source = upload.get_source()
+            platform = str(getattr(source, "platform", "") or "").lower()
+            url = str(getattr(source, "source_url", "") or getattr(upload, "get_path", lambda: "")())
+        except Exception:
+            continue
+        blob = f"{platform} {url}".lower()
+        matched = False
+        for key, candidates in _PROBE_HOSTS.items():
+            if key in blob or any(h.split(".", 1)[0] in blob for h in candidates):
+                hosts.extend(candidates)
+                matched = True
+                break
+        if not matched:
+            hosts.extend(_PROBE_HOSTS_DEFAULT)
+    return list(dict.fromkeys(hosts)) or list(_PROBE_HOSTS_DEFAULT)
+
+
+def network_probe_ok(hosts, dial=None, timeout=5.0):
+    """任一 host 的 TCP:443 能建立连接即视为网络可达。dial 可注入以便测试。"""
+    if dial is None:
+        def dial(host, timeout):
+            sock = socket.create_connection((host, 443), timeout=timeout)
+            sock.close()
+    for host in hosts:
+        try:
+            dial(host, timeout)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _cancellable_wait(seconds):
+    """等待 seconds 秒；每 0.5s 检查一次取消。返回 False 表示被取消。"""
+    end = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_pending():
+            return False
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.5, remaining))
+
+
+def _outage_retry_cycles(failed_uploads, run_detection, probe_ok, wait_fn,
+                         steps=None, index_base=0):
+    """网络中断耐心循环：阶梯等待 + 探测通过后重试失败集。
+
+    返回 (仍失败的 uploads, 恢复的数量)。wait_fn(seconds) 返回 False 表示
+    用户取消，循环立即中止（剩余失败原样返回）。
+    """
+    steps = steps or _OUTAGE_WAIT_STEPS
+    still = list(failed_uploads)
+    recovered = 0
+    for wait_s in steps:
+        if not still:
+            break
+        if not wait_fn(wait_s):
+            break
+        if not probe_ok():
+            print(f"{Fore.YELLOW}  Network probe still failing; "
+                  f"waiting for the next cycle...")
+            continue
+        keep = []
+        for retry_index, upload in enumerate(still):
+            if run_detection(upload, index_base + retry_index):
+                recovered += 1
+            else:
+                keep.append(upload)
+        still = keep
+    return still, recovered
 
 
 def _resolve_txt_paths(output_video_path, configured_txt):
@@ -5421,26 +5515,35 @@ class VideoProcessorApp:
                     if not ok and upload.get_is_url():
                         failed_uploads.append(upload)
 
-                # 第二遍：网络/限流是暂时性的，等退避后仅对失败的远程源重试一次，
-                # 避免整批最后直接跳过本来能恢复的源。
+                # 网络中断耐心循环：断网时所有网络调用立即失败（RST 无等待），
+                # 旧的单次 10s 重试撞上持续几十秒的断网会烧穿整批。现在按
+                # (10,30,60,120,300)s 阶梯等待 + 平台连通性探针，探测通过才重试
+                # 失败集；取消随时可中断；永久性失败（VOD 已删等）不受益但也
+                # 只是 bounded 的重试，最终仍走 skipped 报告。
                 if failed_uploads:
-                    print(
-                        f"{Fore.CYAN}Retrying {len(failed_uploads)} failed remote source(s) "
-                        f"after a short pause...")
-                    time.sleep(10)
-                    recovered = []
-                    for retry_index, upload in enumerate(failed_uploads):
-                        ok = run_detection(upload, len(processing_uploads) + retry_index)
-                        if not ok:
-                            print(
-                                f"{Fore.YELLOW}  Retry still failed: "
-                                f"{get_source_display_name(upload)}")
-                        else:
-                            recovered.append(get_source_display_name(upload))
-                    if recovered:
+                    def _patience_wait(seconds):
                         print(
-                            f"{Fore.GREEN}Retry pass recovered {len(recovered)} previously "
-                            f"failed source(s); remaining failures listed below.")
+                            f"{Fore.CYAN}Network appears unreachable — waiting "
+                            f"{seconds}s before retrying {len(failed_uploads)} failed "
+                            f"remote source(s)...{Style.RESET_ALL}")
+                        return _cancellable_wait(seconds)
+
+                    still_failed, recovered_n = _outage_retry_cycles(
+                        failed_uploads, run_detection,
+                        probe_ok=lambda: network_probe_ok(
+                            _probe_hosts_for(failed_uploads)),
+                        wait_fn=_patience_wait,
+                        index_base=len(processing_uploads))
+                    if recovered_n:
+                        print(
+                            f"{Fore.GREEN}Network patience recovered {recovered_n} "
+                            f"previously failed source(s); remaining failures listed "
+                            f"below.{Style.RESET_ALL}")
+                    if still_failed:
+                        print(
+                            f"{Fore.YELLOW}Skipped {len(still_failed)} remote source(s) "
+                            f"after all network patience cycles; see the skipped VOD list "
+                            f"above.{Style.RESET_ALL}")
 
                 if incomplete_failures:
                     print(

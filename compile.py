@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 
+import numpy as np
+
 from colorama import Fore, Style
 
 from progress import format_compile_progress
@@ -195,6 +197,52 @@ def get_video_codec():
 _X264_CODEC = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
                '-crf', '18', '-maxrate', '12M', '-bufsize', '24M', '-sar', '1:1']
 
+# ── 逐段 A=V 时长强制相等（修 "next sound starts early" 的累积漂移）──
+# Twitch 段实测：视频帧时间线 = req + 17~33ms（HLS 头偏移 + 帧粒度），
+# 音频内容 = req − 45ms（priming 编辑）→ 每段 A−V ≈ −78ms，concat 逐段
+# 累积 → 视频时间轴越来越落后于音频（"画面移后/转场提前"）。
+# 修复：copy_cut 音频 asetpts 重基 + atrim 截尾 + apad 补齐到视频时长；
+# re-encode 同理（CFR 视频 = eff，音频 atrim+apad 到 eff）→ 每段 A=V
+# 精确相等，漂移归零。Bilibili 段容器 V=req 无头偏移，本就无此问题
+# （与测试者"只影响 Twitch"的观察一致）。
+_TAIL_WIN_S = 0.04                 # 包络窗 40ms
+_TAIL_QUIET_FLOOR = 90.0           # "可闻"判定绝对下限（8k RMS int16 量纲）
+_TAIL_QUIET_RATIO = 0.06           # "可闻"相对阈值：区域峰值 × 6%
+_TAIL_FADE_S = 0.1                 # 截断处淡出时长
+
+
+def _decode_audio_region(path, offset, duration, sr=8000):
+    """解码 [offset, offset+duration) 的单声道音频，返回 float32 采样；
+    失败返回 None。"""
+    cmd = [FFMPEG_PATH, '-v', 'error', '-ss', f'{offset:.3f}',
+           '-t', f'{duration:.3f}', '-i', path, '-map', '0:a:0?',
+           '-ac', '1', '-ar', str(sr), '-f', 's16le', '-']
+    r = subprocess.run(cmd, capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)
+
+
+def tail_audible_end_seconds(samples, sr,
+                             quiet_floor=_TAIL_QUIET_FLOOR,
+                             quiet_ratio=_TAIL_QUIET_RATIO,
+                             fade_s=_TAIL_FADE_S):
+    """垫后/尾部分析：最后一个"可闻窗"的末端 + fade 边距 → clip 的有效
+    终点（秒，相对 samples[0]）。全部静音 → fade_s；退化输入 → None。"""
+    samples = np.asarray(samples, dtype=np.float32)
+    win = max(1, int(_TAIL_WIN_S * sr))
+    total = len(samples) // win
+    if total < 2:
+        return None
+    env = np.abs(samples[:total * win].reshape(total, win)).mean(axis=1)
+    peak = float(env.max())
+    floor = max(quiet_floor, peak * quiet_ratio)
+    audible = [i for i, v in enumerate(env) if v >= floor]
+    if not audible:
+        return fade_s
+    return (audible[-1] + 1) * win / sr + fade_s
+
 
 def _fallback_to_x264():
     """NVENC 编码中途失败时，永久回退 libx264（更新缓存）。"""
@@ -205,7 +253,7 @@ def _fallback_to_x264():
 
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 fps=None, preserve_duration=False, progress_callback=None,
-                duration=None, copy_cut=False, batch_size=6):
+                duration=None, batch_size=6):
     if not timestamps:
         return False
 
@@ -220,47 +268,6 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     if n == 0:
         return False
 
-    if copy_cut and n == 1:
-        s, e = timestamps[0]
-        # materialized clip 已是精确区间：视频流直接 copy（快），音频重编为
-        # FLAC（无编码延迟、时长精确），避免 aac priming 在 concat 边界产生
-        # audio overlap/desync。帧率/音量等归一化交给后续 concat（combine 模式）。
-        full_range = s <= 0.05 and (duration is None or e >= duration - 0.1)
-        if full_range:
-            # 远程段（AAC 源）的音频轨普遍比视频长 ~21ms（AAC priming 残留，
-            # 实测真实缓存段 A-V 中位数 +21.3ms）。concat filter 把视频帧序列
-            # 和音频采样列各自独立拼接，这个差值会逐段线性累积（940 段 ≈ 尾部
-            # 错位 20s）。因此 remux 时把音频精确裁到 min(请求时长, 视频实际时长)。
-            target_dur = max(0.0, e - s)
-            probe = _ffprobe(input_file)
-            has_audio = re.search(r'Stream #0:\d+.*Audio:', probe) is not None
-            dm = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', probe)
-            if dm:
-                h, mi, sd_, msd = map(int, dm.groups())
-                vdur = h * 3600 + mi * 60 + sd_ + msd / 100
-                if vdur > 0:
-                    target_dur = min(target_dur or vdur, vdur)
-            af = None
-            if has_audio and target_dur > 0:
-                af = f'atrim=end={target_dur:.6f},asetpts=PTS-STARTPTS'
-            cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
-                   '-i', input_file, '-map', '0:v:0', '-map', '0:a:0?',
-                   '-c:v', 'copy', '-c:a', 'flac']
-            if af:
-                cmd += ['-af', af]
-            cmd += ['-avoid_negative_ts', 'make_zero',
-                    '-movflags', '+faststart', output_file]
-            result = _run_ffmpeg(cmd, timeout=300,
-                                 progress_callback=progress_callback,
-                                 duration=duration, stage="Remuxing clip")
-            if result.returncode != 0:
-                raise Exception(
-                    f"FFmpeg remux failed for {os.path.basename(input_file)}"
-                    f"\n  rc={result.returncode}\n  stderr: "
-                    f"{_sanitize_ffmpeg_detail(result.stderr)}"
-                    f"\n  stdout: {_sanitize_ffmpeg_detail(result.stdout)}")
-            return True
-
     video_codec = get_video_codec()
     if fps and fps > 0:
         video_codec += ['-r', str(int(fps))]
@@ -271,17 +278,19 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         s, e = timestamps[0]
         dur = e - s
         pad = min(_SEEK_PAD, s)
-        af = f'atrim={pad}:{pad + dur}'
+        # A=V 强制相等：视频 CFR 填满到 dur（-t dur），音频 atrim+apad 到 dur
+        af = (f'atrim={pad}:{pad + dur},asetpts=PTS-STARTPTS,'
+              f'apad=whole_dur={dur:.6f}')
         if normalize:
-            af += ',loudnorm'
+            af = (f'atrim={pad}:{pad + dur},asetpts=PTS-STARTPTS,loudnorm,'
+                  f'apad=whole_dur={dur:.6f}')
 
         def build_cmd(codec):
             # -t 而不是 -shortest：-shortest 会在音频 filtergraph EOF 时立即
             # 中止调度，而 NVENC lookahead 还压着 ~15 帧（实测两流各被截短
-            # 恰好 500ms、且残留 +20ms/段的音频落后漂移——切点与输入 EOF
-            # 重合时必现，reverify 合并出的多时间戳条目全部命中）。显式
-            # -t {dur} 让编码器自然排水并精确封顶：视频 CFR 填满到 dur、
-            # 音频 atrim 精确到 dur → A=V=dur，无截短、无漂移。
+            # 恰好 500ms——切点与输入 EOF 重合时必现）。显式 -t {dur} 让
+            # 编码器自然排水并精确封顶：视频 CFR 填满到 dur、音频 atrim
+            # 精确到 dur → A=V=dur，无截短、无漂移。
             c = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
                 '-accurate_seek',
                 '-ss', str(s - pad),
@@ -320,6 +329,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                             f"{_sanitize_ffmpeg_detail(result.stdout)}")
         return True
 
+    # n > 1：多段切分——先逐段切（重基到 0 的 re-encode），再 batched concat。
+    # 段循环的递归调用 n=1 → 终止于 re-encode，无递归风险。
     seg_files = []
     seg_dir = os.path.dirname(output_file)
     # 文件名带 output stem：音频模式 max_parallel=5 时多个 source 并发切分，
@@ -333,10 +344,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                         normalize=normalize, fps=fps,
                         preserve_duration=preserve_duration,
                         progress_callback=progress_callback, duration=duration)
-        # 必须走 batched：单视频上千 segment 时 _ffmpeg_concat 会把所有 -i
-        # 和 filter 塞进一条命令，超过 Windows 命令行上限 → WinError 206。
-        # 该产物会继续进入 compile_vid 的最终 concat，必须写 FLAC 音频
-        # （AAC 中间产物会让 concat 音频时间线逐边界拉伸 ~20ms）。
+        # 多段合并：产物会继续进入 compile_vid 的最终 concat，必须写 FLAC
+        # 音频（AAC 中间产物会让 concat 音频时间线逐边界拉伸 ~20ms）。
         _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
                                fps=fps, progress_callback=progress_callback,
                                total_duration=duration, batch_size=batch_size,
@@ -805,11 +814,8 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 preserve_duration = bool(
                     (elt.get('source_metadata') or {}).get(
                         'materialized_remote_segment'))
-                copy_cut = bool(
-                    is_video and combine_vids and preserve_duration
-                    and len(timestamps) == 1)
                 tasks.append((n, filename, filename_stripped, timestamps, temp,
-                              cut_res, preserve_duration, dur, copy_cut))
+                              cut_res, preserve_duration, dur))
 
             if not tasks:
                 raise Exception("No timestamps found for any input media!")
@@ -822,12 +828,11 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     if cancel_pending():
                         executor.shutdown(cancel_futures=True)
                         raise InterruptedError("Compile cancelled by user.")
-                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur, copy_cut = task
+                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur = task
                     f = executor.submit(cut_func, fn, ts, tmp,
                                         **({'res': cr, 'fps': fps,
                                             'preserve_duration': preserve_duration,
                                             'duration': dur,
-                                            'copy_cut': copy_cut,
                                             'batch_size': batch_size,
                                             'progress_callback': progress_callback}
                                             if is_video else {}),
