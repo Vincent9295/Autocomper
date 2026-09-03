@@ -85,6 +85,9 @@ _BILIBILI_CDN_HOSTS = (
     "upos-sz-mirroralib.bilivideo.com",
 )
 _REMOTE_SEEK_PAD = 10.0
+# 输入读取窗余量（秒）：覆盖 HLS 分片粒度导致的 seek 落点偏差（实测 ~1s），
+# 保证 trim 终点前的内容一定被读到。余量只扩大下载范围，不改变输出内容。
+_REMOTE_READ_MARGIN = 3.0
 # Playlist 条目 hydration 的解析超时。普通 resolve 用 90s，但 playlist 浏览时
 # 每个条目都可能触发一次 hydration（4 并发），慢网络下 90s/条会堆积大量后台
 # 线程；缩短到 30s 避免翻页时资源膨胀。
@@ -878,7 +881,12 @@ def build_segment_command(
     duration = end_value - start_value
     seek_start = max(0.0, start_value - _REMOTE_SEEK_PAD)
     trim_offset = start_value - seek_start
-    input_duration = trim_offset + duration
+    # 输入读取窗余量：HLS/TS 的输入 -t 按 seek "落点"计时，而落点可能比分片
+    # 边界晚（Twitch ~1s 分片）→ 读取在 trim 终点前 δ(~1s) 处停止，段尾缺失。
+    # 实测 58/678 个缓存 Twitch 段少交付 ~1.0s，该缺口在 concat 逐段累积成
+    # 全局 A/V 失步。加固定余量保证 trim 永远拿得到完整窗口；trim 过滤器
+    # 与输出 -t 仍精确裁剪，内容不受余量影响。
+    input_duration = trim_offset + duration + _REMOTE_READ_MARGIN
     seek_text = _segment_number(seek_start, "seek start")
     input_duration_text = _segment_number(input_duration, "input duration")
     trim_start_text = _segment_number(trim_offset, "trim offset")

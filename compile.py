@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,129 @@ def _get_frame_rate(input_file: str):
     if m:
         return float(m.group(1))
     return 30.0
+
+
+# ── 视频轨实际时长（A=V 锚定的测量基础）──
+# 容器 Duration = max(A, V) 会把较短的视频轨掩盖住（Twitch fetch 因 HLS 分片
+# 落点少交付 δ 的段，容器时长=音频时长——这正是此前"全局 A−V≈0"测量全部
+# 失效的盲区）。包内无 ffprobe，这里直接解析 mp4 头（faststart 下 moov 在
+# 文件头，读取量极小）拿视频轨自己的 mdhd 时长，与 ffprobe
+# -select_streams v 的 stream duration 等价。
+_VSTREAM_CACHE = {}
+
+
+def _mp4_box_header(f):
+    """读一个 box 头，返回 (size, typ, header_len)；读不到返回 None。"""
+    hdr = f.read(8)
+    if len(hdr) < 8:
+        return None
+    size, typ = struct.unpack('>I4s', hdr)
+    header_len = 8
+    if size == 1:
+        ext = f.read(8)
+        if len(ext) < 8:
+            return None
+        size = struct.unpack('>Q', ext)[0]
+        header_len = 16
+    return size, typ, header_len
+
+
+def _mp4_walk_containers(f, start, end, target):
+    """在 [start, end) 内找名为 target 的容器 box（只遍历顶层/指定层）。"""
+    pos = start
+    while pos + 8 <= end:
+        f.seek(pos)
+        head = _mp4_box_header(f)
+        if head is None:
+            return None
+        size, typ, header_len = head
+        if size == 0:
+            size = end - pos
+        if size < header_len or pos + size > end:
+            return None
+        if typ == target:
+            return (pos + header_len, pos + size)
+        pos += size
+    return None
+
+
+def _mp4_mdia_track_duration(f, start, end, handler):
+    """在 mdia 内配对 hdlr + mdhd，返回该轨时长（秒）；类型不符返回 None。"""
+    timescale = None
+    duration = None
+    matched = False
+    pos = start
+    while pos + 8 <= end:
+        f.seek(pos)
+        head = _mp4_box_header(f)
+        if head is None:
+            break
+        size, typ, header_len = head
+        if size == 0:
+            size = end - pos
+        if size < header_len or pos + size > end:
+            break
+        body = f.read(min(size - header_len, 32))
+        if typ == b'hdlr':
+            if len(body) >= 12 and body[8:12] == handler:
+                matched = True
+        elif typ == b'mdhd':
+            if len(body) >= 20 and body[0] == 0:
+                timescale = struct.unpack('>I', body[12:16])[0]
+                duration = struct.unpack('>I', body[16:20])[0]
+            elif len(body) >= 32 and body[0] == 1:
+                timescale = struct.unpack('>I', body[20:24])[0]
+                duration = struct.unpack('>Q', body[24:32])[0]
+        pos += size
+    if matched and timescale and duration is not None:
+        return duration / float(timescale)
+    return None
+
+
+def _mp4_track_duration(path, handler):
+    """mp4/mov 指定轨（hdlr 类型：b'vide'/b'soun'）的容器时长（秒）。
+
+    只做头部解析（不解码）：moov→trak→mdia→(hdlr + mdhd)。这个值与
+    ffprobe -select_streams 的 stream duration 一致，也是 concat filter
+    拼接各输入时实际使用的轨时长。不可解析返回 None。"""
+    key = (os.path.normcase(os.path.normpath(str(path))), handler)
+    if key in _VSTREAM_CACHE:
+        return _VSTREAM_CACHE[key]
+    result = None
+    try:
+        with open(path, 'rb') as f:
+            fsize = os.fstat(f.fileno()).st_size
+            moov = _mp4_walk_containers(f, 0, fsize, b'moov')
+            if moov:
+                pos = moov[0]
+                while pos + 8 <= moov[1]:
+                    f.seek(pos)
+                    head = _mp4_box_header(f)
+                    if head is None:
+                        break
+                    size, typ, header_len = head
+                    if size == 0:
+                        size = moov[1] - pos
+                    if size < header_len or pos + size > moov[1]:
+                        break
+                    if typ == b'trak':
+                        mdia = _mp4_walk_containers(
+                            f, pos + header_len, pos + size, b'mdia')
+                        if mdia:
+                            result = _mp4_mdia_track_duration(
+                                f, mdia[0], mdia[1], handler)
+                            if result is not None:
+                                break
+                    pos += size
+    except OSError:
+        result = None
+    _VSTREAM_CACHE[key] = result
+    return result
+
+
+def _video_stream_duration(path):
+    """mp4 视频轨容器时长（秒）；不可解析/非 mp4 返回 None。"""
+    return _mp4_track_duration(path, b'vide')
 
 
 def _mixed_resolution_target(file_list):
@@ -251,6 +375,55 @@ def _fallback_to_x264():
     print(f"{Fore.YELLOW}NVENC encode failed; falling back to libx264 (CPU).{Style.RESET_ALL}")
 
 
+def _align_cut_audio_to_video(path):
+    """第二遍对齐：把音频轨重封到本文件视频轨的实际时长（A=V 逐帧相等）。
+
+    CFR 输出的视频轨时长（容器 mdhd）由帧网格决定，编码前无法精确预测——
+    请求时长落在网格上/差一帧/源段视频轨本身短缺（HLS 分片落点少交付 δ），
+    输出视频轨都会偏离请求值 ±1 帧。concat filter 按各输入的容器轨时长独立
+    拼接视频帧与音频采样，这个偏差会逐段线性累积（实测 testaudio.mp4 全局
+    A−V = +54.5s）。先量后裁：读输出文件的视/音轨 mdhd；已相等（±0.1ms，
+    整数时长 clip 通常直接命中）则跳过；否则 -c:v copy 重封音频到视频轨
+    时长——视频零重编码，音频只重编一次 FLAC。测不准/失败时保留第一遍
+    结果（不致命）。
+    """
+    v = _mp4_track_duration(path, b'vide')
+    a = _mp4_track_duration(path, b'soun')
+    if v is None or a is None or v <= 0:
+        return
+    if abs(a - v) <= 0.0001:
+        return
+    tmp = f"{path}.align.tmp.mp4"
+    cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+           '-i', path,
+           '-map', '0:v:0', '-map', '0:a:0?',
+           '-c:v', 'copy',
+           '-af', f'atrim=0:{v:.6f},asetpts=PTS-STARTPTS,'
+                  f'apad=whole_dur={v:.6f}',
+           '-c:a', 'flac',
+           '-avoid_negative_ts', 'make_zero',
+           '-movflags', '+faststart',
+           tmp]
+    try:
+        result = _run_ffmpeg(cmd, timeout=300)
+        if result.returncode != 0 or not os.path.exists(tmp):
+            raise Exception(f"rc={result.returncode} stderr="
+                            f"{_sanitize_ffmpeg_detail(result.stderr)}")
+        os.replace(tmp, path)
+        # 重封后缓存里的旧轨时长作废
+        _VSTREAM_CACHE.pop((os.path.normcase(os.path.normpath(path)), b'soun'), None)
+        _VSTREAM_CACHE.pop((os.path.normcase(os.path.normpath(path)), b'vide'), None)
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        print(f"{Fore.YELLOW}  Warning: A=V align pass failed for "
+              f"{os.path.basename(path)} ({exc}); keeping the first pass."
+              f"{Style.RESET_ALL}")
+
+
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 fps=None, preserve_duration=False, progress_callback=None,
                 duration=None, batch_size=6):
@@ -327,6 +500,11 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                             f"\n  rc={result.returncode}\n  stderr: "
                             f"{_sanitize_ffmpeg_detail(result.stderr)}\n  stdout: "
                             f"{_sanitize_ffmpeg_detail(result.stdout)}")
+        if preserve_duration:
+            # materialized 段：第二遍把音频对齐到该文件视频轨的实际时长
+            # （CFR 帧网格 + fetch 交付差都会让 -t dur 的预估差 ±1 帧，
+            # 不对齐就会在 concat 逐段累积成全局 A/V 失步）。
+            _align_cut_audio_to_video(output_file)
         return True
 
     # n > 1：多段切分——先逐段切（重基到 0 的 re-encode），再 batched concat。
@@ -681,6 +859,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
     # 同进程二次运行会复用旧路径的 probe 结果（如 _seg0.mp4 已重写），
     # 清空缓存避免时长/尺寸用旧值。
     _PROBE_CACHE.clear()
+    _VSTREAM_CACHE.clear()
 
     # 清理上次崩溃/强杀残留的中间文件（只删我们自己的命名模式，不碰用户文件）
     _out_dir = output if os.path.isdir(output) else os.path.dirname(output)
