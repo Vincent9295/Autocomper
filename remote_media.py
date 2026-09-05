@@ -84,6 +84,9 @@ _BILIBILI_CDN_HOSTS = (
     "upos-sz-mirrorcos.bilivideo.com",
     "upos-sz-mirroraliov.bilivideo.com",
     "upos-sz-mirroralib.bilivideo.com",
+    # B 站国际 CDN（Akamai 全球网络）：海外用户直连国内 upos 慢时的主力选项；
+    # 探测按实测速度选，国内用户探得慢就不会被选中。
+    "upos-hz-mirrorakam.akamaized.net",
 )
 _REMOTE_SEEK_PAD = 10.0
 # 输入读取窗余量（秒）：覆盖 HLS 分片粒度导致的 seek 落点偏差（实测 ~1s），
