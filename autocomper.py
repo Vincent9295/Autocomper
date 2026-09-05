@@ -135,20 +135,22 @@ REMOTE_AUDIO_CHUNK_TOOLTIP_TEXT = (
     "Smaller chunks recover faster when a single request hangs; larger chunks\n"
     "make fewer requests. This setting depends heavily on your CDN and network:\n"
     "if your connection is unstable, a large chunk can hang forever and stall the\n"
-    "whole batch. Keep 4 MiB unless you know your network handles it. Default: 4."
+    "whole batch. Default: 8. Sources whose metadata lacks a file size are probed\n"
+    "automatically (bytes=0-0) so they still use the parallel prefetch path."
 )
 REMOTE_AUDIO_CONCURRENCY_TOOLTIP_TEXT = (
-    "How many Audio Cache audio streams to download at once (same style as YouTube).\n"
-    "More workers may finish faster on a good connection, but on an unstable or\n"
-    "rate-limited CDN more concurrent requests can trip protection and cause 403s\n"
-    "or stalls. Lower to 1-2 if a batch hangs partway. Default: 4."
+    "How many chunks to download in parallel for one Audio Cache file, and how\n"
+    "many workers YouTube Remote Stream prefetch uses. More workers may finish\n"
+    "faster on a good connection, but on an unstable or rate-limited CDN more\n"
+    "concurrent requests can trip protection and cause 403s or stalls. Lower to\n"
+    "1-2 if a batch hangs partway. Default: 8 (max 32)."
 )
-REMOTE_AUDIO_CHUNK_DEFAULT = 4
+REMOTE_AUDIO_CHUNK_DEFAULT = 8
 REMOTE_AUDIO_CHUNK_MIN = 1
 REMOTE_AUDIO_CHUNK_MAX = 64
-REMOTE_AUDIO_CONCURRENCY_DEFAULT = 4
+REMOTE_AUDIO_CONCURRENCY_DEFAULT = 8
 REMOTE_AUDIO_CONCURRENCY_MIN = 1
-REMOTE_AUDIO_CONCURRENCY_MAX = 16
+REMOTE_AUDIO_CONCURRENCY_MAX = 32
 MERGE_BATCH_TOOLTIP_TEXT = (
     "How many clips each FFmpeg merge batch combines before the final concat.\n"
     "Smaller batches (e.g. 6) use less RAM per FFmpeg process and are safer on\n"
@@ -167,15 +169,19 @@ REMOTE_CACHE_TOOLTIP_TEXT = (
     "the next run may need to download or detect the remote media again.\n\n"
     "External audio files are not identified automatically from their contents.\n"
     "To use one safely, it must be associated with the matching VOD source ID and\n"
-    "must cover the same VOD timeline. For Bilibili multi-part videos, each part\n"
-    "has its own source ID. Audio files stay local and are never uploaded."
+    "must cover the same VOD timeline. Bulk import proposes pairings by duration\n"
+    "(and exact title matches) and shows a confirmation table before converting;\n"
+    "ambiguous rows are skipped, never guessed. For Bilibili multi-part videos,\n"
+    "each part has its own source ID. Audio files stay local and are never uploaded."
 )
 EXTERNAL_AUDIO_TOOLTIP_TEXT = (
-    "Import audio downloaded separately for the selected Remote VOD.\n"
-    "Select exactly one YouTube, Twitch, or Bilibili URL in the main list first.\n"
-    "The audio must cover the same VOD timeline; AutoComper cannot identify its\n"
-    "source from audio content alone. Bilibili multi-part videos are imported\n"
-    "one part at a time. The file is converted to m4a and stays local."
+    "Import audio downloaded separately for the selected Remote VOD(s).\n"
+    "Select one URL VOD to import one file manually, or select multiple URL VODs\n"
+    "(Ctrl/Shift-click) to import many files: AutoComper pairs them by duration\n"
+    "(tolerance max(5s, 1% of VOD length)) and shows a confirmation table before\n"
+    "converting anything — ambiguous or unmatched rows are skipped, never guessed.\n"
+    "The audio must cover the same VOD timeline; Bilibili multi-part videos are\n"
+    "imported one part at a time. Files are converted to m4a and stay local."
 )
 
 
@@ -671,6 +677,186 @@ def _get_external_audio_codec(path):
     output = (getattr(result, "stderr", "") or "") + (getattr(result, "stdout", "") or "")
     match = re.search(r"Audio:\s*([^,\s]+)", output, flags=re.IGNORECASE)
     return match.group(1).lower() if match else None
+
+
+def _external_audio_duration_tolerance(vod_duration):
+    """与单文件导入相同的时长容差：max(5s, VOD 时长的 1%)。"""
+    return max(5.0, float(vod_duration) * 0.01)
+
+
+def _normalize_pairing_title(value):
+    """配对标题规范化：去扩展名 + strip + casefold。"""
+    text = str(value or "").strip()
+    return os.path.splitext(text)[0].strip().casefold()
+
+
+def _title_matches_vod(file_entry, vod_entry):
+    """文件名（去扩展名）与 VOD display_name 精确一致 → 配对信号最强。"""
+    source = vod_entry.get("source")
+    vod_title = getattr(source, "display_name", "") if source else ""
+    if not vod_title:
+        return False
+    normalized = _normalize_pairing_title(vod_title)
+    return bool(normalized) and \
+        _normalize_pairing_title(file_entry.get("name")) == normalized
+
+
+def _pair_external_audio(files, vods):
+    """按时长把外部音频文件贪心配对到已解析的 VOD。
+
+    files/vods 是 worker 预探测好的 dict 列表（duration/error 字段）；
+    纯函数无 IO，配对结果必须经确认表人工确认后才执行导入。
+    文件名与 VOD 标题精确一致时优先锁定（跳过歧义判定，Δ=0 也常被
+    同系列多场直播误伤）。返回 [{'file_index', 'vod_index', 'delta',
+    'ambiguous', 'title_locked', 'had_close_alternative'}]，
+    按 (file_index, vod_index) 排序。had_close_alternative=True 表示该文件
+    存在另一个容差内的 VOD 候选（已被认领）——这是"被迫的剩余配对"，
+    大概率正确但确认表中以独立状态提示用户复核。
+    """
+    candidates = []
+    for fi, f in enumerate(files):
+        if f.get("error") or f.get("duration") is None:
+            continue
+        for vi, v in enumerate(vods):
+            if v.get("error") or v.get("duration") is None:
+                continue
+            delta = abs(f["duration"] - v["duration"])
+            if delta <= _external_audio_duration_tolerance(v["duration"]):
+                candidates.append((delta, fi, vi))
+    candidates.sort(key=lambda c: c[0])
+    claimed_files, claimed_vods = set(), set()
+
+    # 第一遍：标题精确匹配直接锁定（可能不在 Δ 升序头部，但要抢先认领）
+    pairs = []
+    for delta, fi, vi in candidates:
+        if fi in claimed_files or vi in claimed_vods:
+            continue
+        if _title_matches_vod(files[fi], vods[vi]):
+            pairs.append({"file_index": fi, "vod_index": vi, "delta": delta,
+                          "ambiguous": False, "title_locked": True})
+            claimed_files.add(fi)
+            claimed_vods.add(vi)
+
+    # 第二遍：其余候选按 Δ 升序贪心认领 + 歧义判定
+    for delta, fi, vi in candidates:
+        if fi in claimed_files or vi in claimed_vods:
+            continue
+        # 歧义：另一个仍未认领的 VOD 也在容差内且 Δ 差距小到分不清。
+        # 有歧义宁可拒绝配对（确认表中默认不勾选），绝不瞎猜。
+        # 已认领的备选单独记录（had_close_alternative）：该文件"被迫"配到
+        # 剩余 VOD，大概率正确但不该伪装成普通 Matched。
+        ambiguous = False
+        had_close_alternative = False
+        margin = max(2.0, _external_audio_duration_tolerance(vods[vi]["duration"]) / 2)
+        for vj, v in enumerate(vods):
+            if vj == vi or v.get("error") or v.get("duration") is None:
+                continue
+            other_delta = abs(files[fi]["duration"] - v["duration"])
+            if other_delta <= _external_audio_duration_tolerance(v["duration"]):
+                if vj in claimed_vods:
+                    had_close_alternative = True
+                elif abs(delta - other_delta) < margin:
+                    ambiguous = True
+                    break
+        pairs.append({"file_index": fi, "vod_index": vi, "delta": delta,
+                      "ambiguous": ambiguous, "title_locked": False,
+                      "had_close_alternative": had_close_alternative})
+        claimed_files.add(fi)
+        claimed_vods.add(vi)
+    pairs.sort(key=lambda p: (p["file_index"], p["vod_index"]))
+    return pairs
+
+
+def _pairing_rows(files, vods):
+    """把配对结果展开成确认表的行 dict（纯函数）。
+
+    行字段：file/vod（dict 或 None）、delta、checked（是否默认勾选）、status。
+    未被配对的文件/VOD 也逐条列出（无勾选框），失败原因直接展示。
+    """
+    rows = []
+    used_files, used_vods = set(), set()
+    for pair in _pair_external_audio(files, vods):
+        fi, vi = pair["file_index"], pair["vod_index"]
+        used_files.add(fi)
+        used_vods.add(vi)
+        rows.append({
+            "file": files[fi], "vod": vods[vi], "delta": pair["delta"],
+            "checked": not pair["ambiguous"],
+            "status": "⚠ Close duration matches — verify manually" if pair["ambiguous"]
+                      else ("Matched by title" if pair.get("title_locked")
+                            else ("Closest remaining match — verify"
+                                  if pair.get("had_close_alternative")
+                                  else "Matched")),
+        })
+    for fi, f in enumerate(files):
+        if fi in used_files:
+            continue
+        rows.append({
+            "file": f, "vod": None, "delta": None, "checked": False,
+            "status": f"Failed: {f['error']}" if f.get("error") else "No matching VOD",
+        })
+    for vi, v in enumerate(vods):
+        if vi in used_vods:
+            continue
+        if v.get("error"):
+            status = f"Failed: {v['error']}"
+        elif v.get("duration") is None:
+            status = "Duration unknown — import manually"
+        else:
+            status = "No matching audio file"
+        rows.append({"file": None, "vod": v, "delta": None, "checked": False,
+                     "status": status})
+    return rows
+
+
+def _import_external_audio_one(cache_store, source, audio_path, progress_func=None):
+    """转换一个外部音频文件并注册进 audio cache（AAC remux 快路径 + 降级重编码）。
+
+    成功返回 cache 路径；失败抛异常（临时文件在 finally 中清理）。
+    """
+    audio_duration = _get_video_duration(audio_path)
+    audio_codec = _get_external_audio_codec(audio_path)
+    if not audio_codec:
+        raise ValueError("The selected file does not contain a readable audio stream.")
+    source_duration = float(source.duration) if source.duration else None
+    if source_duration and audio_duration:
+        tolerance = _external_audio_duration_tolerance(source_duration)
+        if abs(source_duration - audio_duration) > tolerance:
+            raise ValueError(
+                f"Audio duration ({audio_duration:.1f}s) does not match "
+                f"VOD duration ({source_duration:.1f}s)."
+            )
+
+    fd, temporary = tempfile.mkstemp(
+        prefix="external-audio-", suffix=".m4a", dir=str(TEMP_DIR)
+    )
+    os.close(fd)
+    temporary_path = Path(temporary)
+    try:
+        codec_args = ["-c:a", "copy"] if audio_codec in {"aac", "mp4a"} else [
+            "-c:a", "aac", "-b:a", "192k"
+        ]
+        result = run_tracked_progress([
+            FFMPEG_PATH, "-hide_banner", "-loglevel", "warning", "-y",
+            "-i", str(audio_path), "-vn", *codec_args,
+            "-movflags", "+faststart", str(temporary_path),
+        ], duration=audio_duration, timeout=600, progress_callback=progress_func)
+        if result.returncode != 0 and codec_args == ["-c:a", "copy"]:
+            temporary_path.unlink(missing_ok=True)
+            result = run_tracked_progress([
+                FFMPEG_PATH, "-hide_banner", "-loglevel", "warning", "-y",
+                "-i", str(audio_path), "-vn", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(temporary_path),
+            ], duration=audio_duration, timeout=600, progress_callback=progress_func)
+        if result.returncode != 0 or not temporary_path.is_file():
+            detail = getattr(result, "stdout", "") or getattr(result, "stderr", "")
+            raise RuntimeError(f"Audio conversion failed: {detail}")
+        return cache_store.save_audio_cache_file(
+            stable_source_id(source), source.audio_url, "m4a", temporary_path,
+            metadata=_audio_cache_format_identity(source),
+        )
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def source_key(value):
@@ -1591,6 +1777,8 @@ def _save_selected_txt(dict_list, txt_path):
                     s = convert_seconds_to_timestamp(ts['start'])
                     e = convert_seconds_to_timestamp(ts['end'])
                     marker = " [new]" if ts.get('source') == 'new' else ""
+                    if ts.get('suspect'):
+                        marker += " [suspect]"
                     f.write(f"{s} - {e}, confidence: {ts['pred']}{marker}\n")
                 f.write("\n")
         print(f"{Fore.GREEN}Saved selected clips to {selected_path}")
@@ -1613,6 +1801,8 @@ def _write_timestamps_txt(dict_list, txt_path):
         timestamps_text += f"{get_source_persistence_name(entry['filename'])}\n"
         for ts in entry.get('timestamps', []):
             marker = " [new]" if ts.get('source') == 'new' else ""
+            if ts.get('suspect'):
+                marker += " [suspect]"
             timestamps_text += (
                 f"{convert_seconds_to_timestamp(ts['start'])} - "
                 f"{convert_seconds_to_timestamp(ts['end'])}, "
@@ -1683,6 +1873,9 @@ def _parse_timestamps_txt(txt_path):
                 # ReviewDialog 才能正确显示 New/Original 并做 auto-deselect。
                 if '[new]' in line:
                     ts['source'] = 'new'
+                # 恢复 suspect 软标记：二遍 review 时才能预取消勾选 + 红字 + 计数。
+                if '[suspect]' in line:
+                    ts['suspect'] = True
                 current_ts.append(ts)
             else:
                 # 残缺行此前会被静默当作新标题，把前一段的所有 clip 改挂到
@@ -2654,6 +2847,8 @@ class ReviewDialog:
                     start_str = self._fmt(s)
                     end_str = self._fmt(e)
                     marker = " [new]" if ts.get('source') == 'new' else ""
+                    if ts.get('suspect'):
+                        marker += " [suspect]"
                     lines.append(f"{start_str} - {end_str}, confidence: {ts.get('pred', 0):.2f}{marker}")
                 lines.append('')
             if lines:
@@ -2667,6 +2862,136 @@ class ReviewDialog:
     def _on_cancel(self):
         self.result = None
         self.cleanup_preview_files()
+        self.win.destroy()
+
+
+class ExternalAudioPairingDialog:
+    """批量导入外部音频前的自动配对确认表。
+
+    已配对行默认勾选（歧义行默认不勾选且红字），未配对文件/VOD 只展示不勾选。
+    result 为 [(MediaSource, audio_path), ...]；取消时为 None。
+    """
+
+    def __init__(self, app, rows):
+        self.app = app
+        self.rows = rows
+        self.result = None
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Import External Audio — Pairing Review")
+        self.win.geometry("1000x440")
+        self.win.transient(app.root)
+        self.win.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        ttk.Label(self.win, text=(
+            "Paired automatically by duration (tolerance max(5s, 1% of VOD length)). "
+            "Only checked rows are imported.\n"
+            "Red or unchecked rows are skipped — import them with the single-file "
+            "flow if the pairing looks wrong."
+        ), justify=tk.LEFT).pack(anchor="w", padx=10, pady=(8, 4))
+
+        tree_frame = ttk.Frame(self.win)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.tree = ttk.Treeview(
+            tree_frame, columns=('sel', 'vod', 'file', 'delta', 'status'),
+            show='headings', selectmode='none')
+        for col, text, width, anchor in (
+            ('sel', '\u2611', 40, 'center'),
+            ('vod', 'Remote VOD (duration)', 340, 'w'),
+            ('file', 'Audio File (duration)', 270, 'w'),
+            ('delta', '\u0394', 60, 'center'),
+            ('status', 'Status', 230, 'w'),
+        ):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor=anchor)
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.tag_configure('warn', foreground='#c62828')
+
+        self._iid_to_entry = {}
+        for row in rows:
+            pairable = row["file"] is not None and row["vod"] is not None
+            checked = pairable and row["checked"]
+            values = (
+                "\u2611" if checked else ("\u2610" if pairable else ""),
+                self._vod_label(row["vod"]),
+                self._file_label(row["file"]),
+                f"{row['delta']:.1f}s" if row["delta"] is not None else "—",
+                row["status"],
+            )
+            tags = ('warn',) if row["status"].startswith(("⚠", "Failed")) else ()
+            iid = self.tree.insert("", tk.END, values=values, tags=tags)
+            self._iid_to_entry[iid] = {"row": row, "checked": checked}
+        self.tree.bind("<Button-1>", self._on_click)
+
+        buttons = ttk.Frame(self.win)
+        buttons.pack(pady=8)
+        self.import_button = ttk.Button(
+            buttons, text="Import", command=self._confirm, state=tk.DISABLED)
+        self.import_button.pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=6)
+        self._update_import_state()
+
+        self.win.grab_set()
+
+    @staticmethod
+    def _fmt_duration(seconds):
+        if seconds is None:
+            return "?"
+        h, rem = divmod(int(round(seconds)), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    @classmethod
+    def _vod_label(cls, vod):
+        if vod is None:
+            return ""
+        source = vod.get("source")
+        name = (source.display_name if source else None) \
+            or (vod["upload"].get_url() if vod.get("upload") else "VOD")
+        duration = vod.get("duration")
+        return f"{name} ({cls._fmt_duration(duration)})"
+
+    @classmethod
+    def _file_label(cls, file_entry):
+        if file_entry is None:
+            return ""
+        return f"{file_entry.get('name', '?')} ({cls._fmt_duration(file_entry.get('duration'))})"
+
+    def _on_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        entry = self._iid_to_entry.get(iid)
+        if entry is None:
+            return
+        row = entry["row"]
+        if row["file"] is None or row["vod"] is None:
+            return  # 未配对行没有勾选框
+        entry["checked"] = not entry["checked"]
+        self.tree.set(iid, 'sel', "\u2611" if entry["checked"] else "\u2610")
+        self._update_import_state()
+
+    def _update_import_state(self):
+        if any(e["checked"] for e in self._iid_to_entry.values()):
+            self.import_button.configure(state=tk.NORMAL)
+        else:
+            self.import_button.configure(state=tk.DISABLED)
+
+    def _confirm(self):
+        self.result = [
+            (entry["row"]["vod"]["source"], entry["row"]["file"]["path"])
+            for entry in self._iid_to_entry.values() if entry["checked"]
+        ]
+        self._close()
+
+    def _cancel(self):
+        self._close()
+
+    def _close(self):
+        try:
+            self.win.grab_release()
+        except Exception:
+            pass
         self.win.destroy()
 
 
@@ -3339,6 +3664,10 @@ class VideoProcessorApp:
         sys.stdout = StdoutRedirector(self.stdout_text, self.root)
 
         self.active_thread = None
+        # Import External Audio 自己禁用了按钮（区别于 batch run 的 disable_objects）
+        self._external_audio_import_disables_button = False
+        # 防止两个 import 流程重叠跑（结束后 run 收尾可能提前解锁按钮）
+        self._external_audio_import_active = False
 
         self.dont_show_again_var = tk.BooleanVar(value=False)
 
@@ -4293,68 +4622,100 @@ class VideoProcessorApp:
         self.refresh_remote_cache_size()
 
     def import_external_audio(self):
-        selected = self.video_listbox.selection()
-        if len(selected) != 1:
+        if self._external_audio_import_active:
             messagebox.showwarning(
                 "Import External Audio",
-                "Select exactly one remote VOD in the main list first.",
+                "An external audio import is already running. Wait for it to "
+                "finish before starting another one.",
             )
             return
-        try:
-            upload = self.uploaded_videos[int(selected[0])]
-        except (ValueError, IndexError):
-            messagebox.showerror("Import External Audio", "Could not identify the selected VOD.")
-            return
-        if not upload.get_is_url():
+        selected = self.video_listbox.selection()
+        if not selected:
             messagebox.showwarning(
                 "Import External Audio",
-                "The selected item is a local file. Select a YouTube, Twitch, or Bilibili URL.",
+                "Select one or more remote VODs in the main list first.",
+            )
+            return
+        uploads = []
+        for item in selected:
+            try:
+                upload = self.uploaded_videos[int(item)]
+            except (ValueError, IndexError):
+                continue
+            if upload.get_is_url():
+                uploads.append(upload)
+            else:
+                print(f"Import External Audio: skipping local item "
+                      f"{get_source_display_name(upload)} (URL VODs only).")
+        if not uploads:
+            messagebox.showwarning(
+                "Import External Audio",
+                "The selected item is a local file. Select a YouTube, Twitch, "
+                "or Bilibili URL.",
             )
             return
 
-        audio_path = filedialog.askopenfilename(
-            title="Select External Audio or Container",
+        if len(uploads) == 1:
+            # 单文件流程保持原行为：手动一一对应，无自动配对。
+            upload = uploads[0]
+            audio_path = filedialog.askopenfilename(
+                title="Select External Audio or Container",
+                filetypes=[
+                    ("Audio and Media Files",
+                     "*.m4a *.m4s *.mp4 *.webm *.opus *.mp3 *.wav *.flac"),
+                    ("All Files", "*.*"),
+                ],
+            )
+            if not audio_path:
+                return
+            self.import_external_audio_button.configure(state=tk.DISABLED)
+            self._external_audio_import_disables_button = True
+            self._external_audio_import_active = True
+            self.clear_transfer_progress("Inspecting external media...")
+            threading.Thread(
+                target=self._import_external_audio_worker,
+                args=(upload.get_source(), upload.get_url() or upload.get_path(),
+                      audio_path, self.remote_browser_cookies.get()),
+                daemon=True,
+            ).start()
+            return
+
+        # 批量流程：多选文件 → 时长自动配对 → 确认表 → 串行导入。
+        audio_paths = filedialog.askopenfilenames(
+            title="Select External Audio Files (paired automatically)",
             filetypes=[
-                ("Audio and Media Files", "*.m4a *.m4s *.mp4 *.webm *.opus *.mp3 *.wav *.flac"),
+                ("Audio and Media Files",
+                 "*.m4a *.m4s *.mp4 *.webm *.opus *.mp3 *.wav *.flac"),
                 ("All Files", "*.*"),
             ],
         )
-        if not audio_path:
+        if not audio_paths:
             return
         self.import_external_audio_button.configure(state=tk.DISABLED)
-        self.clear_transfer_progress("Inspecting external media...")
+        self._external_audio_import_disables_button = True
+        self._external_audio_import_active = True
+        self.clear_transfer_progress(
+            f"Pairing {len(audio_paths)} file(s) with {len(uploads)} VOD(s)...")
         threading.Thread(
-            target=self._import_external_audio_worker,
-            args=(upload.get_source(), upload.get_url() or upload.get_path(), audio_path,
-                  self.remote_browser_cookies.get()),
+            target=self._import_external_audio_pairing_worker,
+            args=(uploads, list(audio_paths), self.remote_browser_cookies.get()),
             daemon=True,
         ).start()
 
-    def _import_external_audio_worker(self, existing_source, source_url, audio_path, cookies):
-        temporary_path = None
+    def _resolve_upload_source(self, upload, cookies):
+        source = upload.get_source()
+        if isinstance(source, MediaSource):
+            return source
+        return resolve_source(upload.get_url() or upload.get_path(),
+                              browser_cookies=cookies)
+
+    def _import_external_audio_worker(self, existing_source, source_url, audio_path,
+                                      cookies):
         try:
-            source = existing_source if isinstance(existing_source, MediaSource) else resolve_source(
-                source_url, browser_cookies=cookies)
+            source = existing_source if isinstance(existing_source, MediaSource) \
+                else resolve_source(source_url, browser_cookies=cookies)
             if not source.audio_url:
                 raise ValueError("The selected VOD has no audio stream.")
-            source_duration = float(source.duration) if source.duration else None
-            audio_duration = _get_video_duration(audio_path)
-            audio_codec = _get_external_audio_codec(audio_path)
-            if not audio_codec:
-                raise ValueError("The selected file does not contain a readable audio stream.")
-            if source_duration and audio_duration:
-                tolerance = max(5.0, source_duration * 0.01)
-                if abs(source_duration - audio_duration) > tolerance:
-                    raise ValueError(
-                        f"Audio duration ({audio_duration:.1f}s) does not match "
-                        f"VOD duration ({source_duration:.1f}s)."
-                    )
-
-            fd, temporary = tempfile.mkstemp(
-                prefix="external-audio-", suffix=".m4a", dir=str(TEMP_DIR)
-            )
-            os.close(fd)
-            temporary_path = Path(temporary)
 
             def report(current, total, elapsed):
                 sample = format_compile_progress(
@@ -4362,36 +4723,89 @@ class VideoProcessorApp:
                 )
                 self._schedule_ui(self._queue_transfer_progress, sample, "Import")
 
-            codec_args = ["-c:a", "copy"] if audio_codec in {"aac", "mp4a"} else [
-                "-c:a", "aac", "-b:a", "192k"
-            ]
-            result = run_tracked_progress([
-                FFMPEG_PATH, "-hide_banner", "-loglevel", "warning", "-y",
-                "-i", str(audio_path), "-vn", *codec_args,
-                "-movflags", "+faststart", str(temporary_path),
-            ], duration=audio_duration, timeout=600, progress_callback=report)
-            if result.returncode != 0 and codec_args == ["-c:a", "copy"]:
-                temporary_path.unlink(missing_ok=True)
-                result = run_tracked_progress([
-                    FFMPEG_PATH, "-hide_banner", "-loglevel", "warning", "-y",
-                    "-i", str(audio_path), "-vn", "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart", str(temporary_path),
-                ], duration=audio_duration, timeout=600, progress_callback=report)
-            if result.returncode != 0 or not temporary_path.is_file():
-                detail = getattr(result, "stdout", "") or getattr(result, "stderr", "")
-                raise RuntimeError(f"Audio conversion failed: {detail}")
-            metadata = _audio_cache_format_identity(source)
-            self.remote_cache_store.save_audio_cache_file(
-                stable_source_id(source), source.audio_url, "m4a", temporary_path,
-                metadata=metadata,
-            )
-            temporary_path = None
+            _import_external_audio_one(self.remote_cache_store, source,
+                                       audio_path, report)
             self._schedule_ui(self._finish_external_audio_import,
                               source.display_name or source.source_id)
         except Exception as exc:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
             self._schedule_ui(self._fail_external_audio_import, str(exc))
+
+    def _import_external_audio_pairing_worker(self, uploads, audio_paths, cookies):
+        """后台解析 VOD + 探测文件时长，然后弹配对确认表。"""
+        try:
+            vods = []
+            for i, upload in enumerate(uploads):
+                self._schedule_ui(
+                    self.clear_transfer_progress,
+                    f"Resolving VOD {i + 1}/{len(uploads)}...")
+                try:
+                    source = self._resolve_upload_source(upload, cookies)
+                    if not source.audio_url:
+                        raise ValueError("VOD has no audio stream")
+                    vods.append({
+                        "upload": upload, "source": source,
+                        "duration": float(source.duration) if source.duration else None,
+                        "error": None,
+                    })
+                except Exception as exc:
+                    vods.append({"upload": upload, "source": None,
+                                 "duration": None, "error": str(exc)})
+            files = []
+            for i, path in enumerate(audio_paths):
+                self._schedule_ui(
+                    self.clear_transfer_progress,
+                    f"Inspecting file {i + 1}/{len(audio_paths)}...")
+                try:
+                    duration = _get_video_duration(path)
+                    codec = _get_external_audio_codec(path)
+                    if not codec:
+                        raise ValueError("no readable audio stream")
+                    files.append({"path": path, "name": os.path.basename(path),
+                                  "duration": duration, "error": None})
+                except Exception as exc:
+                    files.append({"path": path, "name": os.path.basename(path),
+                                  "duration": None, "error": str(exc)})
+            rows = _pairing_rows(files, vods)
+            self._schedule_ui(self._open_pairing_dialog, rows)
+        except Exception as exc:
+            self._schedule_ui(self._fail_external_audio_import, str(exc))
+
+    def _open_pairing_dialog(self, rows):
+        dialog = ExternalAudioPairingDialog(self, rows)
+        self.root.wait_window(dialog.win)
+        selections = dialog.result
+        if not selections:
+            self._restore_external_audio_button_state()
+            self.clear_transfer_progress("External audio import cancelled.")
+            return
+        self.clear_transfer_progress(
+            f"Importing {len(selections)} external audio file(s)...")
+        threading.Thread(
+            target=self._import_external_audio_batch_worker,
+            args=(selections,),
+            daemon=True,
+        ).start()
+
+    def _import_external_audio_batch_worker(self, selections):
+        """串行导入确认过的配对；单文件失败互不影响，结束统一汇总。"""
+        total = len(selections)
+        imported, failures = 0, []
+        for i, (source, audio_path) in enumerate(selections):
+            label = source.display_name or source.source_id
+
+            def report(current, stream_total, elapsed, i=i, label=label):
+                sample = format_compile_progress(
+                    current, stream_total, elapsed,
+                    f"Importing {i + 1}/{total}: {label}")
+                self._schedule_ui(self._queue_transfer_progress, sample, "Import")
+
+            try:
+                _import_external_audio_one(self.remote_cache_store, source,
+                                           audio_path, report)
+                imported += 1
+            except Exception as exc:
+                failures.append(f"{os.path.basename(audio_path)} → {label}: {exc}")
+        self._schedule_ui(self._finish_external_audio_batch_import, imported, failures)
 
     def _finish_external_audio_import(self, display_name):
         self._restore_external_audio_button_state()
@@ -4407,14 +4821,38 @@ class VideoProcessorApp:
         self.clear_transfer_progress("External audio import failed.")
         messagebox.showerror("Import External Audio", error)
 
+    def _finish_external_audio_batch_import(self, imported, failures):
+        self._restore_external_audio_button_state()
+        self.refresh_remote_cache_size()
+        if failures:
+            shown = "\n".join(failures[:20])
+            extra = f"\n... and {len(failures) - 20} more" if len(failures) > 20 else ""
+            messagebox.showwarning(
+                "Import External Audio",
+                f"Imported {imported} file(s); {len(failures)} failed:\n\n"
+                f"{shown}{extra}",
+            )
+        else:
+            messagebox.showinfo(
+                "Import External Audio",
+                f"Imported {imported} external audio file(s).",
+            )
+        self.clear_transfer_progress("External audio import finished.")
+
     def _restore_external_audio_button_state(self):
-        # import 完成后本应恢复按钮；但若此刻 batch 正在运行（disable_objects
-        # 已禁用该按钮），则保持禁用，等运行结束时 reenable_disabled_objects 再恢复。
+        # import 完成后恢复按钮；但若按钮的禁用来自 batch 运行（disable_objects），
+        # 保持禁用，等运行结束时 reenable_disabled_objects 再恢复。
+        # 两种禁用在 Tk 里都是 DISABLED，无法从 state 区分 → 用 import 侧标志；
+        # import 期间用户又启动了 run 时（线程存活），同样交还给 run 收尾。
         try:
-            if str(self.import_external_audio_button.cget("state")) != tk.DISABLED:
+            if (self._external_audio_import_disables_button
+                    and not self.is_thread_active()):
                 self.import_external_audio_button.configure(state=tk.NORMAL)
         except tk.TclError:
             self.import_external_audio_button.configure(state=tk.NORMAL)
+        finally:
+            self._external_audio_import_disables_button = False
+            self._external_audio_import_active = False
 
     def open_remote_cache(self):
         path = str(self.remote_cache_store.root)
@@ -5376,6 +5814,7 @@ class VideoProcessorApp:
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
                             use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
                             refresh_func=refresh_func,
+                            prefetch_concurrency=self.remote_audio_concurrency.get(),
                             select_candidate_func=(
                                 lambda source: select_audio_candidate(source, log_func=print)
                                 if isinstance(source, MediaSource) else None
@@ -5443,6 +5882,7 @@ class VideoProcessorApp:
                                     threshold, focus_idx, selected_model, self.final_bar,
                                     use_gpu=use_gpu, ort_session=shared_session,
                                     cache_store=cache_store, refresh_func=refresh_func,
+                                    prefetch_concurrency=self.remote_audio_concurrency.get(),
                                     progress_callback=lambda sample, upload=upload, i=i:
                                         self._queue_transfer_progress(
                                             sample,

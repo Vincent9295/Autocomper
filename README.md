@@ -126,7 +126,7 @@ Remote processing lets AutoComper analyze a VOD without first downloading the co
 | **Audio Cache** | Downloads only compressed audio into the persistent cache, then runs detection locally from that file. | Repeated runs, reverify, or unstable networks | The first run still depends on the remote CDN; later runs reuse the cached audio. |
 | **Full Download** | Downloads the complete video using the normal yt-dlp workflow, then processes the local file. | Sources that do not work reliably with streaming, or users who need a local copy | Requires the most disk space and the longest initial download. |
 
-Remote Stream reports the current detection block, for example `Block: 6 / 13`. Audio Cache reports 4 MiB download chunks and the current transfer speed. A slow transfer does not necessarily mean that AutoComper is frozen: Bilibili, YouTube, and Twitch can change CDN throughput during a long request.
+Remote Stream reports the current detection block, for example `Block: 6 / 13`. Audio Cache reports the configured chunk size (default 8 MiB) and the current transfer speed. A slow transfer does not necessarily mean that AutoComper is frozen: Bilibili, YouTube, and Twitch can change CDN throughput during a long request.
 
 While a compilation is being prepared, the UI reports `Preparing clips: N / total` together with the current VOD, clip number, time range, and live download speed/ETA. During the FFmpeg compile the same panel shows encoding progress, speed, and ETA, and the log lists each clip as it is written and each concat batch as it is merged. The UI stays responsive even for large compilations.
 
@@ -152,8 +152,8 @@ The **Remote Settings** panel controls how URL inputs are resolved and cached:
 - **Open Cache Folder** opens the current cache location in File Explorer.
 - **Clear Cache** removes AutoComper's detection, audio, and segment cache entries. It does not delete the original videos or ordinary user files.
 - **Max Download Concurrency** sets how many remote video clips are fetched at once while preparing a compilation (default 5). Each worker runs its own FFmpeg process, so higher values finish faster on fast connections but use more CPU/disk; lower this to 1-2 if the PC feels sluggish during "Preparing clips". The control is disabled while a run is in progress.
-- **Audio Cache Chunk Size (MiB)** sets how much audio each chunk download requests while an Audio Cache file is being fetched (default 4 MiB). Larger chunks mean fewer requests but slower restart on a dropped connection; smaller chunks resume more cheaply on flaky networks.
-- **Audio Cache Download Concurrency** controls how many chunks are fetched in parallel while building an Audio Cache file. More workers finish faster on fast links but raise CDN rate-limit pressure; lower it if you see HTTP 412 / 429 errors from Bilibili on big batches.
+- **Audio Cache Chunk Size (MiB)** sets how much audio each chunk download requests while an Audio Cache file is being fetched (default 8 MiB). Larger chunks mean fewer requests but slower restart on a dropped connection; smaller chunks resume more cheaply on flaky networks. Sources whose metadata lacks a file size are probed automatically (`bytes=0-0`) so they still use the parallel prefetch path instead of the slow single-connection fallback.
+- **Audio Cache Download Concurrency** controls how many chunks are fetched in parallel while building an Audio Cache file (default 8, max 32). It also sets the prefetch worker count for YouTube Remote Stream detection. More workers finish faster on fast links but raise CDN rate-limit pressure; lower it if you see HTTP 412 / 429 errors from Bilibili on big batches. Known slow Bilibili P2P/edge hosts (`mcdn` / `pcdn` / `szbdyd.com` families) are filtered out of the audio candidate list automatically.
 
 #### Playlist Imports and Platform Rate Limits
 
@@ -180,16 +180,26 @@ To keep imports reliable:
 
 Use it as follows:
 
+**Single VOD (manual pairing):**
+
 1. Select exactly one YouTube, Twitch, or Bilibili remote URL in the main media list.
 2. Click **Import External Audio**.
 3. Choose one local media file.
 4. Let AutoComper inspect the file, verify its audio stream and duration, and register it for the selected VOD.
 
+**Multiple VODs (auto-pairing with confirmation):**
+
+1. Select two or more remote URLs in the main media list (Ctrl/Shift-click).
+2. Click **Import External Audio** and choose multiple local media files.
+3. AutoComper resolves each VOD, inspects each file, and pairs them by duration (tolerance `max(5s, 1% of VOD length)`), best match first.
+4. A confirmation table lists every pairing with the duration delta. Ambiguous pairs (a close second candidate within the tolerance) are unchecked and shown in red; unmatched files/VODs and failures are also listed. Nothing is converted until you review the table and press **Import**.
+5. Confirmed pairs are converted serially; one failing file does not stop the rest. A summary dialog reports successes and failures at the end.
+
 Supported input containers include `.m4s`, `.mp4`, `.m4a`, `.webm`, `.opus`, `.mp3`, `.wav`, and `.flac`. An `.mp4` is accepted only when it contains an audio stream; its video stream is ignored. A fragmented `.m4s` file must contain enough initialization data for FFmpeg to read it.
 
-Only one audio file is imported at a time. This is intentional: automatic multi-file ordering can silently create the wrong timeline or audio overlap. Bilibili multi-part videos must be imported one part at a time, with the matching part selected in the media list.
+Auto-pairing is conservative: a pair is only suggested when durations match within the tolerance and no second VOD/file candidate is close enough to be confused with it. Ambiguous or unmatched rows are never guessed — import those with the single-file flow instead. Bilibili multi-part videos must be imported one part at a time, with the matching part selected in the media list.
 
-AutoComper converts non-AAC audio to AAC in an `.m4a` cache file. If the input already contains AAC/MP4A audio, it uses a direct copy/remux path instead of re-encoding, which is substantially faster. The original file is not moved, deleted, or uploaded. The imported audio must cover the same timeline as the selected VOD; a filename alone cannot identify its source.
+AutoComper converts non-AAC audio to AAC in an `.m4a` cache file. If the input already contains AAC/MP4A audio, it uses a direct copy/remux path instead of re-encoding, which is substantially faster. The original file is not moved, deleted, or uploaded. The imported audio must cover the same timeline as the selected VOD. In the single-file flow the filename is not used for identification — you make the association manually; in the bulk flow an exact filename-to-title match is the strongest pairing signal and locks a pair, while duration pairing handles the rest.
 
 #### Why Browser Cookies May Be Needed
 

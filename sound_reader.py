@@ -629,7 +629,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_gpu=True, cache_store=None, progress_callback=None,
                    refresh_func=None, save_audio_path=None,
-                   select_candidate_func=None):
+                   select_candidate_func=None, prefetch_concurrency=None):
     if precision < 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
@@ -685,6 +685,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     offset = 0
     blocks = load_audio(
         file, SAMPLE_RATE, SAMPLE_RATE * block_size,
+        prefetch_concurrency=(prefetch_concurrency if prefetch_concurrency
+                              else DEFAULT_CONCURRENCY),
         progress_callback=progress_callback if is_remote else None,
         refresh_func=refresh_func if is_remote else None,
         select_candidate_func=select_candidate_func if is_remote else None,

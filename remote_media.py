@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 from utils import FFMPEG_PATH, run_tracked, run_tracked_progress
 from remote_prefetch import (
     SpeedMonitor,
+    _probe_real_size,
     iter_hls_bytes,
     iter_range_bytes,
     supports_hls_prefetch,
@@ -586,6 +587,33 @@ def fetch_audio_cache(
     duration_label = f"{duration_value:g}s" if duration_value is not None else "unknown"
     last_error: Exception | None = None
     platform_label = "YouTube" if source.platform == "youtube" else "Bilibili"
+
+    if source.platform in {"youtube", "bilibili"} \
+            and not supports_range_prefetch(source) \
+            and str(source.audio_url or "").startswith(("http://", "https://")) \
+            and run_func is None:
+        # yt-dlp 元数据缺 filesize 时 supports_range_prefetch 为 False，会静默
+        # 回落 FFmpeg 单连接慢路径（用户表现为 Audio Cache 龟速）。先用
+        # bytes=0-0 探测真实流大小写入候选元数据；拿到就走并行预取，探测
+        # 失败才回落（行为同旧版）。
+        try:
+            probed_size = _probe_real_size(
+                source.audio_url,
+                dict(getattr(source, "audio_headers", None)
+                     or getattr(source, "http_headers", None) or {}))
+        except Exception:
+            probed_size = None
+        if probed_size:
+            for item in (getattr(source, "audio_candidates", None) or []):
+                if isinstance(item, dict) and str(item.get("url") or "") == str(source.audio_url):
+                    item["filesize"] = probed_size
+                    break
+            else:
+                metadata = getattr(source, "metadata", None)
+                if isinstance(metadata, dict):
+                    metadata["filesize"] = probed_size
+            report(f"{platform_label} audio stream size probed: {probed_size} bytes "
+                   f"for {cache_label}")
 
     if source.platform in {"youtube", "bilibili"} and supports_range_prefetch(source):
         try:
@@ -1501,6 +1529,19 @@ def _bilibili_cdn_variants(url: str) -> list[str]:
     return variants
 
 
+# B 站 P2P/边缘慢节点（参考社区共识）：被调度到这些 host 的链接通常远慢于
+# upos 正式节点。黑名单只影响候选排序前的过滤，全部被过滤时保留原列表兜底。
+_BILIBILI_SLOW_CDN_MARKERS = ("mcdn", "pcdn", "szbdyd.com")
+
+
+def _is_slow_bilibili_cdn_host(host: str) -> bool:
+    lowered = str(host or "").lower()
+    # upos 官方快节点族（upcdn.bilivideo.com）子串里含 "pcdn"，不能误伤
+    if "upcdn" in lowered:
+        return False
+    return any(marker in lowered for marker in _BILIBILI_SLOW_CDN_MARKERS)
+
+
 def _expand_bilibili_audio_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     expanded = []
     for candidate in candidates:
@@ -1510,7 +1551,9 @@ def _expand_bilibili_audio_candidates(candidates: list[dict[str, Any]]) -> list[
             item["cdn_variant_index"] = index
             item["cdn_host"] = urlsplit(url).netloc
             expanded.append(item)
-    return expanded
+    filtered = [item for item in expanded
+                if not _is_slow_bilibili_cdn_host(item.get("cdn_host"))]
+    return filtered if filtered else expanded
 
 
 def _candidate_sort_key(candidate: Mapping[str, Any], audio: bool) -> tuple[Any, ...]:

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 from typing import Any, Mapping
 
@@ -209,7 +210,28 @@ class CacheStore:
         )
         source = Path(source_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, path)
+        try:
+            os.replace(source, path)
+        except OSError:
+            # 跨盘符（如 C: temp → U 盘 cache）rename 不可能成功：
+            # 先复制到目标同目录的临时文件，再原子替换，保持落盘原子性。
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), suffix=path.suffix or ".tmp"
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            try:
+                shutil.copyfile(source, tmp_path)
+                os.replace(tmp_path, path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+            # 目标已就位后移除源文件，保持与 rename 一致的 move 语义。
+            # 源文件在系统 TEMP，删除失败（如 AV 短暂占用）不能让已成功的
+            # 导入报错——忽略，交给 OS 回收。
+            try:
+                source.unlink(missing_ok=True)
+            except OSError:
+                pass
         safe_metadata = {"source_identity": str(source_identity), "format": str(audio_format).lstrip(".")}
         for key, value in (metadata or {}).items():
             if key in _SAFE_METADATA_KEYS and not _TOKEN_KEY.search(str(key)):
