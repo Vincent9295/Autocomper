@@ -255,6 +255,13 @@ def playlist_tree_values(entry, selected_ids, selected_order):
         or display_date == "Unknown"
     )
     loading = bool(metadata.get("hydration_pending")) and missing_metadata and not failed
+    if failed:
+        status = f"Failed: {metadata.get('hydration_error') or 'unknown error'}"
+        retries = metadata.get("hydration_retries")
+        if retries:
+            status += f" (retry {int(retries)}/3)"
+    else:
+        status = "Loading..." if loading else "Ready"
     return (
         playlist_order_map(selected_order).get(entry.entry_id, "")
         if entry.entry_id in selected_ids else "",
@@ -263,7 +270,7 @@ def playlist_tree_values(entry, selected_ids, selected_order):
         part_label,
         format_playlist_duration(entry.duration),
         display_date,
-        "Metadata failed" if failed else ("Loading..." if loading else "Ready"),
+        status,
     )
 
 
@@ -1630,6 +1637,41 @@ def convert_seconds_to_timestamp(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
 
 
+def convert_seconds_to_timestamp_ms(seconds: float) -> str:
+    """亚秒精度版（毫秒，四舍五入）：专供 timestamps txt 写入。
+
+    整秒版会把 83.47s 写成 0:01:23，读回来漂移最多 1s——两遍工作流
+    （跑检测 → 二遍 review）的 clip 边界因此对不上。
+    """
+    ms = int(round(float(seconds) * 1000))
+    hours, rem = divmod(ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, millis = divmod(rem, 1000)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _read_preferences_into(parser: configparser.ConfigParser, path: str) -> None:
+    """读 preferences.ini：UTF-8 优先；旧版 GBK 文件回退本地编码并原地转存 UTF-8。
+
+    老版本用 open() 默认编码（中文 Windows = GBK）写入；设置里存过非 ASCII
+    路径的存量文件升级后用 UTF-8 读会抛 UnicodeDecodeError（注意它不是
+    configparser.Error，不接住会让 app 启动即崩）。
+    """
+    try:
+        parser.read(path, encoding="utf-8")
+        return
+    except UnicodeDecodeError:
+        pass
+    # 注意不能用 locale.getpreferredencoding——Python 开 UTF-8 模式时它返回
+    # utf-8，等于没回退。旧文件是 ANSI 代码页写的，Windows 上显式用 mbcs。
+    import sys
+    fallback_encoding = "mbcs" if sys.platform == "win32" \
+        else locale.getpreferredencoding(False)
+    parser.read(path, encoding=fallback_encoding)
+    with open(path, "w", encoding="utf-8") as configfile:
+        parser.write(configfile)
+
+
 def format_detection_eta(done, total, recent_elapsed, window=10):
     """检测阶段逐 VOD 完成行里的进度估算后缀；无法估算时返回空串。
 
@@ -1774,8 +1816,8 @@ def _save_selected_txt(dict_list, txt_path):
             for entry in dict_list:
                 f.write(f"{get_source_persistence_name(entry['filename'])}\n")
                 for ts in entry['timestamps']:
-                    s = convert_seconds_to_timestamp(ts['start'])
-                    e = convert_seconds_to_timestamp(ts['end'])
+                    s = convert_seconds_to_timestamp_ms(ts['start'])
+                    e = convert_seconds_to_timestamp_ms(ts['end'])
                     marker = " [new]" if ts.get('source') == 'new' else ""
                     if ts.get('suspect'):
                         marker += " [suspect]"
@@ -1804,8 +1846,8 @@ def _write_timestamps_txt(dict_list, txt_path):
             if ts.get('suspect'):
                 marker += " [suspect]"
             timestamps_text += (
-                f"{convert_seconds_to_timestamp(ts['start'])} - "
-                f"{convert_seconds_to_timestamp(ts['end'])}, "
+                f"{convert_seconds_to_timestamp_ms(ts['start'])} - "
+                f"{convert_seconds_to_timestamp_ms(ts['end'])}, "
                 f"confidence: {ts['pred']}{marker}\n"
             )
             found_timestamps = True
@@ -1846,10 +1888,19 @@ def _parse_timestamps_txt(txt_path):
                 current_ts = []
                 continue
             m = re.match(
-                r'(\d+):(\d{2}):(\d{2})\s*-\s*(\d+):(\d{2}):(\d{2}),\s*confidence:\s*([\d.]+)(?:\s*\[new\])?',
+                r'(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\s*-'
+                r'\s*(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?,'
+                r'\s*confidence:\s*([\d.]+)(?:\s*\[new\])?',
                 line)
             if m:
-                h1, m1, s1, h2, m2, s2, conf = m.groups()
+                h1, m1, s1, frac1, h2, m2, s2, frac2, conf = m.groups()
+
+                def _seconds(h, mi, s, frac):
+                    value = int(h) * 3600 + int(mi) * 60 + int(s)
+                    if frac:
+                        value += int(frac) / (10 ** len(frac))
+                    return value
+
                 # 用户手编文件常见三类脏数据：分钟/秒越界、区间倒置、
                 # conf 是 "1.2.3" 这类 float() 会炸的串。全部跳过并告警，
                 # 不让一行垃圾中断整个批次加载。
@@ -1857,8 +1908,8 @@ def _parse_timestamps_txt(txt_path):
                     print(f"WARNING: skipping line {line_no} (minute/second out of "
                           f"range): {line!r}")
                     continue
-                s = int(h1) * 3600 + int(m1) * 60 + int(s1)
-                e = int(h2) * 3600 + int(m2) * 60 + int(s2)
+                s = _seconds(h1, m1, s1, frac1)
+                e = _seconds(h2, m2, s2, frac2)
                 if e <= s:
                     print(f"WARNING: skipping line {line_no} (end <= start): {line!r}")
                     continue
@@ -2539,8 +2590,8 @@ class ReviewDialog:
         self.win.wait_window()
 
     def _fmt(self, sec):
-        h, m, s = int(sec // 3600), int((sec % 3600) // 60), int(sec % 60)
-        return f"{h}:{m:02d}:{s:02d}"
+        # 与 timestamps txt 一致的毫秒精度：Review 显示/编辑的值 == 文件里的值
+        return convert_seconds_to_timestamp_ms(sec)
 
     def _style(self, iid, checked):
         self.tree.item(iid, tags=('checked',) if checked else ('unchecked',))
@@ -2576,7 +2627,7 @@ class ReviewDialog:
         dlg.resizable(True, True)
         dlg.minsize(350, 160)
 
-        ttk.Label(dlg, text="Start (HH:MM:SS or seconds):").pack(padx=10, pady=(10, 0))
+        ttk.Label(dlg, text="Start (HH:MM:SS.mmm or seconds):").pack(padx=10, pady=(10, 0))
         start_var = tk.StringVar(value=self._fmt(f['start']))
         ttk.Entry(dlg, textvariable=start_var, width=25).pack(padx=10, pady=2)
 
@@ -2586,9 +2637,12 @@ class ReviewDialog:
 
         def _parse(s):
             s = s.strip()
-            m = re.match(r'^(\d+):(\d{2}):(\d{2})$', s)
+            m = re.match(r'^(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$', s)
             if m:
-                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                value = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                if m.group(4):
+                    value += int(m.group(4)) / (10 ** len(m.group(4)))
+                return value
             try:
                 return float(s)
             except ValueError:
@@ -2597,7 +2651,7 @@ class ReviewDialog:
         def _apply_real():
             ns = _parse(start_var.get())
             ne = _parse(end_var.get())
-            if ns is None or ne is None or ns >= ne:
+            if ns is None or ne is None or ns < 0 or ne < 0 or ns >= ne:
                 messagebox.showwarning("Invalid", "Invalid time values (start must be < end).")
                 return
             old_s, old_e = f['start'], f['end']
@@ -2844,8 +2898,8 @@ class ReviewDialog:
                 for ts in entry['timestamps']:
                     s = ts['start']
                     e = ts['end']
-                    start_str = self._fmt(s)
-                    end_str = self._fmt(e)
+                    start_str = convert_seconds_to_timestamp_ms(s)
+                    end_str = convert_seconds_to_timestamp_ms(e)
                     marker = " [new]" if ts.get('source') == 'new' else ""
                     if ts.get('suspect'):
                         marker += " [suspect]"
@@ -3034,19 +3088,21 @@ class VideoProcessorApp:
 
         self.preferences = configparser.ConfigParser()
         try:
-            self.preferences.read(self.preferences_file)
+            # 显式 UTF-8：中文 Windows 默认 GBK，非 GBK 字符（韩文路径等）会炸；
+            # 旧版 GBK 存量文件由 _read_preferences_into 回退读取并原地转存。
+            _read_preferences_into(self.preferences, self.preferences_file)
         except configparser.Error:
             messagebox.showwarning("Error", "Failed to load preferences.")
 
         if 'Settings' not in self.preferences:
             self.preferences['Settings'] = DEFAULT_SETTINGS
-            with open(self.preferences_file, 'w') as configfile:
+            with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
                 self.preferences.write(configfile)
         else:
             for key, value in DEFAULT_SETTINGS.items():
                 if key not in self.preferences['Settings']:
                     self.preferences.set('Settings', key, value)
-                    with open(self.preferences_file, 'w') as configfile:
+                    with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
                         self.preferences.write(configfile)
 
         self.precision = tk.IntVar(value=100)
@@ -3495,10 +3551,12 @@ class VideoProcessorApp:
         self.custom_resolution_height_var = tk.IntVar()
         self.custom_resolution_height_var.set(1080)
 
-        self.custom_padding_before = tk.IntVar()
+        # DoubleVar：输入框 decimal_check 允许小数 padding（如 0.5s），
+        # IntVar 会把 "0.5" 静默截断成 0
+        self.custom_padding_before = tk.DoubleVar()
         self.custom_padding_before.set(0)
 
-        self.custom_padding_after = tk.IntVar()
+        self.custom_padding_after = tk.DoubleVar()
         self.custom_padding_after.set(0)
 
         self.checkbox_frame_three = ttk.Frame(self.video_options_frame)
@@ -4002,6 +4060,9 @@ class VideoProcessorApp:
         sort_status = [""]
         hydration_pending = set()
         hydration_executor = ThreadPoolExecutor(max_workers=4)
+        # hydration 无平台轻量 API（YouTube/Twitch 全量提取），4 worker 连环
+        # 全量提取正是招来 bot-check/429 的行为——提交间加最小间隔。
+        hydration_limiter = ResolveLimiter(min_interval=1.5)
         page_label = ttk.Label(dialog)
         page_label.pack(pady=(10, 4))
         entries_frame = ttk.Frame(dialog)
@@ -4021,11 +4082,11 @@ class VideoProcessorApp:
         tree.heading("status", text="Status")
         tree.column("order", width=55, anchor="center", stretch=False)
         tree.column("select", width=70, anchor="center", stretch=False)
-        tree.column("title", width=470, anchor="w")
+        tree.column("title", width=380, anchor="w")
         tree.column("part", width=55, anchor="center", stretch=False)
         tree.column("duration", width=90, anchor="e", stretch=False)
         tree.column("date", width=110, anchor="center", stretch=False)
-        tree.column("status", width=110, anchor="center", stretch=False)
+        tree.column("status", width=240, anchor="w", stretch=False)
         scrollbar = ttk.Scrollbar(entries_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="both", expand=True)
@@ -4054,7 +4115,8 @@ class VideoProcessorApp:
                     entry.metadata["hydration_pending"] = True
                 tree.insert("", "end", iid=entry.entry_id,
                             values=playlist_tree_values(entry, selected_ids, selected_order))
-                if needs_hydration and entry.entry_id not in hydration_pending:
+                if (needs_hydration and entry.entry_id not in hydration_pending
+                        and entry.metadata.get("hydration_retry_token") is None):
                     hydration_pending.add(entry.entry_id)
                     hydration_executor.submit(
                         hydrate_page_entry, entry, current_page, render_generation, visible_ids
@@ -4064,9 +4126,14 @@ class VideoProcessorApp:
                 state=(tk.NORMAL if (page_index[0] + 1) * descriptor.page_size < descriptor.total_count
                        else tk.DISABLED)
             )
+            refresh_retry_failed_button()
 
         def hydrate_page_entry(entry, render_page_index, render_generation, visible_ids):
             try:
+                # 只节流全量提取平台（YouTube/Twitch 的 bot-check 风险）；
+                # Bilibili 走轻量 view API，串行节流会白白拖慢大页
+                if str(getattr(entry, "platform", "")).lower() in {"youtube", "twitch"}:
+                    hydration_limiter.wait()
                 descriptor.hydrate_entry(entry)
             finally:
                 hydration_pending.discard(entry.entry_id)
@@ -4076,23 +4143,28 @@ class VideoProcessorApp:
                 retry_count = int(entry.metadata.get("hydration_retries", 0) or 0)
                 if retry_count < 3:
                     entry.metadata["hydration_retries"] = retry_count + 1
+                    # token：手动 Retry Failed 会清计数重置状态；过期的 backoff
+                    # 回调凭 token 失配作废，不再抹掉手动重试刚写入的状态
+                    entry.metadata["hydration_retry_token"] = retry_count + 1
                     backoff = (5, 15, 45)[retry_count]
-                    if retry_count == 0:
-                        try:
-                            self.root.after(0, lambda: apply_hydration_update(
-                                entry, render_page_index, render_generation, visible_ids))
-                        except tk.TclError:
-                            pass
+                    # 每次失败都刷新 UI：计数实时走 1/3→2/3→3/3，原因不再被遮
+                    try:
+                        self.root.after(0, lambda: apply_hydration_update(
+                            entry, render_page_index, render_generation, visible_ids))
+                    except tk.TclError:
+                        pass
                     try:
                         self.root.after(
                             int(backoff * 1000),
-                            lambda: schedule_hydration_retry(
-                                entry, render_page_index, render_generation, visible_ids),
+                            lambda t=retry_count + 1: schedule_hydration_retry(
+                                entry, render_page_index, render_generation, visible_ids,
+                                token=t),
                         )
                     except tk.TclError:
                         pass
                 else:
                     entry.metadata.pop("hydration_retries", None)
+                    entry.metadata.pop("hydration_retry_token", None)
                     try:
                         self.root.after(0, lambda: apply_hydration_update(
                             entry, render_page_index, render_generation, visible_ids))
@@ -4100,13 +4172,19 @@ class VideoProcessorApp:
                         pass
                 return
             try:
+                entry.metadata.pop("hydration_retry_token", None)
                 self.root.after(0, lambda: apply_hydration_update(
                     entry, render_page_index, render_generation, visible_ids))
             except tk.TclError:
                 pass
 
-        def schedule_hydration_retry(entry, render_page_index, render_generation, visible_ids):
+        def schedule_hydration_retry(entry, render_page_index, render_generation,
+                                     visible_ids, token=None):
             if closed[0]:
+                return
+            # token 失配 = 状态已被手动 Retry Failed 重置，本回调作废
+            if token is not None and \
+                    entry.metadata.get("hydration_retry_token") != token:
                 return
             entry.metadata["hydration_failed"] = False
             if entry.entry_id not in hydration_pending:
@@ -4115,8 +4193,46 @@ class VideoProcessorApp:
                     hydrate_page_entry, entry, render_page_index, render_generation, visible_ids
                 )
 
+        def retry_failed_entries():
+            """手动重试所有 hydration 失败的条目（重置自动重试计数）。"""
+            if closed[0]:
+                return
+            failed = descriptor.failed_hydration_entries()
+            if not failed:
+                return
+            for entry in failed:
+                if entry.metadata.get("hydration_retry_token") is not None:
+                    continue  # 自动重试已排期（backoff 中），避免双投
+                entry.metadata.pop("hydration_retries", None)
+                entry.metadata["hydration_failed"] = False
+            render_page()  # bump generation + 重绘；当前页条目由 render_page 重提
+            current_page = page_index[0]
+            visible_ids = {e.entry_id for e in descriptor.load_page(current_page, hydrate=False)}
+            for entry in failed:
+                if entry.entry_id in hydration_pending:
+                    continue  # render_page 已重新提交（当前页）
+                if entry.metadata.get("hydration_retry_token") is not None:
+                    continue  # 自动重试已排期
+                hydration_pending.add(entry.entry_id)
+                hydration_executor.submit(
+                    hydrate_page_entry, entry, current_page, generation[0], visible_ids
+                )
+
+        def refresh_retry_failed_button():
+            try:
+                retry_failed_button.config(
+                    state=tk.NORMAL if descriptor.failed_hydration_entries()
+                    else tk.DISABLED
+                )
+            except tk.TclError:
+                pass
+
         def apply_hydration_update(entry, render_page_index, render_generation, visible_ids):
             entry.metadata["hydration_pending"] = False
+            if not closed[0]:
+                refresh_retry_failed_button()
+            # 失败原因 + 重试计数由 playlist_tree_values 统一生成
+            # （不再用 "Retrying (n/3)..." 覆盖——那会遮住原因且计数卡死）。
             if closed[0] or not hydration_update_is_current(
                     entry.entry_id, render_page_index, render_generation,
                     page_index[0], generation[0], visible_ids):
@@ -4216,6 +4332,10 @@ class VideoProcessorApp:
         jump_spin.pack(side="left", padx=(0, 2))
         jump_spin.bind("<Return>", lambda event: go_to_page())
         ttk.Button(controls, text="Go", command=go_to_page).pack(side="left", padx=2)
+        retry_failed_button = ttk.Button(
+            actions, text="Retry Failed", command=lambda: retry_failed_entries(),
+        )
+        retry_failed_button.pack(side="left", padx=4)
         ttk.Button(actions, text="Confirm Selected", command=confirm).pack(side="left", padx=4)
         ttk.Button(actions, text="Cancel", command=cancel).pack(side="left", padx=4)
 
@@ -4548,12 +4668,12 @@ class VideoProcessorApp:
             return
         pp = self._preset_path()
         try:
-            with open(pp, 'r') as f:
+            with open(pp, 'r', encoding="utf-8") as f:
                 presets = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             presets = {}
         presets[name] = self._collect_all_vars()
-        with open(pp, 'w') as f:
+        with open(pp, 'w', encoding="utf-8") as f:
             json.dump(presets, f, indent=2)
         print(f"{Fore.GREEN}Preset '{name}' saved.")
         self._refresh_preset_combo()
@@ -4562,7 +4682,7 @@ class VideoProcessorApp:
         """Reload preset list into the ComboBox."""
         import json
         try:
-            with open(self._preset_path(), 'r') as f:
+            with open(self._preset_path(), 'r', encoding="utf-8") as f:
                 presets = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             presets = {}
@@ -4580,7 +4700,7 @@ class VideoProcessorApp:
         if not name or name == "Load Preset":
             return
         try:
-            with open(self._preset_path(), 'r') as f:
+            with open(self._preset_path(), 'r', encoding="utf-8") as f:
                 presets = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return
@@ -4973,7 +5093,7 @@ class VideoProcessorApp:
         self.preferences.set(
             "Settings", "remote_cache_path", str(self.remote_cache_store.root))
 
-        with open(self.preferences_file, 'w') as configfile:
+        with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
             self.preferences.write(configfile)
 
     def reset_preferences_to_file(self):

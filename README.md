@@ -14,7 +14,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 |---------|-------------|
 | **Skip Detection** | Load existing `timestamps.txt` to skip AI detection entirely. Auto-use mode suppresses the confirmation dialog. |
 | **Review Dialog** | After detection, preview and check/uncheck every clip before compiling. Right-click for audio/video preview. |
-| **Edit Times** | Double-click any row in the review dialog to manually adjust start/end times (HH:MM:SS or seconds). |
+| **Edit Times** | Double-click any row in the review dialog to manually adjust start/end times (HH:MM:SS.mmm or seconds). |
 | **Re-verify Clips** | DRC scan near each clip to find missed sounds. Threshold syncs to main detection. New/original clips shown separately. High-score DRC hits skip P3 confirmation. |
 | **Add Folder** | Recursively scan a folder for video/audio files — no need to pick files one by one. |
 | **Save Selected** | Review dialog exports the checked clips back to a fixed `timestamps_selected.txt` (overwritten each run) for future re-use. |
@@ -253,11 +253,17 @@ Any remote source must download its full audio timeline before detection can run
 
 ### Timestamps Format
 
+Timestamps are stored with **millisecond precision** (`H:MM:SS.mmm`), so a two-pass workflow (run detection, then review in a later run) keeps clip boundaries exactly as detected. Older files with whole-second timestamps are still loaded correctly.
+
 ```
 /path/to/video.mp4
-0:00:05 - 0:00:10, confidence: 0.95
-0:01:15 - 0:01:20, confidence: 0.88
+0:00:05.250 - 0:00:10.750, confidence: 0.95
+0:01:15.120 - 0:01:20.000, confidence: 0.88 [new]
+0:02:30.000 - 0:02:35.500, confidence: 0.72 [suspect]
 ```
+
+- Re-verify adds clips marked `[new]`; suspect clips (argmax mismatch) are marked `[suspect]` and get pre-deselected in the review dialog when the file is reloaded.
+- Hand-edited lines must use `H:MM:SS` or `H:MM:SS.mmm` (1-3 fractional digits); minute/second values over 59 and inverted ranges are skipped with a warning.
 
 ## 🙏 Credits
 

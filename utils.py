@@ -456,8 +456,20 @@ else:  # Linux
 FFMPEG_PATH = get_bundle_filepath(ffmpeg_path)
 
 
-def _download_ydl_options(browser_cookies: str | None = None) -> dict:
-    """Return yt-dlp cookie options without ever passing an anonymous Auto value."""
+def _is_youtube_download_url(url: str) -> bool:
+    from urllib.parse import urlsplit
+    hostname = (urlsplit(str(url)).hostname or "").lower()
+    return any(hostname == marker or hostname.endswith("." + marker)
+               for marker in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+
+
+def _download_ydl_options(browser_cookies: str | None = None, url: str | None = None) -> dict:
+    """Return yt-dlp cookie options without ever passing an anonymous Auto value.
+
+    注意：不预注入 youtube player_client——web_embedded 等客户端给出的媒体
+    URL 需要 PO token，解析成功但下载 403（Audio Cache 卡 0 MB/s 的教训）。
+    tv_downgraded 的 page-reload 错误由 resolve 层的匿名回退处理。
+    """
     value = str(browser_cookies or "").strip()
     if value.casefold() == "none":
         value = ""
@@ -649,7 +661,7 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                 'ffmpeg_location': FFMPEG_PATH
             }
             ydl_opts.update(_download_transfer_options(n_retries))
-            ydl_opts.update(_download_ydl_options(cookie_source))
+            ydl_opts.update(_download_ydl_options(cookie_source, url=url))
             if max_speed > 0:
                 ydl_opts['limit_rate'] = f"{max_speed}K"
             attempts = 0
@@ -727,7 +739,7 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                 'ffmpeg_location': FFMPEG_PATH
             }
             ydl_opts.update(_download_transfer_options(n_retries))
-            ydl_opts.update(_download_ydl_options(cookie_source))
+            ydl_opts.update(_download_ydl_options(cookie_source, url=url))
             if max_speed > 0:
                 ydl_opts['limit_rate'] = f"{max_speed}K"
             attempts = 0

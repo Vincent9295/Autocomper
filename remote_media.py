@@ -177,18 +177,28 @@ class PlaylistDescriptor:
     def hydrate_entry(self, entry: PlaylistEntry) -> PlaylistEntry:
         if not self._hydrate_entry or entry.index in self._hydrated_indices:
             return entry
+        error = None
         try:
             hydrated = self._hydrate_entry(entry)
-        except Exception:
+        except Exception as exc:
             hydrated = None
+            error = _classify_hydration_error(exc)
         if hydrated:
             _merge_entry_metadata(entry, hydrated)
             entry.metadata["_resolved_info"] = dict(hydrated)
             self._hydrated_indices.add(entry.index)
             entry.metadata["hydration_failed"] = False
+            entry.metadata.pop("hydration_error", None)
         else:
             entry.metadata["hydration_failed"] = True
+            if error:
+                entry.metadata["hydration_error"] = error
         return entry
+
+    def failed_hydration_entries(self) -> list[PlaylistEntry]:
+        """Entries whose last hydration attempt failed (retry candidates)."""
+        return [entry for entry in self._entries
+                if getattr(entry, "metadata", {}).get("hydration_failed")]
 
 
 def apply_audio_candidate(source: MediaSource, candidate: Mapping[str, Any]) -> MediaSource:
@@ -1302,6 +1312,7 @@ def _normalize_browser_cookies(browser_cookies: str | None) -> str | None:
 def _ydl_options(
     browser_cookies: str | None = None,
     extract_flat: bool = False,
+    url: str | None = None,
 ) -> dict[str, Any]:
     options = {
         "quiet": True,
@@ -1318,6 +1329,11 @@ def _ydl_options(
         options["cookies"] = normalized[len(_COOKIES_FILE_PREFIX):]
     elif normalized in _BROWSER_COOKIE_NAMES:
         options["cookiesfrombrowser"] = (normalized,)
+    # 注意：这里不预注入 youtube player_client（如 default,web_embedded）。
+    # 实测预注入会让 web_embedded 客户端给出需要 PO token 的媒体 URL，
+    # 元数据解析成功但下载全部 403（Audio Cache 卡 0 MB/s）。
+    # tv_downgraded 坏客户端的 page-reload 错误由
+    # _extract_with_cookie_policy 的匿名回退梯子处理。
     return options
 
 
@@ -1325,9 +1341,10 @@ def _make_ydl(
     ydl_factory: Callable[..., Any] | None,
     browser_cookies: str | None = None,
     extract_flat: bool = False,
+    url: str | None = None,
 ):
     if ydl_factory is not None:
-        return ydl_factory(_ydl_options(browser_cookies, extract_flat=extract_flat))
+        return ydl_factory(_ydl_options(browser_cookies, extract_flat=extract_flat, url=url))
     try:
         from yt_dlp import YoutubeDL
     except ImportError as exc:
@@ -1355,6 +1372,7 @@ def _extract_info(
             ydl_factory,
             browser_cookies=browser_cookies,
             extract_flat=extract_flat,
+            url=url,
         )
         if hasattr(ydl, "__enter__"):
             with ydl as active_ydl:
@@ -1410,13 +1428,66 @@ def _is_bilibili_url(url: str) -> bool:
     return any(hostname == marker or hostname.endswith("." + marker) for marker in _BILIBILI_HOST_MARKERS)
 
 
+_YOUTUBE_HOST_MARKERS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+
+def _is_youtube_url(url: str) -> bool:
+    hostname = (urlsplit(url).hostname or "").lower()
+    return any(hostname == marker or hostname.endswith("." + marker)
+               for marker in _YOUTUBE_HOST_MARKERS)
+
+
 def _is_http_412_error(exc: Exception) -> bool:
     detail = str(exc).lower()
     return "412" in detail or "precondition failed" in detail
 
 
+# YouTube bot-check / Twitch 鉴权类错误：无 cookie 的重试永远不会成功，
+# 带 cookie 重试通常直接解决——这是 YouTube "Metadata failed" 的最常见根因。
+_AUTH_REQUIRED_ERROR_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "please sign in",
+    "login required",
+    "oauth",
+    "authentication",
+)
+
+
+def _looks_like_auth_required_error(exc: Exception) -> bool:
+    detail = str(exc).lower()
+    return any(marker in detail for marker in _AUTH_REQUIRED_ERROR_MARKERS)
+
+
+def _is_yt_page_reload_error(exc: Exception) -> bool:
+    """yt-dlp #17389：带 cookie 时 tv_downgraded 客户端已坏的标志性错误。"""
+    return "page needs to be reloaded" in str(exc).lower()
+
+
 def _should_auto_use_cookies(url: str, exc: Exception) -> bool:
-    return _is_bilibili_url(url) or _is_http_412_error(exc)
+    if _is_bilibili_url(url) or _is_http_412_error(exc):
+        return True
+    return _looks_like_auth_required_error(exc)
+
+
+def _classify_hydration_error(exc: Exception) -> str:
+    """Short failure reason for a playlist-picker status cell (~110-240px 列宽)。
+    操作性建议（如配置 cookies）放在 cookie 回退耗尽后的报错与 README，不塞窄列。"""
+    detail = str(exc).strip().replace("\n", " ")
+    lowered = detail.lower()
+    if _looks_like_auth_required_error(exc):
+        return "sign-in required"
+    if _is_yt_page_reload_error(exc):
+        return "youtube page reload error"
+    if _is_http_412_error(exc) or "429" in lowered or "too many requests" in lowered:
+        return "rate limited"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timed out"
+    if "unavailable" in lowered or "private" in lowered or "removed" in lowered:
+        return "unavailable"
+    if len(detail) > 60:
+        detail = detail[:57] + "..."
+    return detail or exc.__class__.__name__
 
 
 def _short_cookie_failure(browser: str, exc: Exception) -> str:
@@ -1448,9 +1519,21 @@ def _extract_with_cookie_policy(
     resolve_timeout: float = 90,
 ) -> Mapping[str, Any]:
     normalized = _normalize_browser_cookies(browser_cookies)
-    if normalized != "auto":
-        return _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat,
-                             resolve_timeout=resolve_timeout)
+    if normalized not in (None, "auto"):
+        try:
+            return _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat,
+                                 resolve_timeout=resolve_timeout)
+        except SourceResolveError as exc:
+            # yt-dlp #17389：YouTube 带 cookie 时 tv_downgraded 客户端对部分
+            # 用户已坏。公开视频匿名解析正常（issue 原报告证实）——回退匿名
+            # 重试一次；仍失败则抛原始错误（原因更明确）。
+            if _is_youtube_url(url) and _is_yt_page_reload_error(exc):
+                try:
+                    return _extract_info(url, ydl_factory, None, extract_flat=extract_flat,
+                                         resolve_timeout=resolve_timeout)
+                except SourceResolveError:
+                    raise exc
+            raise
 
     try:
         return _extract_info(url, ydl_factory, extract_flat=extract_flat,
@@ -1470,7 +1553,8 @@ def _extract_with_cookie_policy(
         detail = "; ".join(failures)
         raise SourceResolveError(
             f"Could not resolve source {url}: {detail}. "
-            "请登录 Bilibili 浏览器或选择 cookies"
+            "Sign-in appears to be required; configure browser cookies or a "
+            "cookies.txt file in Remote Settings."
         ) from initial_error
 
 
