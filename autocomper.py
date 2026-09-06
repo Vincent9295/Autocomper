@@ -1799,6 +1799,14 @@ def _resolve_txt_paths(output_video_path, configured_txt):
     return os.path.join(folder, "timestamps.txt")
 
 
+def _compile_failure_label(compile_entries) -> str:
+    """编译失败包装文案：本地批次不再顶着 "Remote segment" 的名字误导排查。"""
+    has_remote = any(isinstance(entry.get("filename"), MediaSource)
+                     for entry in compile_entries or [])
+    return ("Remote segment materialization/compile failed" if has_remote
+            else "Clip compilation failed")
+
+
 def _txt_suffixed_path(txt_path, suffix):
     """Derive a fixed-suffix timestamps path (e.g. timestamps_reverified.txt)."""
     root, _ext = os.path.splitext(str(txt_path) or "")
@@ -5871,7 +5879,7 @@ class VideoProcessorApp:
                                         sample, "Compile"),
                                     batch_size=self.merge_batch_size.get())
                     except Exception as exc:
-                        raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
+                        raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                     finally:
                         shutil.rmtree(remote_temp, ignore_errors=True)
                     if remote_failures:
@@ -6255,7 +6263,7 @@ class VideoProcessorApp:
                                     sample, "Compile"),
                                 batch_size=self.merge_batch_size.get())
                 except Exception as exc:
-                    raise Exception(f"Remote segment materialization/compile failed: {exc}") from exc
+                    raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                 finally:
                     shutil.rmtree(remote_temp, ignore_errors=True)
                 if remote_failures:

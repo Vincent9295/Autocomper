@@ -375,6 +375,55 @@ def _fallback_to_x264():
     print(f"{Fore.YELLOW}NVENC encode failed; falling back to libx264 (CPU).{Style.RESET_ALL}")
 
 
+def _pad_clip_audio_if_missing(path: str, probe: str) -> bool:
+    """临时片段有视频但无音频（源音轨在该区间缺失/EOF/有空洞）时，
+    原地补一条静音音轨，让编译继续而不是整体失败。
+
+    触发场景：源文件音轨短于视频轨（B 站分轨下载工具拼接的常见毛病）或
+    音轨有空洞，clip 区间整体落在音频缺失段 → 切割的音频 filtergraph 在
+    0 帧时 EOF，输出片段没有音轨 → concat 预检点名后整批失败。
+    返回是否补音成功（补不了/无需补返回 False）。"""
+    if re.search(r'Stream #0:\d+.*Video:', probe) is None:
+        return False
+    if re.search(r'Stream #0:\d+.*Audio:', probe) is not None:
+        return False
+    dm = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', probe)
+    if not dm:
+        return False
+    h, mi, s, centis = map(int, dm.groups())
+    dur = h * 3600 + mi * 60 + s + centis / 100
+    if dur <= 0:
+        return False
+    tmp = f"{path}.silence.tmp.mp4"
+    cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+           '-i', path,
+           '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+           '-map', '0:v:0', '-map', '1:a:0',
+           '-c:v', 'copy',
+           '-t', f'{dur:.3f}',
+           '-c:a', 'aac', '-b:a', '192k',
+           '-avoid_negative_ts', 'make_zero',
+           tmp]
+    try:
+        result = _run_ffmpeg(cmd, timeout=300)
+        if result.returncode != 0 or not os.path.exists(tmp):
+            return False
+        os.replace(tmp, path)
+        # 原地替换后 _PROBE_CACHE 里的旧探测结果作废
+        _PROBE_CACHE.pop(os.path.normcase(os.path.normpath(path)), None)
+        print(f"{Fore.YELLOW}  Warning: clip {os.path.basename(path)} had no audio "
+              f"stream in the source range; padded with silence."
+              f"{Style.RESET_ALL}")
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
 def _align_cut_audio_to_video(path):
     """第二遍对齐：把音频轨重封到本文件视频轨的实际时长（A=V 逐帧相等）。
 
@@ -606,7 +655,11 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         if re.search(r'Stream #0:\d+.*Video:.*?(\d{2,})x(\d{2,})', probe) is None:
             raise Exception(f"FFmpeg concat: file {i} has no video stream: {fp}")
         if re.search(r'Stream #0:\d+.*Audio:', probe) is None:
-            raise Exception(f"FFmpeg concat: file {i} has no audio stream: {fp}")
+            # 源音轨短于视频/区间内音频缺失时切割会产生无音轨片段：
+            # 补静音继续编译（整批失败代价太大），而不是在这里放弃。
+            if not _pad_clip_audio_if_missing(fp, probe):
+                raise Exception(f"FFmpeg concat: file {i} has no audio stream: {fp}")
+            probe = _ffprobe(fp)
         dm = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', probe)
         if dm:
             h, mi, s, ms = map(int, dm.groups())
