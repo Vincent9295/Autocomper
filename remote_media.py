@@ -1017,19 +1017,28 @@ def _segment_has_stream(path, want_video=True):
 
     ffmpeg exits 0 even for some empty/truncated outputs, so the raw exit code
     and the file-size check alone are not enough to trust a downloaded segment.
+    探测超时/异常属于"不确定"而非"无流"——重探一次再下结论，防止把好
+    segment 误判成 unreadable（慢盘/AV 扫描可能让 10s 探测超时）。
     """
-    try:
-        out = run_tracked([FFMPEG_PATH, "-hide_banner", "-i", str(path)],
-                          timeout=10, text=True)
-    except Exception:
-        return False
-    stderr = getattr(out, "stderr", None)
-    if stderr is None:
-        return True
-    if not isinstance(stderr, str):
-        stderr = str(stderr)
     kind = r"Video:" if want_video else r"Audio:"
-    return bool(re.search(r"Stream #\d+:\d+.*" + kind, stderr))
+    pattern = re.compile(r"Stream #\d+:\d+.*" + kind)
+    for attempt in (1, 2):
+        try:
+            out = run_tracked([FFMPEG_PATH, "-hide_banner", "-i", str(path)],
+                              timeout=10, text=True)
+        except Exception:
+            if attempt == 2:
+                return False
+            time.sleep(1)
+            continue
+        stderr = getattr(out, "stderr", None)
+        if stderr is None:
+            return True
+        if not isinstance(stderr, str):
+            stderr = str(stderr)
+        # 无匹配是确定性结果（真无流），不重试
+        return bool(pattern.search(stderr))
+    return False
 
 
 def _segment_duration(path) -> float | None:
@@ -1071,6 +1080,32 @@ def _refresh_with_backoff(
         refresh_func, limiter=ResolveLimiter(), retries=attempts, logger=logger
     )
     return limited(source)
+
+
+def _rotate_video_candidate(source: MediaSource) -> bool:
+    """无视频流失败后轮换到下一个视频候选（不同 CDN 边缘/格式）。
+
+    视频输入拿不到帧而音频输入正常（音频走另一个 host）→ 产出只有音轨的
+    片段。给该源一次换线机会；没有其他不同 URL 的候选时返回 False。
+    """
+    candidates = [c for c in (getattr(source, "video_candidates", None) or [])
+                  if isinstance(c, dict) and str(c.get("url") or "")]
+    current = str(source.video_url or "")
+    urls = [str(c.get("url")) for c in candidates]
+    try:
+        current_index = urls.index(current)
+    except ValueError:
+        current_index = -1
+    for step in range(1, len(urls) + 1):
+        idx = (current_index + step) % len(urls)
+        if urls[idx] == current:
+            continue
+        source.video_url = urls[idx]
+        headers = candidates[idx].get("http_headers")
+        if headers:
+            source.video_headers = dict(headers)
+        return True
+    return False
 
 
 def fetch_segment(
@@ -1184,9 +1219,17 @@ def fetch_segment(
                 raise SegmentFetchError(f"FFmpeg segment fetch completed without output: {temporary_path}")
             if run_func is None and not _segment_has_stream(
                     temporary_path, want_video=not audio_only):
-                raise SegmentFetchError(
+                error = SegmentFetchError(
                     f"FFmpeg segment fetch produced an unreadable segment "
-                    f"(no {'video' if not audio_only else 'audio'} stream): {temporary_path}")
+                    f"(no {'video' if not audio_only else 'audio'} stream): "
+                    f"{temporary_path}"
+                    + ("" if audio_only else
+                       " (the VOD's video track may end before this clip's "
+                       "start, or the video CDN edge is currently unreachable "
+                       "from this network)"))
+                if not audio_only:
+                    error.no_video_stream = True
+                raise error
             if run_func is None:
                 # 时长校验：下载部分成功但内容不完整/损坏时（URL 过期、CDN
                 # 半连接），ffmpeg 可能退出 0 且流存在，但返回的 segment 远短于
@@ -1235,6 +1278,13 @@ def fetch_segment(
                     f"Segment fetch for {start}-{end} kept failing for 90s; "
                     f"giving up on this clip (the VOD stream for this interval "
                     f"may be unavailable).")
+            # 无视频流（音频正常）→ 大概率是当前 video_url 的 CDN 边缘对本
+            # 网络不可用：轮换到下一个视频候选换线重试（不消耗 refresh 名额；
+            # 刷新的重新解析可能选回同一个坏边缘）。
+            if isinstance(exc, SegmentFetchError) and getattr(exc, "no_video_stream", False):
+                if _rotate_video_candidate(source) and logger is not None:
+                    logger("Remote segment produced no video stream; "
+                           "retrying with the next video candidate")
             if refresh_func is not None and not refreshed:
                 refreshed = True
                 try:
