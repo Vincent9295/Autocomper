@@ -12,7 +12,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 
 | Feature | Description |
 |---------|-------------|
-| **Skip Detection** | Load existing `timestamps.txt` to skip AI detection entirely. Auto-use mode suppresses the confirmation dialog. |
+| **Skip Detection** | Load an existing timestamps file to skip AI detection entirely. Auto-use mode suppresses the confirmation dialog. When several timestamp files exist for the same output (`timestamps.txt`, `timestamps_reverified.txt`, `timestamps_selected.txt`), AutoComper asks which one to load and shows each file's clip count, its `[new]` clip count when it has any, and the file's last-modified time. |
 | **Review Dialog** | After detection, preview and check/uncheck every clip before compiling. Right-click for audio/video preview. |
 | **Edit Times** | Double-click any row in the review dialog to manually adjust start/end times (HH:MM:SS.mmm or seconds). |
 | **Re-verify Clips** | DRC scan near each clip to find missed sounds. Threshold syncs to main detection. New/original clips shown separately. High-score DRC hits skip P3 confirmation. |
@@ -26,6 +26,9 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Max Download Concurrency** | Control how many remote clips are fetched at once while preparing a compilation (default 5). |
 | **Fixed Timestamps Files** | Timestamps are always saved as fixed names — `timestamps.txt` (detection), with re-verify writing `timestamps_reverified.txt` and review writing `timestamps_selected.txt`. Each is overwritten per run, so nothing piles up across videos. |
 | **Merge Batch Size** | Adjust how many clips each FFmpeg merge batch combines before the final concat. Lower it for laptops/weak CPUs; higher is faster on strong machines. |
+| **Import URLs from Timestamps .txt** | The **Add Media** menu can queue every URL listed in an existing timestamps file. Each section title in that file is the source of one video, so a batch can be rebuilt without pasting URLs again. Titles that are neither a URL nor a media file path, files that no longer exist, and entries already in the list are skipped (and counted in the log). |
+| **Rate-Limit Pause and Retry** | If the platform rate-limits source resolving (YouTube bot check, HTTP 429, Bilibili 412), AutoComper offers to wait 5/15/30 minutes and then retries **only** the sources that failed. The countdown is shown in the progress panel and can be cancelled with Stop. |
+| **Shorter-Clip Warnings** | Clips that end up shorter than requested are no longer silent: a remote segment that arrives short is fetched again under the normal retry policy, and a remaining shortfall (or padding clipped by a clip next to it) is reported in a summary line. |
 | **Improved UI** | Scrollable settings panel, stable Settings layout, clearer remote clip progress, and repositioned tooltips. |
 
 ### Technical Improvements vs. the Original
@@ -102,7 +105,7 @@ If CUDA isn't installed, the app falls back to CPU automatically.
 
 ## 📖 Usage
 
-1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist.
+1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist. To rebuild a batch you have processed before, use **Add Media → Import URLs from Timestamps .txt** and pick one of its timestamps files: every URL in that file is queued again.
 2. **Configure** — set Precision / Block Size / Threshold. Use tooltips for guidance.
 3. **Choose Remote Processing** for URL inputs:
    - **Remote Stream** reads remote audio directly and fetches video only for previews/selected clips.
@@ -137,6 +140,25 @@ Each remote clip is downloaded on its own. If one clip cannot be fetched (expire
 For the full detail on every skipped clip, AutoComper writes a `_skipped_clips.txt` file next to your output video (for example `MyVideo_skipped_clips.txt`). It lists each skipped clip's name, full source URL, time range, and the exact failure reason, so you can see exactly what was left out. The file is only created when at least one clip was skipped. If nothing is skipped, no file is produced.
 
 Before downloading any clips, AutoComper checks that the temp drive has enough free space for the selected clips plus the final merge (based on your **Max Download Quality**). If the disk would run out mid-compile, it stops with a clear "insufficient disk space" error instead of filling the drive and failing partway.
+
+#### Clips That Come Out Shorter Than Requested
+
+A compiled video can be shorter than the sum of the clips you selected for two reasons, and both are now reported instead of passing silently:
+
+- **A short remote segment.** If the CDN or a refreshed signed URL delivers less media than the requested time range by more than 0.3s, AutoComper fetches that segment again (up to twice, plus one source refresh, under the same retry policy used for other fetch failures). If it is still short the clip is accepted, and the log prints for example `twitch:42 clip 10-12s was delivered 0.50s short (1.50s of 2.00s); the clip will end earlier than the padding suggests.`, followed by a summary line before compiling. A short delivery is never written to the segment cache, so the next run fetches it again instead of silently reusing it. This check applies to video clips; in **Audio** mode a short segment is neither re-fetched nor reported.
+- **Shortened by a neighbouring clip.** Padding never eats into the next clip: with `before`/`after` padding, a clip's effective end is `min(end + after, next_clip_start)` and its effective start is `max(start - before, previous_effective_end)`. Back-to-back clips therefore lose the padding between them by design, and overlapping detections get trimmed to the unpadded times. The log prints `N clip(s) were shortened by a neighbouring clip (padding removed, or an overlapping detection trimmed)`, so the shorter total is expected, not a bug.
+
+The `timestamps.txt` files themselves always keep the detected (unpadded) times, so re-running from a saved file reproduces the same clips.
+
+#### When Resolving Is Rate Limited
+
+Resolving a large list of URLs (a whole channel or playlist) can hit the platform's quota. AutoComper detects this class of failure, spaces out the remaining resolves, and then asks whether to wait:
+
+- **Wait 5 / 15 / 30 minutes** pauses the run, shows a countdown in the progress panel, and after the wait retries **only** the sources that failed. At most two pauses per run.
+- **Skip** keeps going with the sources that did resolve.
+- **Stop** cancels the wait immediately (within a second); the progress panel says `Stop to cancel` while the countdown runs. The dialog itself is modal, so pick a wait or Skip to close it.
+
+A rate limit is a quota, not a broken link, so the same URLs usually resolve after a short wait. Signing in through **Remote Browser Cookies** or a `cookies.txt` raises the quota substantially and avoids most of these pauses.
 
 #### Remote Settings
 
@@ -267,6 +289,9 @@ Timestamps are stored with **millisecond precision** (`H:MM:SS.mmm`), so a two-p
 
 - Re-verify adds clips marked `[new]`; suspect clips (argmax mismatch) are marked `[suspect]` and get pre-deselected in the review dialog when the file is reloaded.
 - Hand-edited lines must use `H:MM:SS` or `H:MM:SS.mmm` (1-3 fractional digits); minute/second values over 59 and inverted ranges are skipped with a warning.
+- Every non-empty line that is **not** a clip line is a section title, and that title is the media identity: the source URL for remote inputs, or the file path for local ones (a bare `movie.mp4` next to the timestamps file counts as a local file). **Import URLs from Timestamps .txt** reads exactly those titles, which is why it can rebuild a batch from an old file; titles that are neither a URL nor a media path are counted as skipped.
+- If more than one timestamps file exists for the output, AutoComper asks which one to load. Tick "Remember this choice" in that dialog to skip the question later, and change it again under **Add Media → Timestamps File Preference…**.
+- Files saved by Notepad (UTF-8 with BOM) and older local encodings (for example GBK) are both read; a non-UTF-8 file prints a warning suggesting you re-save it as UTF-8.
 
 ## 🙏 Credits
 

@@ -37,6 +37,38 @@ _SEGMENT_HEARTBEAT_INTERVAL = 60.0
 _AUDIO_CACHE_FALLBACK_STALL_TIMEOUT = 300.0
 _PLATFORM_LABELS = {"youtube": "YouTube", "bilibili": "Bilibili",
                     "bilibiliweb": "Bilibili", "twitch": "Twitch"}
+# 交付比请求短超过这个秒数就重取一次（最后一次尝试仍短则接受并记录）。
+# 以前静默接受：clip 被对齐裁到实际交付长度，结尾比 padding 预期早、切点生硬。
+_SHORT_SEGMENT_TOLERANCE = 0.3
+_short_delivery_records: list[dict[str, Any]] = []
+_short_delivery_lock = threading.Lock()
+
+
+def reset_short_delivery_records() -> None:
+    """Clear the per-run short-delivery log (called before materialize)."""
+    with _short_delivery_lock:
+        _short_delivery_records.clear()
+
+
+def short_delivery_records() -> list[dict[str, Any]]:
+    """Clips whose downloaded segment was shorter than the requested window."""
+    with _short_delivery_lock:
+        return list(_short_delivery_records)
+
+
+def _log_short_delivery(source, start, end, actual, expected) -> None:
+    shortfall = max(0.0, float(expected) - float(actual))
+    platform = getattr(source, "platform", None) or "remote"
+    source_id = getattr(source, "source_id", None) or "?"
+    label = f"{platform}:{source_id}"
+    record = {"name": label, "start": float(start), "end": float(end),
+              "actual": float(actual), "expected": float(expected),
+              "shortfall": shortfall}
+    with _short_delivery_lock:
+        _short_delivery_records.append(record)
+    print(f"  {label} clip {float(start):g}-{float(end):g}s was delivered "
+          f"{shortfall:.2f}s short ({actual:.2f}s of {expected:.2f}s); "
+          f"the clip will end earlier than the padding suggests.")
 
 
 class RemoteMediaError(Exception):
@@ -1086,16 +1118,23 @@ def _segment_duration(path) -> float | None:
 
     Uses the same bounded ffmpeg probe as `_segment_has_stream` so a corrupt or
     truncated download (which ffmpeg may still exit 0 for) can be detected
-    before it enters the compile stage.
+    before it enters the compile stage. 探测失败重试一次：返回 None 会同时关掉
+    50% 截断检查和短交付检查，在并发抓取（磁盘忙）时不该静默失效。
     """
-    try:
-        out = run_tracked(
-            [FFMPEG_PATH, "-hide_banner", "-i", str(path),
-             "-probesize", "32M", "-analyzeduration", "100M"],
-            timeout=10, text=True)
-        stderr = getattr(out, "stderr", None)
-    except Exception:
-        return None
+    stderr = None
+    for probe_attempt in range(2):
+        try:
+            out = run_tracked(
+                [FFMPEG_PATH, "-hide_banner", "-i", str(path),
+                 "-probesize", "32M", "-analyzeduration", "100M"],
+                timeout=10, text=True)
+            stderr = getattr(out, "stderr", None)
+        except Exception:
+            stderr = None
+        if isinstance(stderr, str) and "Duration:" in stderr:
+            break
+        if probe_attempt == 0:
+            time.sleep(0.5)
     if not isinstance(stderr, str):
         return None
     m = re.search(r"Duration: (\d+):(\d+):(\d+)\.(\d+)", stderr)
@@ -1233,6 +1272,8 @@ def fetch_segment(
     refreshed = False
     attempt = 0
     allowed_attempts = int(retries) + 1
+    # 这一轮交付的片段是否"短但可用"（用于跳过缓存写入，见下）。
+    short_delivery = False
     # 持续失败预算：只针对"反复失败无进展"的片段。慢速但稳定产出的下载
     # 有数据（stall 不触发）不会被误杀；连续失败累计超过该秒数则放弃，
     # 避免 materialize 卡在单个坏片段上无限 refresh 探测。
@@ -1291,14 +1332,42 @@ def fetch_segment(
                 ) - max(0.0, float(start) - float(padding_before))
                 actual_duration = _segment_duration(temporary_path)
                 if (expected_duration > 0 and actual_duration is not None
-                        and actual_duration > 0
-                        and actual_duration < expected_duration * 0.5):
-                    raise SegmentFetchError(
-                        f"FFmpeg segment fetch produced a truncated segment "
-                        f"({actual_duration:g}s vs expected ~{expected_duration:g}s): "
-                        f"{temporary_path}")
+                        and actual_duration > 0):
+                    if actual_duration < expected_duration * 0.5:
+                        raise SegmentFetchError(
+                            f"FFmpeg segment fetch produced a truncated segment "
+                            f"({actual_duration:g}s vs expected ~{expected_duration:g}s): "
+                            f"{temporary_path}")
+                    shortfall = expected_duration - actual_duration
+                    # 有整段预算的调用（预览：max_total_duration>0）本来就不该
+                    # 为一个窗口再抓一遍，也不该往 materialize 的短交付汇总里写
+                    # 预览记录。
+                    if (shortfall > _SHORT_SEGMENT_TOLERANCE and not audio_only
+                            and not (max_total_duration and max_total_duration > 0)):
+                        # 交付比请求短（但过了 50% 门槛）：以前静默接受，clip 会被
+                        # 对齐裁到实际交付长度 → 结尾比 padding 预期早、切点生硬
+                        # （测试者反馈）。先按失败重试（走 refresh 阶梯）；最后一次
+                        # 尝试仍短就接受，宁可短一点也不丢整个 clip。
+                        #
+                        # 但"连续失败 90s 就放弃"的预算不能把短交付算进去：慢 CDN 上
+                        # 两次 40-50s 的抓取就够触发，结果是"接受一个短 clip"变成
+                        # "丢掉整个 clip"。预算已耗尽时直接走接受分支。
+                        budget_exhausted = (
+                            _fail_budget_started is not None
+                            and time.monotonic() - _fail_budget_started > 90)
+                        if attempt + 1 < allowed_attempts and not budget_exhausted:
+                            raise SegmentFetchError(
+                                f"FFmpeg segment delivered {actual_duration:g}s of the "
+                                f"requested {expected_duration:g}s "
+                                f"({shortfall:g}s short); re-fetching")
+                        _log_short_delivery(source, start, end, actual_duration,
+                                            expected_duration)
+                        short_delivery = True
             data = temporary_path.read_bytes()
-            if cache_store is not None:
+            if cache_store is not None and not short_delivery:
+                # 短交付的片段不写缓存：缓存命中是按"声称覆盖了请求区间"判断的，
+                # 存进去以后下一轮会直接命中，既不重抓也不报告，可见性只在第一轮
+                # 存在（重新抓一次还会顺带刷新签名 URL）。
                 fetched_start = max(0.0, float(start) - float(padding_before))
                 fetched_end = float(end) + float(padding_after)
                 cache_store.save_segment_cache(

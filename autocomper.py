@@ -77,11 +77,14 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            ProbeCooldown,
                            MAX_PLAYLIST_ENTRIES,
                            classify_resolve_failure,
+                           reset_short_delivery_records,
+                           short_delivery_records,
                            _audio_cache_format_identity)
 from remote_cache import CacheStore
 from remote_rate import (LimitedRefresher, ResolveLimiter, is_throttling_error,
                          throttle_step)
-from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
+from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
+                     MediaUpload, VIDEO_SUFFIXES,
                      cancel_clear, cancel_pending, convert_quality_str_to_int,
                      download_audio, download_video, get_bundle_filepath,
                      kill_tracked_procs, request_cancel, run_tracked,
@@ -89,6 +92,9 @@ from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
                      unique_download_stem, yt_dlp_version)
+
+# timestamps .txt 里"看起来像本地媒体文件"的标题判据（视频 + 音频都算）。
+_TIMESTAMPS_MEDIA_SUFFIXES = VIDEO_SUFFIXES | AUDIO_SUFFIXES
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
 VIDEO_OUTPUT = [("Video Files", "*.mp4"), ("All Files", "*.*")]
@@ -967,6 +973,30 @@ def preserve_remote_result(result, source):
     return preserved
 
 
+def _wait_for_quota(seconds, logger=None, cancel_check=None, slice_seconds=1.0,
+                    progress_callback=None):
+    """Sleep in short slices so Cancel is honoured during a throttle pause.
+
+    Returns True when the full wait elapsed, False when it was cancelled early.
+    """
+    total = max(0.0, float(seconds))
+    waited = 0.0
+    while waited < total:
+        if cancel_check is not None and cancel_check():
+            return False
+        step = min(slice_seconds, total - waited)
+        time.sleep(step)
+        waited += step
+        if progress_callback is not None:
+            try:
+                progress_callback(waited, total)
+            except Exception:
+                pass
+    if logger is not None and total > 0:
+        logger(f"Resuming after a {total / 60:.0f} minute wait.")
+    return True
+
+
 def resolve_remote_uploads(
     uploaded_videos,
     resolver=None,
@@ -974,6 +1004,10 @@ def resolve_remote_uploads(
     browser_cookies=None,
     max_height=None,
     limiter=None,
+    pause_ask=None,
+    pause_progress=None,
+    max_pauses=2,
+    cancel_check=None,
 ):
     """Resolve URL uploads without changing local uploads.
 
@@ -985,6 +1019,12 @@ def resolve_remote_uploads(
     shared limiter slow down for the rest of the batch — otherwise a big batch
     keeps hammering the platform and every later resolve fails ("YouTube sources
     failing to resolve constantly").
+
+    ``pause_ask(failed_count, reasons, attempt)`` may return a number of seconds
+    to wait for the quota window to recover; only the still-failing sources are
+    then retried (at most ``max_pauses`` times, cancellable through
+    ``cancel_check``). ``pause_progress(waited, total)`` is called once per
+    second so the GUI can show the countdown.
     """
     resolver = resolver or resolve_source
     local_entries = []
@@ -997,70 +1037,83 @@ def resolve_remote_uploads(
                f"cookies={browser_cookies or 'none'} | "
                f"max quality={'no limit' if max_height is None else f'{max_height}p'}")
     resolved_count = 0
-    failed_sources = []
+    failures = {}          # id(upload) -> (url, reason)；等待后重试成功就移除
+    pause_candidates = []  # 限流类失败：等配额窗口恢复后单独重试
     throttle_streak = 0
+
+    def resolve_one(upload):
+        """Resolve one URL upload (3 attempts) or raise the last error.
+
+        取消检查放在每次尝试之前，退避也用可取消的等待：否则 Stop 之后还会在
+        限流平台上继续打几分钟（limiter.wait() 本身最长可睡 120s），
+        "上一轮还在关闭"的守卫会因此误报卡死。
+        """
+        source = upload.get_source()
+        was_attached = source is not None
+        if source is None:
+            source_url = upload.get_url() or upload.get_path()
+            # resolve 失败重试 2 次（网络抖动/瞬时 412），仍失败才跳过。
+            # 被限流/机器人验证时改为更长的退避（默认 2/4s 对限流毫无意义）。
+            last_exc = None
+            for attempt in range(3):
+                if cancel_check is not None and cancel_check():
+                    raise InterruptedError("Operation cancelled by user.")
+                if attempt > 0:
+                    wait = (throttle_step(attempt - 1)
+                            if last_exc is not None and is_throttling_error(last_exc)
+                            else 2.0 * attempt)
+                    if logger is not None:
+                        logger(f"  Retrying resolve in {wait:.0f}s "
+                               f"({classify_resolve_failure(last_exc)[0]})")
+                    if not _wait_for_quota(wait, cancel_check=cancel_check):
+                        raise InterruptedError("Operation cancelled by user.")
+                # 真正需要 resolve 才受限流器控制（防平台限流）
+                if limiter is not None:
+                    limiter.wait()
+                try:
+                    if browser_cookies is None:
+                        if max_height is not None:
+                            source = resolver(source_url, max_height=max_height)
+                        else:
+                            source = resolver(source_url)
+                    elif max_height is not None:
+                        source = resolver(source_url, browser_cookies=browser_cookies,
+                                          max_height=max_height)
+                    else:
+                        source = resolver(source_url, browser_cookies=browser_cookies)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                raise last_exc
+        elif max_height is not None and source.max_height != max_height:
+            source = apply_video_quality_limit(source, max_height)
+        return source, was_attached
+
+    def attach(upload, source):
+        upload.set_source(source)
+        upload.set_path(source.display_name or source.source_url)
+        remote_sources.append((upload, source))
+        failures.pop(id(upload), None)
+        if limiter is not None:
+            limiter.note_success()
+
     for upload in uploaded_videos:
         if not upload.get_is_url():
             local_entries.append(upload)
             continue
         resolved_count += 1
-        source = upload.get_source()
-        was_attached = source is not None
         try:
-            if source is None:
-                source_url = upload.get_url() or upload.get_path()
-                # resolve 失败重试 2 次（网络抖动/瞬时 412），仍失败才跳过。
-                # 被限流/机器人验证时改为更长的退避（默认 2/4s 对限流毫无意义）。
-                last_exc = None
-                for attempt in range(3):
-                    if attempt > 0:
-                        wait = (throttle_step(attempt - 1)
-                                if last_exc is not None and is_throttling_error(last_exc)
-                                else 2.0 * attempt)
-                        if logger is not None:
-                            logger(f"  Retrying resolve in {wait:.0f}s "
-                                   f"({classify_resolve_failure(last_exc)[0]})")
-                        time.sleep(wait)
-                    # 真正需要 resolve 才受限流器控制（防平台限流）
-                    if limiter is not None:
-                        limiter.wait()
-                    try:
-                        if browser_cookies is None:
-                            if max_height is not None:
-                                source = resolver(source_url, max_height=max_height)
-                            else:
-                                source = resolver(source_url)
-                        elif max_height is not None:
-                            source = resolver(source_url, browser_cookies=browser_cookies,
-                                              max_height=max_height)
-                        else:
-                            source = resolver(source_url, browser_cookies=browser_cookies)
-                        last_exc = None
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                if last_exc is not None:
-                    raise last_exc
-            elif max_height is not None and source.max_height != max_height:
-                source = apply_video_quality_limit(source, max_height)
-            upload.set_source(source)
-            upload.set_path(source.display_name or source.source_url)
-            remote_sources.append((upload, source))
-            throttle_streak = 0
-            if limiter is not None:
-                limiter.note_success()
-            if logger is not None:
-                # 已 attach source（import 时 resolve 过）：标注"已解析"而非
-                # "Resolving"，避免误导用户以为每次都在重新解析全部 URL。
-                verb = "Using resolved source" if was_attached else "Resolving remote source"
-                logger(
-                    f"{verb} [{resolved_count}/{total_remote}]: "
-                    f"{source.display_name or source.source_id or source.source_url}"
-                )
+            source, was_attached = resolve_one(upload)
+        except InterruptedError:
+            # 取消不是"解析失败"：不要写进失败汇总，交给上层中断整批。
+            raise
         except Exception as exc:
             reason, hint = classify_resolve_failure(exc)
-            failed_sources.append((upload.get_url() or upload.get_path(), reason))
+            failures[id(upload)] = (upload.get_url() or upload.get_path(), reason)
             if is_throttling_error(exc):
+                pause_candidates.append(upload)
                 throttle_streak += 1
                 if limiter is not None:
                     interval = limiter.penalize()
@@ -1078,6 +1131,80 @@ def resolve_remote_uploads(
             if hint:
                 message += f" — {hint}"
             (logger or print)(message)
+            continue
+        attach(upload, source)
+        throttle_streak = 0
+        if logger is not None:
+            # 已 attach source（import 时 resolve 过）：标注"已解析"而非
+            # "Resolving"，避免误导用户以为每次都在重新解析全部 URL。
+            verb = "Using resolved source" if was_attached else "Resolving remote source"
+            logger(
+                f"{verb} [{resolved_count}/{total_remote}]: "
+                f"{source.display_name or source.source_id or source.source_url}"
+            )
+
+    # 限流是配额问题（等一会儿就恢复）：暂停后只重试失败的那几条，比对着整批
+    # 继续硬打有效，也不会把已经解析好的源再解析一遍。
+    pauses_used = 0
+    while pause_candidates and pause_ask is not None and pauses_used < max_pauses:
+        if cancel_check is not None and cancel_check():
+            if logger is not None:
+                logger("Run cancelled during resolve; skipping the throttle pause.")
+            break
+        reasons = sorted({failures[id(upload)][1] for upload in pause_candidates
+                          if id(upload) in failures})
+        try:
+            wait = pause_ask(len(pause_candidates), reasons, pauses_used + 1)
+        except Exception as exc:
+            if logger is not None:
+                logger(f"Throttle pause prompt failed ({type(exc).__name__}); "
+                       f"continuing without it.")
+            break
+        try:
+            wait = float(wait or 0)
+        except (TypeError, ValueError):
+            wait = 0.0
+        if wait <= 0:
+            break
+        pauses_used += 1
+        if logger is not None:
+            logger(f"Waiting {wait / 60:.0f} minute(s) for the platform limit to "
+                   f"clear, then retrying {len(pause_candidates)} source(s).")
+        if not _wait_for_quota(wait, logger=logger, cancel_check=cancel_check,
+                               progress_callback=pause_progress):
+            if logger is not None:
+                logger("Throttle pause cancelled; the remaining sources stay "
+                       "unresolved.")
+            break
+        still_failing = []
+        for upload in pause_candidates:
+            if cancel_check is not None and cancel_check():
+                still_failing.append(upload)
+                continue
+            try:
+                source, _was_attached = resolve_one(upload)
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                reason, _hint = classify_resolve_failure(exc)
+                failures[id(upload)] = (upload.get_url() or upload.get_path(), reason)
+                still_failing.append(upload)
+                if logger is not None:
+                    logger(f"Still failing after the wait "
+                           f"({upload.get_url() or upload.get_path()}): {reason}")
+                continue
+            attach(upload, source)
+            if logger is not None:
+                logger(f"Resolved after the wait: "
+                       f"{source.display_name or source.source_id or source.source_url}")
+        pause_candidates = still_failing
+
+    # 等待后补解析成功的源要回到列表里的原位置：否则它们会排到整批最后，
+    # 界面进度与编译顺序都会跟用户排的顺序对不上。
+    order = {id(upload): index for index, upload in enumerate(uploaded_videos)}
+    remote_sources.sort(key=lambda pair: order[id(pair[0])])
+
+    failed_sources = list(failures.values())
     if failed_sources and logger is not None:
         counts = {}
         for _url, reason in failed_sources:
@@ -1269,6 +1396,8 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     before, after = float(before), float(after)
     if before < 0 or after < 0:
         raise ValueError("Clip padding cannot be negative!")
+    # 每轮 materialize 重置"交付偏短"记录，compile 结束后统一汇报
+    reset_short_delivery_records()
     materialized: list[dict] = []
     remote_video_total = sum(
         1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
@@ -1459,6 +1588,13 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                     eff_start = start - before
                     if prev_eff_end is not None:
                         eff_start = max(eff_start, prev_eff_end)
+                    # 统计"被邻居剪短"：padding 被吃掉，或重叠的检测区间本身被裁
+                    # （after/before 为 0 时也会发生，只看 padding 会漏报）。
+                    if ((before > 0 and eff_start > start - before + 1e-6)
+                            or (after > 0 and eff_end < end + after - 1e-6)
+                            or eff_start > start + 1e-6
+                            or eff_end < end - 1e-6):
+                        state["padding_clipped"] = state.get("padding_clipped", 0) + 1
                     prev_eff_end = eff_end
                     clamped.append(dict(ts, start=eff_start, end=eff_end))
                 local_item['timestamps'] = clamped
@@ -1489,6 +1625,8 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             # 有效区间终点约束。reverify 的 original/new 跨组不桥接，
             # 若不加钳制，gap<before+after 时两段 padding 会重叠，
             # 拼接边界处开头内容会重复播放。
+            # 钳制会静默吃掉 padding（密集 clip 时 1s padding 基本失效），
+            # 用户会看到"clip 比 padding 预期早结束"，所以计数后统一告知。
             next_start = (
                 float(timestamps[interval_index + 1]['start'])
                 if interval_index + 1 < n_ts else None
@@ -1497,6 +1635,14 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             eff_start = start - before
             if prev_eff_end is not None:
                 eff_start = max(eff_start, prev_eff_end)
+            # 统计"被邻居剪短"：padding 被吃掉，或重叠的检测区间本身被裁（
+            # after/before 为 0 时也会发生）。真正丢弃 clip 的情况见下面的视频流
+            # 终点分支 —— 那种 clip 不计入，否则会报一个从未交付的片段。
+            neighbour_shortened = (
+                (before > 0 and eff_start > start - before + 1e-6)
+                or (after > 0 and eff_end < end + after - 1e-6)
+                or eff_start > start + 1e-6
+                or eff_end < end - 1e-6)
 
             # 视频编译：把区间钳到视频流可用终点内。音频轨比视频长时，
             # 尾部检测到的事件没有对应画面——完全越界的直接跳过（省掉
@@ -1537,6 +1683,8 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                     continue
 
             prev_eff_end = eff_end
+            if neighbour_shortened:
+                state["padding_clipped"] = state.get("padding_clipped", 0) + 1
             duration = eff_end - eff_start
             extension = "mp4" if is_video else "m4a"
             output = os.path.join(
@@ -1548,7 +1696,15 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                           remote_video_index, duration, ts.get('pred', 0)))
             result_plan.append(("task", (entry_index, interval_index)))
 
+    clipped = state.get("padding_clipped", 0)
+    if clipped:
+        print(f"{Fore.YELLOW}{clipped} clip(s) were shortened by a neighbouring clip "
+              f"(padding removed, or an overlapping detection trimmed), so they stop "
+              f"where the next clip starts and the configured padding no longer "
+              f"applies there.{Style.RESET_ALL}")
     if not tasks:
+        # 纯本地批次（或所有远程 clip 都被视频流终点丢弃）也会走到这里：摘要必须
+        # 在提前返回之前打印，否则这些情况永远看不到提示。
         return [item for kind, item in result_plan]
 
     # 按 source 分组，下载前对过期源统一做一次前瞻刷新（限流器控制节奏）。
@@ -1939,6 +2095,117 @@ def _txt_suffixed_path(txt_path, suffix):
     return root + suffix + ".txt"
 
 
+# 三种固定名 timestamps 文件的语义（读取侧）：base 是纯检测结果，
+# _reverified 含 reverify 追加的 [new] 片段，_selected 是上次 Review 后
+# 真正参与编译的集合。检测分支只写；load 分支以前只读 base，
+# 导致"跳过检测重跑"会丢掉 reverify 扩展（成片变短、切点生硬）。
+_TIMESTAMPS_FILE_KINDS = (
+    ("", "detection only",
+     "raw AI detection, no re-verify extras and no Review filtering"),
+    ("_reverified", "detection + re-verify",
+     "includes the extra [new] clips re-verify found (usually longer)"),
+    ("_selected", "last compiled selection",
+     "detection + re-verify after your Review selection"),
+)
+_TIMESTAMPS_PREFERENCE_VALUES = ("ask", "newest", "detection only",
+                                 "detection + re-verify", "last compiled selection")
+
+
+def timestamps_load_candidates(base_txt, configured_txt="", legacy_paths=()):
+    """Existing timestamps files for this session, as pickable dicts.
+
+    The three fixed-name files are listed (base / ``_reverified`` / ``_selected``),
+    plus any legacy ``timestamps.txt`` location for backward compatibility. With
+    an explicit "Timestamp Output File" in Settings the same three suffixes are
+    derived from *that* name instead: the configured path is written to, so its
+    derived files have to be readable too, and if the configured file itself is
+    missing the remaining candidates still keep skip-detection usable. Read-only:
+    the caller decides which one to load.
+    """
+    seen = set()
+    candidates = []
+
+    def add(path, kind, label, description):
+        if not path:
+            return
+        try:
+            key = os.path.normcase(os.path.abspath(str(path)))
+        except (OSError, ValueError):
+            return
+        if key in seen or not os.path.isfile(path):
+            return
+        seen.add(key)
+        candidates.append({"path": str(path), "kind": kind, "label": label,
+                           "description": description})
+
+    configured = (configured_txt
+                  if configured_txt and configured_txt != "No file selected!"
+                  else "")
+    root = configured or base_txt
+    for suffix, label, description in _TIMESTAMPS_FILE_KINDS:
+        path = _txt_suffixed_path(root, suffix) if suffix else root
+        if configured and not suffix:
+            add(path, "custom", "configured file", "the path set in Settings")
+            continue
+        add(path, suffix, label, description)
+    for path in legacy_paths:
+        add(path, "", "detection only",
+            "raw AI detection, no re-verify extras and no Review filtering")
+    return candidates
+
+
+def timestamps_file_summary(path):
+    """Clip counts + mtime for the chooser (best effort, never raises)."""
+    try:
+        with_videos, _without = _parse_timestamps_txt(path)
+    except Exception:
+        return None
+    clips = 0
+    new_clips = 0
+    suspect_clips = 0
+    for entry in with_videos:
+        for ts in entry.get("timestamps", []):
+            clips += 1
+            if ts.get("source") == "new":
+                new_clips += 1
+            if ts.get("suspect"):
+                suspect_clips += 1
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return {"clips": clips, "new": new_clips, "suspect": suspect_clips,
+            "mtime": mtime,
+            "mtime_text": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            if mtime else "unknown"}
+
+
+def _timestamps_kind_priority(kind):
+    """Tie-break when mtimes are equal: most-processed file first."""
+    return {"_selected": 3, "_reverified": 2, "custom": 1, "": 0}.get(kind, 0)
+
+
+def pick_timestamps_candidate(candidates, preference="ask", summaries=None):
+    """Choose which candidate to load. Returns the dict or None.
+
+    ``preference`` is either "ask"/"newest" (newest mtime wins) or a file kind
+    label from the chooser ("detection only" / "detection + re-verify" /
+    "last compiled selection").
+    """
+    if not candidates:
+        return None
+    summaries = summaries or {}
+    if preference not in (None, "", "ask", "newest"):
+        for candidate in candidates:
+            if candidate.get("label") == preference:
+                return candidate
+    def sort_key(candidate):
+        info = summaries.get(candidate["path"]) or {}
+        return (info.get("mtime") or 0.0,
+                _timestamps_kind_priority(candidate.get("kind", "")))
+    return max(candidates, key=sort_key)
+
+
 def _save_selected_txt(dict_list, txt_path):
     """保存审核后勾选的片段到固定的 timestamps_selected.txt（派生自 base 文件，
     仅含用户勾选的片段）。"""
@@ -1960,6 +2227,128 @@ def _save_selected_txt(dict_list, txt_path):
         print(f"{Fore.GREEN}Saved selected clips to {selected_path}")
     except Exception as e:
         print(f"{Fore.YELLOW}Could not save selected timestamps: {e}")
+
+
+def _read_text_lines(path):
+    """Read a timestamps txt as UTF-8 (BOM tolerant) with a legacy fallback.
+
+    ``open()`` 只创建解码器、不读数据，所以旧编码文件在旧实现里会在迭代到一半时
+    抛 UnicodeDecodeError（回退分支永远轮不到）。这里先整体读入再返回 StringIO。
+    """
+    import io
+    import locale
+    with open(path, 'rb') as handle:
+        raw = handle.read()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        fallback = locale.getpreferredencoding(False) or 'utf-8'
+        print(f"WARNING: {path} is not UTF-8; retrying as {fallback}. "
+              f"Please re-save it as UTF-8.")
+        text = raw.decode(fallback, errors='replace')
+    return io.StringIO(text)
+
+
+# timestamps txt 的 clip 行；section 头是"任何不是 clip 行的非空行"。
+_TIMESTAMPS_CLIP_LINE_RE = re.compile(
+    r'(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\s*-'
+    r'\s*(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?,'
+    r'\s*confidence:\s*([\d.]+)(?:\s*\[new\])?')
+
+
+def media_identity_key(value, base_dir=None):
+    """Stable comparison key for a media identity (URL or path).
+
+    URLs compare case-insensitively; paths compare Windows-style (case + slash
+    direction) after resolving relative names against ``base_dir``, so
+    ``movie.mp4`` next to the timestamps file and the absolute path of the same
+    file are recognised as one entry.
+    """
+    text = str(value).strip()
+    if text.lower().startswith(("http://", "https://")):
+        return text.casefold()
+    if base_dir and not os.path.isabs(text):
+        text = os.path.join(str(base_dir), text)
+    return os.path.normcase(os.path.normpath(text))
+
+
+def timestamps_txt_headers(txt_path):
+    """Section headers of a timestamps txt: the media identity of each block.
+
+    Remote sections are written as their source URL and local ones as a file
+    path (``get_source_persistence_name``), so this is what makes "queue every
+    URL from an old timestamps file" possible without re-adding them by hand.
+    Returns [{"kind": "url"|"local"|"other", "value": str}], deduplicated in
+    file order.
+    """
+    headers = []
+    seen = set()
+    with _read_text_lines(txt_path) as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or _TIMESTAMPS_CLIP_LINE_RE.match(line):
+                continue
+            if line.lower().startswith(("http://", "https://")):
+                kind = "url"
+            elif _looks_like_media_path(line):
+                kind = "local"
+            else:
+                kind = "other"
+            key = (kind, media_identity_key(line))
+            if key in seen:
+                continue
+            seen.add(key)
+            headers.append({"kind": kind, "value": line})
+    return headers
+
+
+def _looks_like_media_path(value):
+    """True for absolute/relative paths and bare media file names.
+
+    手编或早期版本写出的本地条目可能只有文件名（没有目录），不能因为"没有路径
+    分隔符"就当成无法识别的标题丢掉。
+    """
+    if os.path.isabs(value) or os.path.sep in value or "/" in value:
+        return True
+    return os.path.splitext(value)[1].lower() in _TIMESTAMPS_MEDIA_SUFFIXES
+
+
+def uploads_from_timestamps_headers(headers, media_type="video", exists=os.path.isfile,
+                                    base_dir=None):
+    """Turn parsed headers into MediaUpload entries, keeping the file order.
+
+    Returns ``(uploads, stats)``. Local headers are only added when the file
+    still exists (relative names resolve against ``base_dir``, normally the
+    folder of the timestamps file); anything else is counted as skipped so the
+    caller can say so instead of silently dropping entries.
+    """
+    uploads = []
+    stats = {"url": 0, "local": 0, "skipped": 0}
+    seen = set()
+    for header in headers:
+        kind = header.get("kind")
+        value = str(header.get("value") or "").strip()
+        if not value:
+            continue
+        key = (kind, media_identity_key(value, base_dir))
+        if key in seen:
+            continue
+        seen.add(key)
+        if kind == "url":
+            uploads.append(MediaUpload(value, media_type, True, value))
+            stats["url"] += 1
+        elif kind == "local":
+            candidate = value
+            if base_dir and not os.path.isabs(candidate):
+                candidate = os.path.join(base_dir, candidate)
+            if exists(candidate):
+                uploads.append(MediaUpload(candidate, media_type))
+                stats["local"] += 1
+            else:
+                stats["skipped"] += 1
+        else:
+            stats["skipped"] += 1
+    return uploads, stats
 
 
 def _write_timestamps_txt(dict_list, txt_path):
@@ -1992,26 +2381,22 @@ def _write_timestamps_txt(dict_list, txt_path):
         with open(txt_path, 'w', encoding="utf-8") as file:
             file.write(timestamps_text)
         return True
-    except OSError:
+    except OSError as exc:
+        # 以前静默返回 False：目录不存在（换机/删目录的配置）时用户完全看不出
+        # 时间戳没保存，下一轮还会奇怪"为什么成片变短了"。
+        print(f"{Fore.YELLOW}Could not save timestamps to {txt_path}: "
+              f"{exc}{Style.RESET_ALL}")
         return False
 
 
 def _parse_timestamps_txt(txt_path):
     """Parse timestamps.txt -> (with videos, without videos)"""
-    import locale
     with_videos = []
     without_videos = []
     current_file = None
     current_ts = []
-    try:
-        # utf-8-sig 兼容记事本保存出的 BOM；GBK 等旧编码回退本地编码并提示。
-        f = open(txt_path, 'r', encoding='utf-8-sig')
-    except UnicodeDecodeError:
-        fallback = locale.getpreferredencoding(False) or 'utf-8'
-        print(f"WARNING: {txt_path} is not UTF-8; retrying as {fallback}. "
-              f"Please re-save it as UTF-8.")
-        f = open(txt_path, 'r', encoding=fallback, errors='replace')
-    with f:
+    # utf-8-sig 兼容记事本保存出的 BOM；GBK 等旧编码回退本地编码并提示。
+    with _read_text_lines(txt_path) as f:
         for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -2021,11 +2406,7 @@ def _parse_timestamps_txt(txt_path):
                 current_file = None
                 current_ts = []
                 continue
-            m = re.match(
-                r'(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\s*-'
-                r'\s*(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?,'
-                r'\s*confidence:\s*([\d.]+)(?:\s*\[new\])?',
-                line)
+            m = _TIMESTAMPS_CLIP_LINE_RE.match(line)
             if m:
                 h1, m1, s1, frac1, h2, m2, s2, frac2, conf = m.groups()
 
@@ -3266,6 +3647,9 @@ class VideoProcessorApp:
 
         self.keep_downloaded_vids = tk.BooleanVar(value=False)
         self.download_video_path = tk.StringVar()
+        # 跳过检测时优先读哪个 timestamps 文件（ask = 每次让用户选）。
+        # 存在多个（base / _reverified / _selected）时才用得上。
+        self.timestamps_load_preference = tk.StringVar(value="ask")
         self.max_quality = tk.StringVar()
         self.max_download_speed = tk.IntVar()
         
@@ -3276,6 +3660,12 @@ class VideoProcessorApp:
         except (configparser.Error, ValueError):
             _kdv = False
         self.keep_downloaded_vids.set(_kdv)
+
+        try:
+            _tlp = self.preferences.get("Settings", "timestamps_load_preference")
+        except (configparser.Error, ValueError):
+            _tlp = "ask"
+        self.timestamps_load_preference.set(_tlp or "ask")
 
         self.download_video_path.set(
             self.preferences.get("Settings", "download_path"))
@@ -3374,13 +3764,15 @@ class VideoProcessorApp:
             root, tearoff=0, font=(None, 11, "bold"),
             bg="#333333", fg="#ffffff", activebackground="#555555", activeforeground="#ffffff"
         )
-
-        self.media_menu.add_command(
-            label=" Add Video Files ", command=self.add_video)
-        self.media_menu.add_command(
-            label=" Add URL ", command=self.add_video_url)
-        self.media_menu.add_command(
-            label=" Add Folder ", command=self.add_video_folder)
+        self.populate_add_button()
+        # 提示只挂一次：populate_add_button 在 Video/Audio 切换时会重跑，
+        # 每次新建 CustomHovertip 会在同一控件上叠加多份 <Enter> 绑定。
+        self.import_urls_tooltip = CustomHovertip(
+            self.add_button,
+            "Import URLs from Timestamps .txt queues every URL listed in an\n"
+            "existing timestamps file: each section title in that file is the\n"
+            "source of one video, so a batch can be rebuilt without pasting\n"
+            "URLs again. Files that no longer exist are skipped.")
 
         def show_menu(event):
             x = self.add_button.winfo_rootx()
@@ -3903,7 +4295,7 @@ class VideoProcessorApp:
         strict_fp_tooltip = CustomHovertip(
             self.strict_fp_checkbox, 'Drop clips where another sound class (speech/scream/etc.) scores higher than burp.\nReduces false positives for noisy streamers, but may rarely miss real burps mixed with loud talking.\nSuspect clips are also shown pre-deselected in Review regardless of this option.')
         skip_auto_tooltip = CustomHovertip(
-            self.skip_auto_checkbox, 'When a timestamps.txt file already exists, automatically use it without showing the confirmation dialog.')
+            self.skip_auto_checkbox, 'When a timestamps.txt file already exists, automatically use it without showing the confirmation dialog. If more than one timestamps file exists for the output, you are still asked which one to load (remember that choice once, or set it under Add Media > Timestamps File Preference).')
         settings_tooltip = CustomHovertip(self.settings_button, "Settings")
 
         self.disable_while_processing = [
@@ -3972,6 +4364,10 @@ class VideoProcessorApp:
         )
 
     def _poll_ui(self):
+        # 先重新排队再排空：排空过程中如果有回调阻塞（例如限流暂停/时间戳选择的
+        # 模态框会 wait_window），排在后面的 UI 更新（比如 Stop 后的
+        # "Cancelling..."）就永远轮不到，界面看起来像卡死。
+        self.root.after(50, self._poll_ui)
         # 单轮最多处理有限条 UI 更新，避免一次性排空大量积压事件
         # 阻塞主线程事件循环导致窗口假死（与 StdoutRedirector 的渲染上限对齐）。
         processed = 0
@@ -3985,7 +4381,6 @@ class VideoProcessorApp:
                 processed += 1
         except queue.Empty:
             pass
-        self.root.after(50, self._poll_ui)
 
     def _schedule_ui(self, func, *args):
         """Run func(*args) on the main thread via the thread-safe UI queue."""
@@ -4080,6 +4475,13 @@ class VideoProcessorApp:
                 label=" Add URL ", command=self.add_video_url)
             self.media_menu.add_command(
                 label=" Add Folder ", command=self.add_video_folder)
+        self.media_menu.add_separator()
+        self.media_menu.add_command(
+            label=" Import URLs from Timestamps .txt ",
+            command=self.import_urls_from_timestamps)
+        self.media_menu.add_command(
+            label=" Timestamps File Preference… ",
+            command=self.choose_timestamps_preference)
 
     def clear_output(self):
         self.output_video_path.set("No location selected!")
@@ -4500,6 +4902,100 @@ class VideoProcessorApp:
         dialog.grab_set()
         self.root.wait_window(dialog)
         return result["sources"]
+
+    def choose_timestamps_preference(self):
+        """Change or clear the remembered timestamps-file choice.
+
+        记忆值一旦写进 ini，就必须有地方改回来（否则用户只能手编配置文件）。
+        菜单回调本身就在主线程，所以这里直接建对话框，不走 _run_on_main_thread
+        （主线程等 _run_on_main_thread 会死锁：排空队列的 _poll_ui 也在主线程）。
+        """
+        current = self.timestamps_load_preference.get() or "ask"
+        radios = {
+            "ask": "Ask every time (recommended)",
+            "newest": "Use the newest timestamp file automatically",
+            "detection only": "Always use timestamps.txt (raw detection)",
+            "detection + re-verify": "Always use timestamps_reverified.txt",
+            "last compiled selection": "Always use timestamps_selected.txt",
+        }
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Timestamps File Preference")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        choice = tk.StringVar(value=current if current in radios else "ask")
+        result = {"value": None}
+
+        ttk.Label(dialog, justify="left",
+                  text=("Which timestamps file should be loaded when skip-detection\n"
+                        "finds more than one for this output?")
+                  ).pack(anchor="w", padx=14, pady=(12, 6))
+        for value in _TIMESTAMPS_PREFERENCE_VALUES:
+            ttk.Radiobutton(dialog, value=value, variable=choice,
+                            text=radios.get(value, value)).pack(anchor="w", padx=14)
+
+        def confirm():
+            result["value"] = choice.get() or "ask"
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(8, 12))
+        ttk.Button(buttons, text="Save", command=confirm).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        dialog.focus_force()
+        self.root.wait_window(dialog)
+        if result["value"]:
+            self._persist_timestamps_preference(result["value"])
+
+    def import_urls_from_timestamps(self):
+        """Queue every URL listed in a timestamps .txt (one per section header).
+
+        一个频道的 timestamps.txt 里每个 section 头就是那期视频的 URL，所以重编
+        一批老素材时不用再一条条手动粘贴 URL。
+        """
+        path = filedialog.askopenfilename(
+            title="Select a timestamps .txt",
+            filetypes=[("Timestamps", "*.txt"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            headers = timestamps_txt_headers(path)
+        except OSError as exc:
+            messagebox.showerror("Import URLs", f"Could not read that file:\n{exc}")
+            return
+
+        media_type = "video" if self.is_video else "audio"
+        base_dir = os.path.dirname(os.path.abspath(path))
+        # 已经在列表里的 URL/路径不再重复加入（重编时通常会先加一部分）。用同一个
+        # 归一化规则、并且 url 和 path 都要比对：Full Download 之后 url 仍在、path
+        # 已经变成下载好的本地文件，只比 url 会把同一个源再加一遍。
+        queued = set()
+        for upload in self.uploaded_videos:
+            for value in (upload.get_url(), upload.get_path()):
+                if value:
+                    queued.add(media_identity_key(value, base_dir))
+        headers = [
+            header for header in headers
+            if media_identity_key(header["value"], base_dir) not in queued
+        ]
+
+        uploads, stats = uploads_from_timestamps_headers(
+            headers, media_type, base_dir=base_dir)
+        if not uploads:
+            messagebox.showinfo(
+                "Import URLs",
+                f"No new usable entries were found in {os.path.basename(path)}."
+                + (f"\nSkipped {stats['skipped']} entry(ies)." if stats["skipped"] else ""),
+            )
+            return
+        self.uploaded_videos.extend(uploads)
+        self.update_listbox_add_video(scroll_to_bottom=True)
+        summary = (f"Imported {stats['url']} URL(s) and {stats['local']} local file(s) "
+                   f"from {os.path.basename(path)}")
+        if stats["skipped"]:
+            summary += f" (skipped {stats['skipped']} unusable entry(ies))"
+        print(f"{Fore.GREEN}{summary}.{Style.RESET_ALL}")
 
     def add_video_url(self):
         self.entry_window = tk.Toplevel(self.root)
@@ -5277,24 +5773,207 @@ class VideoProcessorApp:
 
         self.root.after(poll_ms, poll)
 
+    def _run_on_main_thread(self, func, timeout=600.0):
+        """Run ``func`` on the Tk main thread and return its value.
+
+        worker 线程不能直接建/操作 Tk 控件（会和主线程轮询抢 Tcl 锁）。
+        窗口已销毁或超时返回 None。
+        """
+        box = {"done": threading.Event(), "value": None}
+
+        def wrapper():
+            try:
+                box["value"] = func()
+            except tk.TclError:
+                box["value"] = None
+            except Exception as exc:
+                # 静默降级会让"选择文件/等待限流"这类交互悄悄退回默认行为，
+                # 正好是这轮要消灭的"什么都没发生"。至少把原因打到日志里。
+                box["value"] = None
+                print(f"{Fore.YELLOW}UI action failed "
+                      f"({type(exc).__name__}): {exc}{Style.RESET_ALL}")
+            finally:
+                box["done"].set()
+
+        self._schedule_ui(wrapper)
+        if not box["done"].wait(timeout):
+            print(f"{Fore.YELLOW}UI action timed out after {timeout:.0f}s; "
+                  f"continuing without it.{Style.RESET_ALL}")
+        return box["value"]
+
     def _ask_choice_blocking(self, title, message, timeout=600.0):
         """在主线程弹 askyesnocancel 并等结果（worker 线程不能直接碰 Tk）。
 
         返回 True/False/None；窗口已销毁或超时按 None（跳过）处理。
         """
-        box = {"done": threading.Event(), "answer": None}
+        return self._run_on_main_thread(
+            lambda: messagebox.askyesnocancel(title, message), timeout=timeout)
 
-        def show():
-            try:
-                box["answer"] = messagebox.askyesnocancel(title, message)
-            except tk.TclError:
-                box["answer"] = None
-            finally:
-                box["done"].set()
+    _THROTTLE_PAUSE_OPTIONS = (("Wait 5 minutes", 300),
+                               ("Wait 15 minutes", 900),
+                               ("Wait 30 minutes", 1800))
+    _THROTTLE_PAUSE_MAX = 2
 
-        self._schedule_ui(show)
-        box["done"].wait(timeout)
-        return box["answer"]
+    def _ask_throttle_pause(self, failed_count, reasons, attempt):
+        """限流导致的 resolve 失败：问用户要不要等配额窗口恢复后重试。
+
+        只影响失败的那几条源；返回要等待的秒数，用户选择跳过（或按了 Stop）时返回
+        None。对话框是模态的（主窗口的 Stop 点不到），所以文案不能让人以为等待期间
+        还能按 Stop：真正的取消发生在倒计时阶段，那时这个框已经关了。
+        """
+        if cancel_pending():
+            return None
+        reason_text = ", ".join(reasons) if reasons else "rate limited"
+        detail = (f"{failed_count} source(s) failed to resolve because the platform "
+                  f"is rate limiting us ({reason_text}).\n\n"
+                  f"This is a quota, not a broken link: it usually clears by itself "
+                  f"after a few minutes. Only the failed source(s) will be retried "
+                  f"after the wait.\n\n"
+                  f"Pick a wait to start the countdown (Stop cancels it), or Skip to "
+                  f"continue with the sources that did resolve.\n\n"
+                  f"Tip: browser cookies / a cookies.txt (signed-in requests) get a "
+                  f"much higher quota.\n\n"
+                  f"Attempt {attempt} of {self._THROTTLE_PAUSE_MAX}.")
+
+        def build():
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Rate limited")
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            result = {"wait": None}
+
+            ttk.Label(dialog, text=detail, justify="left",
+                      wraplength=520).pack(anchor="w", padx=16, pady=(14, 8))
+
+            buttons = ttk.Frame(dialog)
+            buttons.pack(fill="x", padx=16, pady=(6, 14))
+
+            def choose(seconds):
+                result["wait"] = seconds
+                dialog.destroy()
+
+            ttk.Button(buttons, text="Skip",
+                       command=lambda: choose(None)).pack(side="right", padx=(6, 0))
+            for label, seconds in reversed(self._THROTTLE_PAUSE_OPTIONS):
+                ttk.Button(buttons, text=label,
+                           command=lambda s=seconds: choose(s)).pack(side="right",
+                                                                    padx=(6, 0))
+
+            def watch_cancel():
+                # 用户按 Stop 时不要把一个没人回答的模态框留在屏幕上。
+                if cancel_pending():
+                    choose(None)
+                    return
+                dialog.after(500, watch_cancel)
+
+            dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+            dialog.grab_set()
+            dialog.focus_force()
+            dialog.after(500, watch_cancel)
+            self.root.wait_window(dialog)
+            return result["wait"]
+
+        return self._run_on_main_thread(build, timeout=1800.0)
+
+    def _throttle_pause_progress(self, waited, total):
+        """等待限流恢复期间的状态栏倒计时（worker 线程调用）。"""
+        remaining = max(0, int(round(total - waited)))
+        if remaining <= 0:
+            # 不清掉的话这句会一直挂着，直到下一次传输进度事件才被覆盖。
+            self.clear_transfer_progress("Rate limit wait finished; retrying the "
+                                         "failed sources...")
+            return
+        self.clear_transfer_progress(
+            f"Rate limited: waiting {remaining // 60:02d}:{remaining % 60:02d} "
+            f"before retrying the failed sources (Stop to cancel)")
+
+    def _choose_timestamps_source(self, candidates, summaries):
+        """Modal chooser for which timestamps file to load.
+
+        Returns the chosen path (or the default when the user cancels), and
+        stores the label in ``timestamps_load_preference`` when "Remember" is
+        ticked. Runs on the main thread; the caller waits for the answer.
+        """
+        default = pick_timestamps_candidate(candidates, "newest", summaries)
+
+        def build():
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Select Timestamps File")
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            choice = tk.StringVar(value=default["path"] if default else "")
+            remember = tk.BooleanVar(value=False)
+            result = {"path": default["path"] if default else None,
+                      "remember": False}
+
+            ttk.Label(
+                dialog,
+                text=("More than one timestamps file exists for this output.\n"
+                      "Pick the one to load (details below each name):"),
+                justify="left").pack(anchor="w", padx=14, pady=(12, 6))
+            for candidate in candidates:
+                info = summaries.get(candidate["path"]) or {}
+                row = ttk.Frame(dialog)
+                row.pack(fill="x", padx=14, pady=3)
+                ttk.Radiobutton(row, value=candidate["path"], variable=choice,
+                                text=os.path.basename(candidate["path"])).pack(anchor="w")
+                detail = (f"      {candidate['label']} · {info.get('clips', '?')} clips"
+                          + (f" ({info.get('new')} [new])" if info.get("new") else "")
+                          + f" · {info.get('mtime_text', '?')}")
+                ttk.Label(row, text=detail, font=(None, 9)).pack(anchor="w")
+                ttk.Label(row, text=f"      {candidate['description']}",
+                          font=(None, 9)).pack(anchor="w")
+
+            ttk.Checkbutton(dialog, text="Remember this choice (change it later under "
+                                         "Add Media > Timestamps File Preference)",
+                            variable=remember).pack(anchor="w", padx=14, pady=(10, 4))
+
+            def confirm():
+                result["path"] = choice.get() or result["path"]
+                result["remember"] = bool(remember.get())
+                dialog.destroy()
+                # 主线程里落盘：worker 线程直接 set tk 变量会跟主线程抢 Tcl 锁。
+                if result["remember"] and result["path"]:
+                    label = next((c["label"] for c in candidates
+                                  if c["path"] == result["path"]), None)
+                    if label:
+                        self._persist_timestamps_preference(label)
+
+            buttons = ttk.Frame(dialog)
+            buttons.pack(fill="x", padx=14, pady=(4, 12))
+            ttk.Button(buttons, text="Load", command=confirm).pack(side="right")
+            dialog.protocol("WM_DELETE_WINDOW", confirm)
+
+            def watch_cancel():
+                # 跑批被取消时不要留一个没人回答的模态框。
+                if cancel_pending():
+                    confirm()
+                    return
+                dialog.after(500, watch_cancel)
+
+            dialog.grab_set()
+            dialog.focus_force()
+            dialog.after(500, watch_cancel)
+            self.root.wait_window(dialog)
+            return result
+
+        result = self._run_on_main_thread(build) or {}
+        return result.get("path")
+
+    def _persist_timestamps_preference(self, label):
+        """Remember the chooser's answer in preferences.ini (main thread only).
+
+        以前只写 tk 变量：process_videos 每轮开头都会用 ini 里的旧值把它覆盖回去，
+        所以"记住这个选择"从来没生效，用户还得每轮点一次。
+        """
+        try:
+            self.timestamps_load_preference.set(label)
+            self.preferences.set("Settings", "timestamps_load_preference", label)
+            with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
+                self.preferences.write(configfile)
+            print(f"Remembered timestamps choice: {label}")
+        except Exception as exc:
+            print(f"Could not save the timestamps choice ({type(exc).__name__}): {exc}")
 
     def on_closing(self):
         if self.is_thread_active():
@@ -5316,6 +5995,9 @@ class VideoProcessorApp:
             "Settings", "output_text_path", self.output_text_path.get())
         self.preferences.set(
             "Settings", "remote_cache_path", str(self.remote_cache_store.root))
+        self.preferences.set(
+            "Settings", "timestamps_load_preference",
+            self.timestamps_load_preference.get() or "ask")
 
         with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
             self.preferences.write(configfile)
@@ -5339,6 +6021,11 @@ class VideoProcessorApp:
         self.output_text_path.set(self.preferences.get(
             "Settings", "output_text_path"
         ))
+        try:
+            _tlp = self.preferences.get("Settings", "timestamps_load_preference")
+        except (configparser.Error, ValueError):
+            _tlp = "ask"
+        self.timestamps_load_preference.set(_tlp or "ask")
 
     def open_settings_modal(self):
         modal = tk.Toplevel(self.root)
@@ -5826,11 +6513,17 @@ class VideoProcessorApp:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
+                    pause_ask=self._ask_throttle_pause,
+                    pause_progress=self._throttle_pause_progress,
+                    cancel_check=cancel_pending,
                 )
             elif audio_cache:
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
+                    pause_ask=self._ask_throttle_pause,
+                    pause_progress=self._throttle_pause_progress,
+                    cancel_check=cancel_pending,
                 )
                 failed_remote_ids = set()
                 _audio_probe_cooldown = ProbeCooldown()
@@ -6001,27 +6694,59 @@ class VideoProcessorApp:
             self.clear_transfer_progress("Transfers complete; getting timestamps...")
 
             # --- Check for existing timestamps.txt ---
-            # 候选路径与保存逻辑一致：设置里的路径优先，其次是影片名基准或
-            # 默认位置（<输出目录>/timestamps.txt）——否则未设置 txt 路径时
-            # 上次保存的 timestamps.txt 永远找不到，用户会被迫重跑检测
-            txt_candidates = []
+            # 候选与保存逻辑一致：设置里的路径最高优先，其次是 base 固定名；
+            # 另外把 _reverified / _selected 两个派生文件也纳入候选——它们以前
+            # 只写不读，导致"跳过检测重跑"静默丢掉 reverify 扩展与 Review 勾选，
+            # 成片变短、切点生硬（测试者反馈）。多个候选时让用户选，不再需要
+            # 手动重命名文件。
             _cfg_txt = self.output_text_path.get()
-            if _cfg_txt and _cfg_txt != "No file selected!":
-                txt_candidates.append(_cfg_txt)
             base_txt = _resolve_txt_paths(output_video_path, _cfg_txt)
-            if base_txt not in txt_candidates:
-                txt_candidates.append(base_txt)
+            # 派生文件名一律从 base 推导，所以 base 所在目录必须真实存在：配置里
+            # 指向一个已被删除/换机的目录时，写入会静默失败（_write_timestamps_txt
+            # 吞 OSError），ReviewDialog 的 open() 还会在 Tk 回调里抛异常 → 窗口
+            # 永不关闭、worker 卡在 wait_window（回退到输出目录的旧行为）。
+            _base_dir = os.path.dirname(base_txt) or "."
+            if not os.path.isdir(_base_dir):
+                _fallback_txt = os.path.join(
+                    os.path.dirname(output_video_path), "timestamps.txt")
+                print(f"{Fore.YELLOW}Timestamps folder does not exist "
+                      f"({_base_dir}); falling back to {_fallback_txt}"
+                      f"{Style.RESET_ALL}")
+                base_txt = _fallback_txt
+            _legacy_txt = []
             if os.path.isdir(output_video_path):
-                txt_candidates.append(os.path.join(output_video_path, "timestamps.txt"))
+                _legacy_txt.append(os.path.join(output_video_path, "timestamps.txt"))
             else:
-                txt_candidates.append(os.path.join(os.path.dirname(output_video_path), "timestamps.txt"))
-            txt_path = next((p for p in txt_candidates if os.path.exists(p)), None)
+                _legacy_txt.append(os.path.join(os.path.dirname(output_video_path),
+                                                "timestamps.txt"))
+            candidates = timestamps_load_candidates(base_txt, _cfg_txt, _legacy_txt)
+            summaries = {c["path"]: timestamps_file_summary(c["path"])
+                         for c in candidates}
+            preference = self.timestamps_load_preference.get() or "ask"
+            default_choice = pick_timestamps_candidate(candidates, preference,
+                                                       summaries)
+            txt_path = default_choice["path"] if default_choice else None
             if txt_path:
                 auto_use = self.skip_detection_auto.get()
+                extra = ""
+                if len(candidates) > 1:
+                    extra = (f"\n\n{len(candidates)} timestamp files were found "
+                             f"in that folder; you can pick which one to load.")
                 if auto_use or messagebox.askyesno(
                     "Skip Detection",
-                    f"Found existing timestamps file:\n{txt_path}\n\nSkip AI detection and use saved timestamps directly?"
+                    f"Found existing timestamps file:\n{txt_path}\n\nSkip AI detection and use saved timestamps directly?{extra}"
                 ):
+                    if len(candidates) > 1 and preference in ("ask", "newest"):
+                        chosen = self._choose_timestamps_source(candidates, summaries)
+                        if chosen:
+                            txt_path = chosen
+                    if len(candidates) > 1:
+                        _others = ", ".join(
+                            os.path.basename(c["path"])
+                            for c in candidates if c["path"] != txt_path)
+                        if _others:
+                            print(f"{Fore.CYAN}Other timestamp files present but not "
+                                  f"loaded: {_others}{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}Loading timestamps from {txt_path}...")
                     with_videos, _ = _parse_timestamps_txt(txt_path)
 
@@ -6042,6 +6767,14 @@ class VideoProcessorApp:
                             entry['filename'] = remote_name_map[entry['filename']]
                             dict_list.append(entry)
                             loaded += 1
+                            continue
+                        if not entry.get('filename'):
+                            # 手编文件里"片段出现在任何标题之前"是允许的（parser 会
+                            # 保留但 filename=None）：以前这里 basename(None) 抛
+                            # TypeError，把整批加载打断，报错还看不出原因。
+                            print(f"{Fore.YELLOW}  Skipping {len(entry.get('timestamps', []))} "
+                                  f"clip(s) that appear before any media title in "
+                                  f"{os.path.basename(txt_path)}.{Style.RESET_ALL}")
                             continue
                         base = os.path.basename(entry['filename'])
                         candidates = basename_map.get(base, [])
@@ -6177,6 +6910,12 @@ class VideoProcessorApp:
                             failure_records=remote_failure_records)
                         for line in _summarize_remote_failures(remote_failures):
                             print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
+                        _short = short_delivery_records()
+                        if _short:
+                            print(f"{Fore.YELLOW}{len(_short)} clip(s) were delivered "
+                                  f"shorter than requested and end early (the CDN sent "
+                                  f"less than the requested window)."
+                                  f"{Style.RESET_ALL}")
                         skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
                         if skipped_report:
                             print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
@@ -6504,7 +7243,9 @@ class VideoProcessorApp:
                 # Review"时写：勾了 Review 时由 ReviewDialog 写入
                 # timestamps_selected.txt（仅勾选片段）。
                 if self.use_verify.get() and save_timestamps and not self.use_review.get():
-                    reverified_path = _txt_suffixed_path(txt_path, "_reverified")
+                    # 派生文件名一律从 base 推导（不是从"这次读了哪个文件"），
+                    # 否则读了 _reverified 会写出 _reverified_reverified.txt。
+                    reverified_path = _txt_suffixed_path(base_txt, "_reverified")
                     if _write_timestamps_txt(dict_list, reverified_path):
                         print(
                             f"{Fore.GREEN}Saved re-verified timestamps to {reverified_path}!")
@@ -6514,7 +7255,7 @@ class VideoProcessorApp:
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
                                       use_verify=self.use_verify.get(),
-                                      txt_path=txt_path,
+                                      txt_path=base_txt,
                                       cache_store=cache_store)
                     if dlg.result is None:
                         print(f"{Fore.YELLOW}Review cancelled.")
@@ -6531,7 +7272,7 @@ class VideoProcessorApp:
                         if removed:
                             excluded.setdefault(source_key(fn), []).extend(removed)
                     # 保存固定名 timestamps_selected.txt（仅勾选的片段）
-                    _save_selected_txt(dict_list, txt_path)
+                    _save_selected_txt(dict_list, base_txt)
 
                 print(
                     f"Compiling and writing to {output_video_path.split('/')[-1]}...")
@@ -6565,6 +7306,11 @@ class VideoProcessorApp:
                             failure_records=remote_failure_records)
                     for line in _summarize_remote_failures(remote_failures):
                         print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
+                    _short = short_delivery_records()
+                    if _short:
+                        print(f"{Fore.YELLOW}{len(_short)} clip(s) were delivered "
+                              f"shorter than requested and end early (the CDN sent "
+                              f"less than the requested window).{Style.RESET_ALL}")
                     skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
                     if skipped_report:
                         print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
