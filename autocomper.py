@@ -12,6 +12,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 
 _DLL_DIRECTORY_HANDLES = []
@@ -75,14 +76,19 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            preflight_cookie_source,
                            ProbeCooldown,
                            MAX_PLAYLIST_ENTRIES,
+                           classify_resolve_failure,
                            _audio_cache_format_identity)
 from remote_cache import CacheStore
-from remote_rate import LimitedRefresher, ResolveLimiter
+from remote_rate import (LimitedRefresher, ResolveLimiter, is_throttling_error,
+                         throttle_step)
 from utils import (DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH, MediaUpload,
                      cancel_clear, cancel_pending, convert_quality_str_to_int,
                      download_audio, download_video, get_bundle_filepath,
                      kill_tracked_procs, request_cancel, run_tracked,
-                     run_tracked_progress, check_compile_disk_space)
+                     run_tracked_progress, check_compile_disk_space,
+                     lookup_downloaded_file, media_file_for_stem,
+                     register_download, sanitize_download_name,
+                     unique_download_stem, yt_dlp_version)
 
 VIDEO_INPUT = [("Video Files",  "*.mp4 *.avi *.mkv *.m4v *.mov")]
 VIDEO_OUTPUT = [("Video Files", "*.mp4"), ("All Files", "*.*")]
@@ -878,6 +884,50 @@ def remote_mode_actions(mode):
     return mode != "Full Download", mode == "Audio Cache", mode == "Full Download"
 
 
+def download_identity(source) -> str:
+    """Full Download 的去重身份：platform:source_id + 分 P 参数。
+
+    多 P 视频的各分 P 共用同一个 BV id，只按 `stable_source_id` 去重会把 P2 当成
+    P1 已下载过。这里把 URL 上的 `p=`/`index=` 一并纳入身份。
+    """
+    base = stable_source_id(source)
+    url = str(getattr(source, "source_url", "") or "")
+    try:
+        query = urlsplit(url).query
+        pairs = parse_qsl(query, keep_blank_values=False)
+    except ValueError:
+        pairs = []
+    for key, value in pairs:
+        if key.casefold() in {"p", "index", "part"}:
+            return f"{base}|{key.casefold()}={value}"
+    return base
+
+
+def download_matches_source(existing_path, source,
+                            tolerance_floor=5.0, tolerance_ratio=0.01):
+    """已存在的同名文件与当前 source 是否是同一部影片（True/False/None）。
+
+    标题相同的不同影片在 B 站/YouTube 上很常见，所以"文件名相同"绝不能直接
+    当重复。第一判据是下载索引里的 source identity；这个函数是兜底判据（用于
+    索引出现之前的旧文件）：比较本地文件时长与远端解析出的时长。
+
+    返回 None = 无法判断（本地探测失败或远端没有 duration）→ 调用方询问用户，
+    绝不静默复用/覆盖。
+    """
+    try:
+        local_duration = _get_video_duration(existing_path)
+    except Exception:
+        local_duration = None
+    try:
+        remote_duration = float(getattr(source, "duration", None))
+    except (TypeError, ValueError):
+        remote_duration = None
+    if not local_duration or not remote_duration or remote_duration <= 0:
+        return None
+    tolerance = max(float(tolerance_floor), remote_duration * float(tolerance_ratio))
+    return abs(float(local_duration) - remote_duration) <= tolerance
+
+
 def browser_cookie_setting_value(label, cookies_file=""):
     """Convert the GUI browser-cookie label to the resolver setting."""
     value = str(label or "Auto").strip()
@@ -929,12 +979,26 @@ def resolve_remote_uploads(
 
     Returns local uploads and ``(upload, source)`` pairs. A bad URL is isolated
     so the remaining batch can continue.
+
+    Failure handling: throttling failures (YouTube bot-check / HTTP 429 /
+    Bilibili 412) are classified, retried with a longer backoff and make the
+    shared limiter slow down for the rest of the batch — otherwise a big batch
+    keeps hammering the platform and every later resolve fails ("YouTube sources
+    failing to resolve constantly").
     """
     resolver = resolver or resolve_source
     local_entries = []
     remote_sources = []
     total_remote = sum(1 for upload in uploaded_videos if upload.get_is_url())
+    if total_remote and logger is not None:
+        # YouTube "解析一直失败"多数是提取器侧（客户端）问题，日志里先留版本号，
+        # 一眼能看出测试者用的是不是最新包（2026 年已因此出过两次事故）。
+        logger(f"Remote resolver: yt-dlp {yt_dlp_version()} | "
+               f"cookies={browser_cookies or 'none'} | "
+               f"max quality={'no limit' if max_height is None else f'{max_height}p'}")
     resolved_count = 0
+    failed_sources = []
+    throttle_streak = 0
     for upload in uploaded_videos:
         if not upload.get_is_url():
             local_entries.append(upload)
@@ -944,15 +1008,22 @@ def resolve_remote_uploads(
         was_attached = source is not None
         try:
             if source is None:
-                # 真正需要 resolve 才受限流器控制（防 yt-dlp 412 限流）
-                if limiter is not None:
-                    limiter.wait()
                 source_url = upload.get_url() or upload.get_path()
-                # resolve 失败重试 2 次（网络抖动/瞬时 412），仍失败才跳过
+                # resolve 失败重试 2 次（网络抖动/瞬时 412），仍失败才跳过。
+                # 被限流/机器人验证时改为更长的退避（默认 2/4s 对限流毫无意义）。
                 last_exc = None
                 for attempt in range(3):
                     if attempt > 0:
-                        time.sleep(2.0 * attempt)
+                        wait = (throttle_step(attempt - 1)
+                                if last_exc is not None and is_throttling_error(last_exc)
+                                else 2.0 * attempt)
+                        if logger is not None:
+                            logger(f"  Retrying resolve in {wait:.0f}s "
+                                   f"({classify_resolve_failure(last_exc)[0]})")
+                        time.sleep(wait)
+                    # 真正需要 resolve 才受限流器控制（防平台限流）
+                    if limiter is not None:
+                        limiter.wait()
                     try:
                         if browser_cookies is None:
                             if max_height is not None:
@@ -975,21 +1046,50 @@ def resolve_remote_uploads(
             upload.set_source(source)
             upload.set_path(source.display_name or source.source_url)
             remote_sources.append((upload, source))
+            throttle_streak = 0
+            if limiter is not None:
+                limiter.note_success()
             if logger is not None:
                 # 已 attach source（import 时 resolve 过）：标注"已解析"而非
-                # "Resolving"，避免误导用户以为每次都在重新 resolve 全部 URL。
+                # "Resolving"，避免误导用户以为每次都在重新解析全部 URL。
                 verb = "Using resolved source" if was_attached else "Resolving remote source"
                 logger(
                     f"{verb} [{resolved_count}/{total_remote}]: "
                     f"{source.display_name or source.source_id or source.source_url}"
                 )
         except Exception as exc:
+            reason, hint = classify_resolve_failure(exc)
+            failed_sources.append((upload.get_url() or upload.get_path(), reason))
+            if is_throttling_error(exc):
+                throttle_streak += 1
+                if limiter is not None:
+                    interval = limiter.penalize()
+                    if logger is not None:
+                        logger(
+                            f"  Platform is throttling resolves; spacing them "
+                            f"{interval:.0f}s apart for the rest of the batch.")
             if logger is not None:
                 logger(
-                    f"Resolving remote source [{resolved_count}/{total_remote}] failed: {exc}"
+                    f"Resolving remote source [{resolved_count}/{total_remote}] "
+                    f"failed: {reason}"
                 )
-            message = f"Remote source failed ({upload.get_url() or upload.get_path()}): {exc}"
+            message = (f"Remote source failed ({upload.get_url() or upload.get_path()}): "
+                       f"{reason}")
+            if hint:
+                message += f" — {hint}"
             (logger or print)(message)
+    if failed_sources and logger is not None:
+        counts = {}
+        for _url, reason in failed_sources:
+            counts[reason] = counts.get(reason, 0) + 1
+        summary = ", ".join(f"{count}x {reason}" for reason, count in
+                            sorted(counts.items(), key=lambda item: -item[1]))
+        logger(f"{len(failed_sources)} of {total_remote} remote source(s) failed to "
+               f"resolve: {summary}")
+        if throttle_streak:
+            logger("Being throttled usually clears by itself: wait 10-30 minutes, "
+                   "or configure browser cookies / a cookies.txt (signed-in "
+                   "requests get a much higher quota).")
     if total_remote and not remote_sources and not local_entries:
         raise RuntimeError("No remote sources could be resolved; see the preceding errors.")
     return local_entries, remote_sources
@@ -1231,6 +1331,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
         (entry_index, interval_index, source, start, end, output,
          clip_index, clips_total, video_index, duration, pred) = task
         in_flight_key = (entry_index, interval_index)
+        if cancel_pending():
+            # 取消后不要再为排队中的任务启动 ffmpeg：让线程池的队列瞬间排空，
+            # 否则每个任务都要"启动进程→被 kill"走一遍，旧线程迟迟不退出。
+            return fail_task(task, InterruptedError("Operation cancelled by user."))
 
         def fetch_progress(current, total_value, elapsed):
             with in_flight_lock:
@@ -1489,6 +1593,13 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             _last_completed = 0
             _stall_notified = False
             for future in as_completed(futures):
+                if cancel_pending():
+                    # 取消：丢弃排队中的任务并立刻退出循环（with 退出的
+                    # shutdown(wait=True) 只需等当前在跑的 attempt 收尾——
+                    # fetch_task 的入口检查会让队列瞬间排空）。
+                    for pending in futures:
+                        pending.cancel()
+                    raise InterruptedError("Operation cancelled by user.")
                 key = futures[future]
                 try:
                     result = future.result()
@@ -1507,8 +1618,23 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                         _stall_notified = True
                         print(
                             f"{Fore.YELLOW}No remote clip progress for 120s "
-                            f"({current}/{state['total']} clips finished). "
-                            f"Some clips may be repeatedly failing:")
+                            f"({current}/{state['total']} clips finished).")
+                        with in_flight_lock:
+                            pending = sorted(
+                                in_flight.values(),
+                                key=lambda item: item["order"])
+                        for meta in pending[:5]:
+                            print(
+                                f"{Fore.YELLOW}  still downloading: video "
+                                f"{meta['video']}/{meta['videos_total']} · clip "
+                                f"{meta['clip']}/{meta['clips_total']} · Range "
+                                f"{meta['start']:g}-{meta['end']:g}s"
+                                f"{Style.RESET_ALL}")
+                        if pending:
+                            print(
+                                f"{Fore.YELLOW}  (a clip stuck here is abandoned by "
+                                f"its stall watchdog and retried; see the heartbeat "
+                                f"lines above for live progress){Style.RESET_ALL}")
                         for msg in list(failures)[-10:]:
                             print(f"{Fore.YELLOW}  {msg}{Style.RESET_ALL}")
                     _last_completed = current
@@ -4155,6 +4281,12 @@ class VideoProcessorApp:
                     # 回调凭 token 失配作废，不再抹掉手动重试刚写入的状态
                     entry.metadata["hydration_retry_token"] = retry_count + 1
                     backoff = (5, 15, 45)[retry_count]
+                    # 限流/机器人验证的失败要给更长的冷却：固定 5/15/45s 对
+                    # YouTube 的配额窗口太短，会一直"重试也失败"。
+                    if is_throttling_error(Exception(
+                            str(entry.metadata.get("hydration_error") or ""))):
+                        backoff = max(backoff, throttle_step(retry_count))
+                        hydration_limiter.penalize()
                     # 每次失败都刷新 UI：计数实时走 1/3→2/3→3/3，原因不再被遮
                     try:
                         self.root.after(0, lambda: apply_hydration_update(
@@ -4995,7 +5127,10 @@ class VideoProcessorApp:
     def clear_remote_cache(self):
         if not messagebox.askyesno(
                 "Clear Remote Cache",
-                "Clear all remote cache files? The next run may need to download or detect media again."):
+                "Clear detection, audio and segment cache files? The next run may "
+                "need to download or detect media again.\n\n"
+                "Videos downloaded by Full Download are NOT deleted (they live in "
+                "the cache's 'video' folder and still count toward the size shown)."):
             return
         try:
             self.remote_cache_store.clear()
@@ -5045,6 +5180,15 @@ class VideoProcessorApp:
 
     def process_videos_multi(self):
         # Run video processing in new thread so the app doesn't hang
+        # 旧线程可能仍在收尾（取消后线程池要把已提交任务排空）。此时绝不能清掉
+        # 取消标志再起一条新流水线：旧 worker 会立刻恢复下载（旧 N 路 + 新 N 路
+        # = 2× 并发），并且两条流水线同时写同一个输出文件/同一个日志。
+        if self.is_thread_active():
+            messagebox.showwarning(
+                "Still stopping",
+                "The previous run is still shutting down. Please wait a few "
+                "seconds and press Process again.")
+            return
         cancel_clear()
         self.active_thread = KThread(target=self.process_videos)
         # daemon：用户取消/关闭后线程即使卡在 C 层阻塞（如 communicate），
@@ -5075,10 +5219,82 @@ class VideoProcessorApp:
                     print(
                         f"\n{Fore.RED}FAILURE: Operation cancelled by user.")
                     cleanup_temp_children()
-                    self.clear_transfer_progress("Cancelled")
-                    self.reenable_disabled_objects()
+                    self.clear_transfer_progress("Cancelling...")
+                    # 不立刻解锁：等旧线程（含线程池 worker）真的结束再恢复按钮。
+                    # 提前解锁 = 用户可以马上再点 Process，而旧 worker 仍在跑，
+                    # 于是出现 2× 下载并发 + clips 重复生成（测试者反馈）。
+                    self._await_run_shutdown()
                     return True
             return False
+
+    def _await_run_shutdown(self, grace_seconds=120.0, poll_ms=200):
+        """轮询等待活动线程退出后再解锁 UI（不阻塞 Tk 主线程）。
+
+        取消是合作式的：发出标志后线程池要把已提交的任务排空、被 kill 的
+        ffmpeg 要收尾。`terminate()` 只是异步注入 SystemExit，对阻塞在 C 层
+        或线程池里的线程无效，所以必须等 `is_alive()` 真的变 False。
+
+        轮询链用 token 单飞：取消按钮在等待期间仍可点，第二次取消若再起一条
+        轮询链，旧链会在新一轮已经启动后误判"旧线程还活着"→ request_cancel()
+        把新运行悄悄取消掉。token 变化 + 目标线程同一性双重校验可避免。
+        超时（默认 120s）后仍然解锁，但会明确告诉用户卡住并给出退出选项。
+        """
+        started = time.monotonic()
+        self._shutdown_poll_token = getattr(self, "_shutdown_poll_token", 0) + 1
+        token = self._shutdown_poll_token
+        target_thread = self.active_thread
+
+        def poll():
+            if token != getattr(self, "_shutdown_poll_token", 0):
+                return                      # 已被更新的取消链取代
+            if self.active_thread is not target_thread:
+                return                      # 新一轮已开始：别再碰它
+            if not self.is_thread_active():
+                cleanup_temp_children()
+                self.clear_transfer_progress("Cancelled")
+                self.reenable_disabled_objects()
+                return
+            request_cancel()
+            elapsed = time.monotonic() - started
+            if elapsed > grace_seconds:
+                print(
+                    f"{Fore.YELLOW}Previous run is still shutting down after "
+                    f"{grace_seconds:.0f}s; it is stuck in a call that cannot be "
+                    f"interrupted.{Style.RESET_ALL}")
+                cleanup_temp_children()
+                self.clear_transfer_progress("Cancelled")
+                self.reenable_disabled_objects()
+                # 不留下死胡同：线程卡在原生调用里时，Process 会一直被守卫拦住，
+                # 唯一出路是重启程序，这里直接问用户。
+                if messagebox.askyesno(
+                        "Previous run is stuck",
+                        "The previous run cannot be stopped (it is blocked inside "
+                        "a native call).\n\nClose AutoComper now? Unsaved progress "
+                        "of the running job is lost either way."):
+                    self.root.destroy()
+                return
+            self.root.after(poll_ms, poll)
+
+        self.root.after(poll_ms, poll)
+
+    def _ask_choice_blocking(self, title, message, timeout=600.0):
+        """在主线程弹 askyesnocancel 并等结果（worker 线程不能直接碰 Tk）。
+
+        返回 True/False/None；窗口已销毁或超时按 None（跳过）处理。
+        """
+        box = {"done": threading.Event(), "answer": None}
+
+        def show():
+            try:
+                box["answer"] = messagebox.askyesnocancel(title, message)
+            except tk.TclError:
+                box["answer"] = None
+            finally:
+                box["done"].set()
+
+        self._schedule_ui(show)
+        box["done"].wait(timeout)
+        return box["answer"]
 
     def on_closing(self):
         if self.is_thread_active():
@@ -5173,6 +5389,14 @@ class VideoProcessorApp:
             modal, text="Keep Media Downloaded By URL", variable=self.keep_downloaded_vids,
             command=toggle_download_button)
         self.keep_saved_vids_checkbox.pack()
+        CustomHovertip(
+            self.keep_saved_vids_checkbox,
+            "Full Download always keeps the complete media: it is saved to the "
+            "remote cache's 'video' folder. Tick this and choose a Download "
+            "Location to store them somewhere else instead (the folder fields "
+            "below are only used while this is ticked). The file is then "
+            "processed as a local file, so its clips are never downloaded again. "
+            "Clear Cache does not delete downloaded videos.")
 
         download_settings_frame = ttk.Frame(modal)
 
@@ -5333,19 +5557,39 @@ class VideoProcessorApp:
             cookies_file=self.remote_cookies_file.get(),
         )
 
-        # 防御：如果配置的下载目录不存在，回退到 TEMP_DIR
-        if download_path and download_path != "No location selected!":
-            if not os.path.isdir(download_path):
-                print(f"{Fore.YELLOW}Configured download directory missing: {download_path}")
-                print(f"{Fore.YELLOW}Falling back to temporary directory.")
-                download_path = TEMP_DIR
+        # Full Download 的用户要的是"把影片留下来"，所以默认落在远程缓存根目录
+        # 下的 video/ 子目录（随缓存一起定位/换盘，且 Clear Cache 不会删它），
+        # 而不是系统 TEMP 用完即丢。勾了 Keep 且选了自定义目录才用它。
+        download_path = str(download_path or "")
+        use_custom = (keep_downloaded_vids
+                      and download_path
+                      and download_path != "No location selected!"
+                      and os.path.isdir(download_path))
+        if not use_custom:
+            if (keep_downloaded_vids and download_path
+                    and download_path != "No location selected!"):
+                print(f"{Fore.YELLOW}Configured download directory missing: "
+                      f"{download_path}")
+            try:
+                # 只在真的要写缓存目录时才创建：U 盘/移动盘没插时不该在这里炸，
+                # 而且自定义目录可用时完全不需要碰缓存目录。
+                cache_download_dir = self.remote_cache_store.video_download_dir()
+            except OSError as exc:
+                raise Exception(
+                    f"Could not create the download folder "
+                    f"({self.remote_cache_store.root}\\video): {exc}. "
+                    f"Pick a Download Location in Settings, or fix the remote "
+                    f"cache folder.") from exc
+            download_path = str(cache_download_dir)
+            print(f"{Fore.CYAN}Falling back to the cache folder: {download_path}"
+                  f"{Style.RESET_ALL}")
+        os.makedirs(download_path, exist_ok=True)
 
-        if not keep_downloaded_vids:
-            download_path = TEMP_DIR
-
-        if keep_downloaded_vids and (not download_path or download_path == "No location selected!"):
-            raise Exception(
-                "Please set a directory to save downloaded media. You can do this by clicking the gear in the top left.")
+        print(f"{Fore.CYAN}Full Download saves complete media to: {download_path}"
+              f"{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Downloaded files are kept there and processed as local "
+              f"files (no clip re-download); Clear Cache does not touch them."
+              f"{Style.RESET_ALL}")
 
         indices_to_delete = []
         for i, video in enumerate(self.uploaded_videos):
@@ -5364,32 +5608,86 @@ class VideoProcessorApp:
                 try:
                     video.set_source(resolve_source(media_url, browser_cookies=browser_cookies))
                 except Exception as exc:
+                    reason, hint = classify_resolve_failure(exc)
+                    detail = f"{reason}. {hint}".strip()
                     raise RuntimeError(
-                        f"Could not resolve remote source {media_url}: {exc}") from exc
+                        f"Could not resolve remote source {media_url}: {detail}") from exc
 
-            output_path = os.path.join(
-                download_path,
-                str(media_path) +
-                (".mp4" if media_type == "video" else ".mp3")
-            )
-            if os.path.exists(output_path):
-                if messagebox.askyesno(
-                    title="Media Already Exists",
-                    message=f"The media '{media_path}' already exists in the download directory. Would you like to use the existing file? If not, the media will be redownloaded and overwrite the existing file."""
-                ):
-                    self.uploaded_videos[i].set_path(output_path)
+            source = video.get_source()
+            identity = download_identity(source)
+            # 1) 真重复：下载索引里已有同一 source（BV 号/视频 ID）且**同为视频/音频**
+            #    的文件 → 直接复用。同名不同片（up 主常用同一个标题）不会被误判，
+            #    音频模式留下的 .mp3 也不会被当成视频输入复用。
+            recorded = lookup_downloaded_file(download_path, identity, media_type)
+            if recorded:
+                self.uploaded_videos[i].set_path(recorded)
+                self.uploaded_videos[i].set_is_url(False)
+                print(f"{Fore.GREEN}Already downloaded (same source): {recorded}"
+                      f"{Style.RESET_ALL}")
+                continue
+
+            # 2) 目标文件名：标题被占用时先判断"是不是同一部影片"
+            stem = sanitize_download_name(str(media_path))
+            existing = media_file_for_stem(download_path, stem, media_type)
+            if existing is not None:
+                same = download_matches_source(existing, source)
+                if same is True:
+                    register_download(download_path, identity,
+                                      os.path.basename(existing),
+                                      media_type=media_type,
+                                      title=str(media_path),
+                                      duration=getattr(source, "duration", None))
+                    self.uploaded_videos[i].set_path(existing)
                     self.uploaded_videos[i].set_is_url(False)
-                    print(f"{Fore.GREEN}Done!")
+                    print(f"{Fore.GREEN}Existing file matches this source "
+                          f"(same duration); reusing: {existing}{Style.RESET_ALL}")
                     continue
+                if same is None:
+                    # 老文件（本功能之前下载的）没有索引记录、时长也测不出来：
+                    # 交给用户决定，绝不静默覆盖或静默复用。弹窗必须在主线程
+                    # （worker 线程直接碰 Tk 会和主线程轮询抢 Tcl 锁）。
+                    answer = self._ask_choice_blocking(
+                        "Media Already Exists",
+                        (f"A file named '{os.path.basename(existing)}' already "
+                         f"exists and has no download record.\n\n"
+                         f"Yes = use it as this video\n"
+                         f"No = download this video as a new file "
+                         f"('{stem} (2)…')\n"
+                         f"Cancel = skip this item"))
+                    if answer is None:
+                        print(f"{Fore.YELLOW}Skipped {media_path}.")
+                        # 跳过的 URL 条目必须从列表里摘掉：留着它会在检测阶段
+                        # 被当成"本地路径"处理，直接把整批运行打断。
+                        indices_to_delete.append(i)
+                        continue
+                    if answer:
+                        register_download(download_path, identity,
+                                          os.path.basename(existing),
+                                          media_type=media_type,
+                                          title=str(media_path),
+                                          duration=getattr(source, "duration", None))
+                        self.uploaded_videos[i].set_path(existing)
+                        self.uploaded_videos[i].set_is_url(False)
+                        print(f"{Fore.GREEN}Using existing download: {existing}"
+                              f"{Style.RESET_ALL}")
+                        continue
+                stem = unique_download_stem(download_path, stem)
+                print(f"{Fore.CYAN}Name already used by another video; saving as "
+                      f"'{stem}'{Style.RESET_ALL}")
 
             if media_type == 'video':
                 success, result = download_video(
-                    media_url, media_path, download_path, self.max_quality.get(), self.max_download_speed.get(), self.final_bar,
+                    media_url, stem, download_path, self.max_quality.get(), self.max_download_speed.get(), self.final_bar,
                     browser_cookies=browser_cookies)
                 if success:
                     if result:
                         self.uploaded_videos[i].set_path(result)
                         self.uploaded_videos[i].set_is_url(False)
+                        register_download(download_path, identity,
+                                          os.path.basename(result),
+                                          media_type=media_type,
+                                          title=str(media_path),
+                                          duration=getattr(source, "duration", None))
                     else:
                         indices_to_delete.append(i)
                         print(f"{Fore.YELLOW}No video found, skipping")
@@ -5398,11 +5696,19 @@ class VideoProcessorApp:
                         f"Failed to download {media_path}: {result}\nPress 'Process' again and it should start from where you left off.")
             elif media_type == 'audio':
                 success, result = download_audio(
-                    media_url, media_path, download_path, self.max_download_speed.get(), self.final_bar,
+                    media_url, stem, download_path, self.max_download_speed.get(), self.final_bar,
                     browser_cookies=browser_cookies)
-                if success:
+                if success and result:
                     self.uploaded_videos[i].set_path(result)
                     self.uploaded_videos[i].set_is_url(False)
+                    register_download(download_path, identity,
+                                      os.path.basename(result),
+                                      media_type=media_type,
+                                      title=str(media_path),
+                                      duration=getattr(source, "duration", None))
+                elif success:
+                    indices_to_delete.append(i)
+                    print(f"{Fore.YELLOW}No audio found, skipping")
                 else:
                     raise Exception(
                         f"Failed to download {media_path}: {result}\nPress 'Process' again and it should start from where you left off.")
@@ -5844,10 +6150,14 @@ class VideoProcessorApp:
                     remote_failures = []
                     # 下载开始前预检磁盘：大批次会把所有远程片段写进 TEMP，
                     # 磁盘不足时中间失败（Errno 28）会拖垮整个 compile。提前报错更清晰。
-                    check_compile_disk_space(
-                        remote_temp,
-                        _total_clip_seconds(dict_list, padding),
-                        convert_quality_str_to_int(self.max_quality.get()))
+                    # 全本地批次（如 Full Download 下载完的影片）不下载任何片段，
+                    # 不做这个预检（否则会用远程片段的估算量误报磁盘不足）。
+                    if any(isinstance(entry.get('filename'), MediaSource)
+                           for entry in dict_list):
+                        check_compile_disk_space(
+                            remote_temp,
+                            _total_clip_seconds(dict_list, padding),
+                            convert_quality_str_to_int(self.max_quality.get()))
                     # 检测可能已耗时 1-3 小时：compile 前对过期远程源做一次前瞻刷新，
                     # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
                     # 与首次全流程 compile 路径共用同一逻辑。
@@ -5857,6 +6167,7 @@ class VideoProcessorApp:
                     try:
                         self.clear_transfer_progress("Preparing remote clips...")
                         remote_failure_records = []
+                        compile_entries = []
                         compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,
@@ -6227,11 +6538,14 @@ class VideoProcessorApp:
                 ensure_temp_dir()
                 remote_temp = tempfile.mkdtemp(dir=TEMP_DIR, prefix='remote-compile-')
                 remote_failures = []
-                # 下载开始前预检磁盘（与上一 compile 路径一致）。
-                check_compile_disk_space(
-                    remote_temp,
-                    _total_clip_seconds(dict_list, padding),
-                    convert_quality_str_to_int(self.max_quality.get()))
+                # 下载开始前预检磁盘（与上一 compile 路径一致）；全本地批次跳过
+                # （Full Download 下载完的影片不产生远程片段下载）。
+                if any(isinstance(entry.get('filename'), MediaSource)
+                       for entry in dict_list):
+                    check_compile_disk_space(
+                        remote_temp,
+                        _total_clip_seconds(dict_list, padding),
+                        convert_quality_str_to_int(self.max_quality.get()))
                 # 首次全流程的检测可能耗时数小时：compile 前对过期远程源做前瞻
                 # 刷新，并给 materialize 传入 refresh_func 兜底——否则尾部源
                 # URL 过期导致整批 403、片段被跳过（与跳过检测路径共用逻辑）。
@@ -6241,6 +6555,7 @@ class VideoProcessorApp:
                 try:
                     self.clear_transfer_progress("Preparing remote clips...")
                     remote_failure_records = []
+                    compile_entries = []
                     compile_entries = materialize_remote_entries(
                             dict_list, remote_temp, cache_store=cache_store, padding=padding,
                             is_video=self.is_video, failures=remote_failures,

@@ -37,12 +37,17 @@ class CacheStore:
         self.detection_root = self.root / "detection"
         self.audio_root = self.root / "audio"
         self.segment_root = self.root / "segments"
+        # Full Download 模式下载的完整影片落在这里（用户明确要"留着影片"，
+        # 不能再写系统 TEMP 用完即丢）。放在 cache 根下便于和缓存一起被
+        # 定位/迁移（换盘、U 盘），但 clear("all") 刻意不删它 —— 见 clear()。
+        self.video_root = self.root / "video"
 
     def ensure_ready(self) -> Path:
         """Create the cache tree and verify that the selected root is writable."""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            for directory in (self.detection_root, self.audio_root, self.segment_root):
+            for directory in (self.detection_root, self.audio_root,
+                              self.segment_root, self.video_root):
                 directory.mkdir(parents=True, exist_ok=True)
             probe = self.root / ".write-test"
             probe.write_bytes(b"")
@@ -50,6 +55,11 @@ class CacheStore:
         except OSError as exc:
             raise OSError(f"Remote cache root is not writable: {self.root} ({exc})") from exc
         return self.root
+
+    def video_download_dir(self) -> Path:
+        """Directory for Full Download's complete media files (created on demand)."""
+        self.video_root.mkdir(parents=True, exist_ok=True)
+        return self.video_root
 
     def _is_safe_path(self, path: Path) -> bool:
         try:
@@ -73,19 +83,26 @@ class CacheStore:
         return total
 
     def clear(self, kind: str | None = None) -> None:
-        """Delete cache contents while retaining the root and category directories."""
+        """Delete cache contents while retaining the root and category directories.
+
+        ``video`` (Full Download's complete media files) is NOT part of ``all``:
+        those are the user's saved movies, not disposable cache. Clear it only by
+        asking for ``kind="video"`` explicitly.
+        """
         normalized = "all" if kind is None else str(kind).strip().lower()
         roots = {
             "detection": self.detection_root,
             "audio": self.audio_root,
             "segments": self.segment_root,
+            "video": self.video_root,
         }
         if normalized == "all":
-            selected = tuple(roots.values())
+            selected = (self.detection_root, self.audio_root, self.segment_root)
         elif normalized in roots:
             selected = (roots[normalized],)
         else:
-            raise ValueError("kind must be one of: all, detection, audio, segments")
+            raise ValueError(
+                "kind must be one of: all, detection, audio, segments, video")
 
         for directory in selected:
             if not self._is_safe_path(directory) or not directory.exists():

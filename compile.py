@@ -23,6 +23,17 @@ import os
 
 MERGE_THRESHOLD = 2  # seconds
 
+# 编码"卡死"看门狗：ffmpeg 仍在按 0.5s 节奏打印 progress、但 out_time 长时间
+# 不前进（NVENC 驱动死锁、输出盘被占用/被杀软扫描）时，原有"30s 无输出"看门狗
+# 永远不触发，编译会挂着直到 concat 的小时级 timeout（测试者看到的
+# "ETA 00:00、工作挂着、不继续下一轮"）。240s 无任何前进 → 判定卡死并走既有
+# 回退/失败路径。判定完全在后台，不打日志（批量编译阶段进度卡已在刷新）。
+_PROGRESS_STALL_TIMEOUT = 240.0
+
+# 第一层 concat 产物允许的 A/V 偏差：超过它就重封对齐（正常批次 ±5ms，
+# 出问题的批次 ~75ms）。阈值取 30ms，避免为每批都做一次多余的重封。
+_BATCH_ALIGN_TOLERANCE = 0.03
+
 # 音频输出编码组。concat 链条里的任何 AAC 输入都会让 concat filter 的音频时间线
 # 相对视频每段拉伸 ~20ms（AAC priming 残留，实测真实远程段 A-V 中位数 +21.3ms，
 # 940 段批次尾部累积近 20s——"整体逐渐错位"根因）。因此：
@@ -66,7 +77,13 @@ def _run_ffmpeg(command, timeout, progress_callback=None, duration=None, stage="
         progress_callback(format_compile_progress(current, total, elapsed, stage))
 
     return run_tracked_progress(
-        command, duration=duration, timeout=timeout, progress_callback=report
+        command, duration=duration, timeout=timeout, progress_callback=report,
+        # out_time 长时间不前进 = 编码卡死（NVENC 死锁/输出被占用）：抛
+        # ProgressStallTimeout（TimeoutExpired 子类），既有回退分支会接住。
+        # 刻意不打心跳日志：批量编译阶段进度卡本来就在刷新，"still encoding"
+        # 每 60s 刷一行没有信息量（用户要求去掉）；心跳只保留在下载阶段
+        # （Preparing clips，每个 clip 都是短任务，卡住需要立刻可见）。
+        progress_stall_timeout=_PROGRESS_STALL_TIMEOUT,
     )
 
 
@@ -409,8 +426,10 @@ def _pad_clip_audio_if_missing(path: str, probe: str) -> bool:
         if result.returncode != 0 or not os.path.exists(tmp):
             return False
         os.replace(tmp, path)
-        # 原地替换后 _PROBE_CACHE 里的旧探测结果作废
+        # 原地替换后 _PROBE_CACHE / _VSTREAM_CACHE 里的旧结果作废（文件变了）
         _PROBE_CACHE.pop(os.path.normcase(os.path.normpath(path)), None)
+        for handler in (b'soun', b'vide'):
+            _VSTREAM_CACHE.pop((os.path.normcase(os.path.normpath(path)), handler), None)
         print(f"{Fore.YELLOW}  Warning: clip {os.path.basename(path)} had no audio "
               f"stream in the source range; padded with silence."
               f"{Style.RESET_ALL}")
@@ -424,23 +443,27 @@ def _pad_clip_audio_if_missing(path: str, probe: str) -> bool:
         return False
 
 
-def _align_cut_audio_to_video(path):
+def _align_cut_audio_to_video(path, tolerance=0.0001):
     """第二遍对齐：把音频轨重封到本文件视频轨的实际时长（A=V 逐帧相等）。
 
     CFR 输出的视频轨时长（容器 mdhd）由帧网格决定，编码前无法精确预测——
     请求时长落在网格上/差一帧/源段视频轨本身短缺（HLS 分片落点少交付 δ），
     输出视频轨都会偏离请求值 ±1 帧。concat filter 按各输入的容器轨时长独立
     拼接视频帧与音频采样，这个偏差会逐段线性累积（实测 testaudio.mp4 全局
-    A−V = +54.5s）。先量后裁：读输出文件的视/音轨 mdhd；已相等（±0.1ms，
-    整数时长 clip 通常直接命中）则跳过；否则 -c:v copy 重封音频到视频轨
-    时长——视频零重编码，音频只重编一次 FLAC。测不准/失败时保留第一遍
-    结果（不致命）。
+    A−V = +54.5s）。先量后裁：读输出文件的视/音轨 mdhd；已相等（±tolerance）
+    则跳过；否则 -c:v copy 重封音频到视频轨时长——视频零重编码，音频只重编
+    一次 FLAC。测不准/失败时保留第一遍结果（不致命）。
+
+    `tolerance` 供 concat 中间产物使用：实测第一层 6 合 1 里有约 14% 的批次会
+    丢 ~75ms 音频（采样率混合 + concat filter 的采样边界），300 段累积
+    −0.5s。对超阈值（默认 cut 路径 0.1ms / 批次 30ms）的结果做一次对齐即可
+    把这一层归零，不必每批都重封。
     """
     v = _mp4_track_duration(path, b'vide')
     a = _mp4_track_duration(path, b'soun')
     if v is None or a is None or v <= 0:
         return
-    if abs(a - v) <= 0.0001:
+    if abs(a - v) <= tolerance:
         return
     tmp = f"{path}.align.tmp.mp4"
     cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
@@ -451,6 +474,11 @@ def _align_cut_audio_to_video(path):
                   f'apad=whole_dur={v:.6f}',
            '-c:a', 'flac',
            '-avoid_negative_ts', 'make_zero',
+           # 必须有输出时长上限：atrim+apad 在部分源（48kHz AAC 段）上会把音轨
+           # 做到 whole_dur 之外（实测 +0.379s），逐段累积成全局音画漂移
+           # （测试者成片 40 分钟后整体错位 ~20s）。第一遍 cut 有 -t 才没这问题，
+           # 这一步重封漏了。
+           '-t', f'{v:.6f}',
            '-movflags', '+faststart',
            tmp]
     try:
@@ -458,10 +486,23 @@ def _align_cut_audio_to_video(path):
         if result.returncode != 0 or not os.path.exists(tmp):
             raise Exception(f"rc={result.returncode} stderr="
                             f"{_sanitize_ffmpeg_detail(result.stderr)}")
+        # 复核：重封结果必须真的对齐，且**不得比第一遍更差**。不达标就丢弃
+        # tmp、保留第一遍结果——宁可留下几毫秒的差，也绝不让坏结果进入 concat。
+        new_v = _mp4_track_duration(tmp, b'vide')
+        new_a = _mp4_track_duration(tmp, b'soun')
+        limit = min(0.02, abs(a - v) + 1e-3)   # +1ms：容忍 mdhd 采样刻度取整
+        if new_v is None or new_a is None or abs(new_a - new_v) > limit:
+            raise Exception(f"alignment did not converge "
+                            f"(A={new_a} V={new_v}, before A={a} V={v})")
         os.replace(tmp, path)
-        # 重封后缓存里的旧轨时长作废
-        _VSTREAM_CACHE.pop((os.path.normcase(os.path.normpath(path)), b'soun'), None)
-        _VSTREAM_CACHE.pop((os.path.normcase(os.path.normpath(path)), b'vide'), None)
+        # 重封后缓存里的旧轨时长/旧探测结果作废（原路径与 tmp 路径都要清）。
+        # _PROBE_CACHE 存的是 `ffmpeg -i` 文本（含 Duration），文件被原地替换后
+        # 旧值会让 concat 的 total_dur 与缺音轨预检用到过期数据。
+        for target in (path, tmp):
+            key = os.path.normcase(os.path.normpath(target))
+            _VSTREAM_CACHE.pop((key, b'soun'), None)
+            _VSTREAM_CACHE.pop((key, b'vide'), None)
+            _PROBE_CACHE.pop(key, None)
     except Exception as exc:
         try:
             if os.path.exists(tmp):
@@ -529,9 +570,48 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             c.append(output_file)
             return c
 
-        result = _run_ffmpeg(build_cmd(video_codec), timeout=600,
-                             progress_callback=progress_callback, duration=dur,
-                             stage="Encoding clip")
+        try:
+            result = _run_ffmpeg(build_cmd(video_codec), timeout=600,
+                                 progress_callback=progress_callback, duration=dur,
+                                 stage="Encoding clip")
+        except subprocess.TimeoutExpired as exc:
+            # 真超时或"进度不前进"卡死：NVENC 时回退 x264 重试一次
+            # （ProgressStallTimeout 是 TimeoutExpired 子类，同样走这里）。
+            if cancel_pending():
+                raise InterruptedError("Compile cancelled by user.")
+            if 'h264_nvenc' not in video_codec:
+                raise
+            print(f"{Fore.YELLOW}Clip encode stalled ({exc}); retrying with "
+                  f"libx264.{Style.RESET_ALL}")
+            _fallback_to_x264()
+            # 关键：把 video_codec 换成 x264，否则这次重试若也失败，下面的
+            # "rc!=0 且仍是 nvenc" 分支会再跑一遍 x264（每个坏 clip 白烧 600s）。
+            video_codec = list(_X264_CODEC)
+            codec = list(video_codec)
+            if fps and fps > 0:
+                codec += ['-r', str(int(fps))]
+            result = _run_ffmpeg(build_cmd(codec), timeout=600,
+                                 progress_callback=progress_callback, duration=dur,
+                                 stage="Encoding clip")
+        except Exception as exc:
+            # 无输出楔死走的是 RemoteAudioStallError（普通 Exception），它不是
+            # TimeoutExpired；compile 的输入都是本地文件，"远端 URL 过期"的
+            # 提示是误导，而且不重试会白扔一个 clip。这里按卡死处理。
+            # 惰性导入避免模块级循环依赖。
+            from sound_reader import RemoteAudioStallError
+            if (not isinstance(exc, RemoteAudioStallError) or cancel_pending()
+                    or 'h264_nvenc' not in video_codec):
+                raise
+            print(f"{Fore.YELLOW}Clip encode produced no output ({exc}); "
+                  f"retrying with libx264.{Style.RESET_ALL}")
+            _fallback_to_x264()
+            video_codec = list(_X264_CODEC)
+            codec = list(video_codec)
+            if fps and fps > 0:
+                codec += ['-r', str(int(fps))]
+            result = _run_ffmpeg(build_cmd(codec), timeout=600,
+                                 progress_callback=progress_callback, duration=dur,
+                                 stage="Encoding clip")
         if result.returncode != 0 and 'h264_nvenc' in video_codec:
             # 取消导致的 rc!=0 不是 NVENC 故障：不能触发 x264 回退重试，
             # 否则取消后编译会以 CPU 编码继续跑完（用户报告的假取消）。
@@ -760,6 +840,10 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                                 audio_out=_FLAC_AUDIO)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
+            # 第一层 concat 偶尔会丢 ~75ms 音频（混合采样率 + filter 采样边界，
+            # 实测约 14% 的批次；300 段累积 −0.5s）。超阈值才重封一次，把这一层
+            # 的 A/V 差归零，避免它继续向上层累积。
+            _align_cut_audio_to_video(batch_out, tolerance=_BATCH_ALIGN_TOLERANCE)
         print(f"  Final merge ({len(batch_files)} files)...")
         if progress_callback is not None:
             progress_callback(format_compile_progress(0, None, 0, "Final merge: starting"))

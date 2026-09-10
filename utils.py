@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import platform
 import shutil
 import re
@@ -41,6 +42,24 @@ def cancel_pending():
 
 class InsufficientDiskSpaceError(RuntimeError):
     """Raised before a download when the destination lacks safe free space."""
+
+
+class ProgressStallTimeout(subprocess.TimeoutExpired):
+    """FFmpeg 仍在输出进度行，但 out_time 长时间不前进（编码卡死类）。
+
+    子类化 TimeoutExpired，让既有的"超时 → NVENC 回退 x264"分支自动接住：
+    NVENC 驱动死锁、输出盘被占用、杀软扫描大文件时 ffmpeg 往往还在按 0.5s
+    节奏打印 progress（因此原有的"30s 无输出"看门狗永远不触发），但编码
+    时间不再前进——测试者看到的"ETA 00:00 挂着不动"就是这一类。
+    """
+
+    def __str__(self):
+        # TimeoutExpired.__str__ 忽略 output（CPython 只用 cmd/timeout），
+        # 不覆盖的话日志里区分不出"卡死"和"真超时"，stall 详情也会丢。
+        detail = self.output if isinstance(self.output, str) else ""
+        base = (f"Command {self.cmd!r} made no progress for "
+                f"{self.timeout} seconds")
+        return f"{base}: {detail}" if detail else base
 
 
 def _size_value(value):
@@ -308,7 +327,9 @@ def run_tracked(cmd, timeout=None, text=False):
 
 
 def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=None,
-                         stall_timeout=None):
+                         stall_timeout=None, progress_stall_timeout=None,
+                         heartbeat_label=None, heartbeat_interval=60.0,
+                         heartbeat_verb="encoding"):
     """Run FFmpeg while forwarding its machine-readable progress output.
 
     ``stall_timeout`` (seconds) adds a no-data watchdog: if FFmpeg produces no
@@ -316,6 +337,16 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
     and ``RemoteAudioStallError`` is raised so callers can refresh and retry
     instead of hanging forever. Reads happen on a daemon thread so a silent
     process can never block the timeout check.
+
+    ``progress_stall_timeout`` (seconds) adds a second watchdog on the *content*:
+    progress lines that keep arriving while ``out_time`` never advances are
+    treated as a wedged encode and raise ``ProgressStallTimeout`` (a
+    ``TimeoutExpired`` subclass, so NVENC→x264 fallbacks still fire).
+
+    ``heartbeat_label``/``heartbeat_interval`` print one status line to the log
+    every N seconds while a long encode runs, so "still working" is visible in
+    the log instead of only in the progress card (ETA 00:00 previously looked
+    identical to a hang).
     """
     command = list(cmd)
     if "-progress" not in command:
@@ -339,13 +370,18 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
         effective_stall = stall_timeout if (stall_timeout is not None and stall_timeout > 0) else 30
         return _run_progress_with_stall(p, state, output, duration,
                                         progress_callback, started_at,
-                                        timeout, effective_stall, command)
+                                        timeout, effective_stall, command,
+                                        progress_stall_timeout,
+                                        heartbeat_label, heartbeat_interval,
+                                        heartbeat_verb)
     finally:
         _ACTIVE_PROCS.discard(p)
 
 
 def _run_progress_with_stall(p, state, output, duration, progress_callback,
-                             started_at, timeout, stall_timeout, command):
+                             started_at, timeout, stall_timeout, command,
+                             progress_stall_timeout=None, heartbeat_label=None,
+                             heartbeat_interval=60.0, heartbeat_verb="encoding"):
     import queue as _queue
     import threading as _threading
 
@@ -364,6 +400,9 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
 
     thread = _threading.Thread(target=reader, name="ffmpeg-progress-reader", daemon=True)
     thread.start()
+    last_advance_at = time.monotonic()
+    last_progress_value = None
+    last_heartbeat = time.monotonic()
     try:
         while True:
             if cancel_pending():
@@ -386,12 +425,40 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
             if "=" in text_line:
                 key, value = text_line.split("=", 1)
                 state[key] = value
-                if key == "out_time_ms" and progress_callback is not None:
+                if key == "out_time_ms":
                     try:
                         current = float(value) / 1_000_000
                     except ValueError:
-                        continue
-                    progress_callback(current, duration, time.monotonic() - started_at)
+                        # ffmpeg 在还没有输出帧时会打印 `out_time_ms=N/A`
+                        # （NVENC 起手 EAGAIN 空转就是这样）。这里**不能**
+                        # continue：那会连下面的卡死看门狗、心跳和 timeout
+                        # 检查一起跳过，进程空转永远不超时。
+                        current = None
+                    if current is not None:
+                        if last_progress_value is None or current > last_progress_value + 1e-6:
+                            last_progress_value = current
+                            last_advance_at = time.monotonic()
+                        if progress_callback is not None:
+                            progress_callback(current, duration,
+                                               time.monotonic() - started_at)
+            now = time.monotonic()
+            if (progress_stall_timeout and progress_stall_timeout > 0
+                    and now - last_advance_at > progress_stall_timeout):
+                p.kill()
+                raise ProgressStallTimeout(
+                    command, progress_stall_timeout,
+                    f"encode made no progress for {progress_stall_timeout:g}s "
+                    f"(stuck at {last_progress_value if last_progress_value is not None else 0:.1f}s)")
+            if (heartbeat_label and heartbeat_interval > 0
+                    and now - last_heartbeat >= heartbeat_interval):
+                last_heartbeat = now
+                elapsed = now - started_at
+                encoded = last_progress_value or 0.0
+                speed = f"{encoded / elapsed:.2f}x realtime" if elapsed > 0 else "--"
+                total_text = f"{duration:.0f}s" if duration else "unknown"
+                print(f"  [{heartbeat_label}] still {heartbeat_verb}: "
+                      f"{encoded:.0f}s / {total_text} ({speed}, "
+                      f"{now - last_advance_at:.0f}s since last progress change)")
             if timeout is not None and time.monotonic() - started_at > timeout:
                 p.kill()
                 raise subprocess.TimeoutExpired(command, timeout)
@@ -640,6 +707,16 @@ def is_valid_yt_dlp_url(base_url: str, max_quality: str = None):
                 f"An unexpected error occured while retrieving URLs. Please try again.\nError: {str(e)}")
 
 
+def yt_dlp_version() -> str:
+    """Bundled yt-dlp version, for the log (YouTube breakages are usually
+    extractor-side and only a newer build fixes them)."""
+    try:
+        from yt_dlp.version import __version__
+        return str(__version__)
+    except Exception:
+        return "unknown"
+
+
 def download_video(url: str, filename: str, output_location: str, max_quality: str, max_speed: int, logger, n_retries: int = 3, browser_cookies: str | None = None) -> Tuple[bool, str]:
     logger.reset_total_progress(100)
     os.makedirs(output_location, exist_ok=True)
@@ -782,6 +859,159 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
     return False, str(last_error) if last_error else "download failed"
+
+
+DOWNLOAD_INDEX_FILENAME = "_autocomper_downloads.json"
+_MEDIA_SUFFIXES = (
+    ".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts", ".avi", ".m4v",
+    ".mp3", ".m4a", ".aac", ".opus", ".flac", ".wav", ".ogg",
+)
+VIDEO_SUFFIXES = frozenset(
+    {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts", ".avi", ".m4v"})
+AUDIO_SUFFIXES = frozenset(
+    {".mp3", ".m4a", ".aac", ".opus", ".flac", ".wav", ".ogg"})
+
+
+def suffixes_for_media_type(media_type) -> frozenset:
+    """Suffix set for a MediaUpload type ("video"/"audio"/anything else)."""
+    return AUDIO_SUFFIXES if str(media_type).lower() == "audio" else VIDEO_SUFFIXES
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Windows 保留设备名（不区分大小写，含带扩展名的形式）：CON.mp4 也建不出来
+_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def sanitize_download_name(name: str) -> str:
+    """Make a title safe as a Windows file name (keeps it recognisable)."""
+    cleaned = _ILLEGAL_NAME_CHARS.sub("_", str(name or "")).strip()
+    cleaned = cleaned.rstrip(". ")
+    if cleaned.casefold() in _RESERVED_NAMES:
+        cleaned += "_"
+    return cleaned or "download"
+
+
+def download_index_path(download_dir) -> Path:
+    return Path(download_dir) / DOWNLOAD_INDEX_FILENAME
+
+
+def load_download_index(download_dir) -> dict:
+    """Return {"version": 1, "entries": {identity: {...}}} (empty when absent)."""
+    path = download_index_path(download_dir)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {"version": 1, "entries": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return {"version": 1, "entries": {}}
+    data.setdefault("version", 1)
+    return data
+
+
+def save_download_index(download_dir, index) -> None:
+    path = download_index_path(download_dir)
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(index, handle, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        # 索引只是"省一次下载"的优化，写不进去不能影响下载本身
+        pass
+
+
+def lookup_downloaded_file(download_dir, identity, media_type=None) -> Optional[str]:
+    """Path of an already-downloaded file for this source identity, if present.
+
+    ``media_type`` ("video"/"audio") must match the recorded entry: audio and
+    video mode share one download folder, and an audio-only file must never be
+    reused as a video input (or vice versa).
+    """
+    if not identity:
+        return None
+    index = load_download_index(download_dir)
+    entry = (index.get("entries") or {}).get(str(identity))
+    if not isinstance(entry, dict):
+        return None
+    name = str(entry.get("file") or "")
+    if not name:
+        return None
+    recorded_type = str(entry.get("media_type") or "").lower()
+    if media_type and recorded_type and recorded_type != str(media_type).lower():
+        return None
+    suffix = os.path.splitext(name)[1].casefold()
+    if media_type and suffix and suffix not in suffixes_for_media_type(media_type):
+        return None
+    candidate = Path(download_dir) / name
+    if candidate.is_file():
+        return str(candidate)
+    return None
+
+
+def register_download(download_dir, identity, filename, media_type=None,
+                      **metadata) -> None:
+    """Record identity -> file so the same source is never downloaded twice."""
+    if not identity:
+        return
+    index = load_download_index(download_dir)
+    entry = {"file": os.path.basename(str(filename))}
+    if media_type:
+        entry["media_type"] = str(media_type).lower()
+    entry.update({key: value for key, value in metadata.items()
+                  if value is not None})
+    index.setdefault("entries", {})[str(identity)] = entry
+    save_download_index(download_dir, index)
+
+
+def media_file_for_stem(download_dir, stem: str, media_type=None) -> Optional[str]:
+    """Existing media file whose name is exactly ``stem`` (any media suffix).
+
+    ``media_type`` narrows the accepted suffixes so a video download is not
+    blocked by (or mistaken for) an audio file with the same stem.
+    """
+    try:
+        names = os.listdir(download_dir)
+    except OSError:
+        return None
+    allowed = suffixes_for_media_type(media_type) if media_type else _MEDIA_SUFFIXES
+    wanted = str(stem).casefold()
+    for name in names:
+        path = Path(download_dir) / name
+        if not path.is_file() or path.stem.casefold() != wanted:
+            continue
+        if path.suffix.casefold() in allowed:
+            return str(path)
+    return None
+
+
+def unique_download_stem(download_dir, title: str) -> str:
+    """Free stem for a new download: ``title``, then ``title (2)``, ``title (3)``…
+
+    Uploaders often reuse an identical title for different videos, so a name
+    clash must never mean "the same file": identity is tracked separately by
+    the download index, and a clash with a *different* source gets the Windows
+    style `` (n)`` suffix instead of overwriting or silently reusing.
+    """
+    base = sanitize_download_name(title)
+    index = load_download_index(download_dir)
+    entries = index.get("entries") or {}
+    if media_file_for_stem(download_dir, base) is None:
+        return base
+    # 索引里的文件名要按"去扩展名的 stem"比较：索引存的是 "Title.mp4"，
+    # 直接拿它跟候选 stem 比会永远不相等（曾经的死判断）。
+    taken = {os.path.splitext(str(item.get("file") or ""))[0].casefold()
+             for item in entries.values() if isinstance(item, dict)}
+    suffix = 2
+    while suffix < 1000:
+        candidate = f"{base} ({suffix})"
+        if (media_file_for_stem(download_dir, candidate) is None
+                and candidate.casefold() not in taken):
+            return candidate
+        suffix += 1
+    return f"{base} ({os.getpid()})"
 
 
 class MediaUpload:

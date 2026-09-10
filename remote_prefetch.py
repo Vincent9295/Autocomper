@@ -8,7 +8,7 @@ from typing import Mapping
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from progress import format_transfer_progress
+from progress import format_transfer_progress, format_hls_progress
 
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
@@ -317,8 +317,15 @@ def _hls_attribute(line, name):
 
 
 def iter_hls_bytes(source, concurrency=DEFAULT_CONCURRENCY, request_func=None, logger=None,
-                   progress_callback=None):
-    """Yield Twitch HLS init and media fragments in playlist order."""
+                   progress_callback=None, refresher=None):
+    """Yield Twitch HLS init and media fragments in playlist order.
+
+    ``refresher`` (optional) is called when a fragment keeps failing after its
+    per-fragment retries: the signed HLS URL/token is renewed and the manifest
+    is re-read, then the stream continues. Without it an expired Twitch URL
+    could only fail the whole prefetch and fall back to the slow FFmpeg path
+    (the tester saw the legacy "(attempt 1/3)" download with no live progress).
+    """
     try:
         concurrency = int(concurrency)
     except (TypeError, ValueError) as exc:
@@ -327,6 +334,43 @@ def iter_hls_bytes(source, concurrency=DEFAULT_CONCURRENCY, request_func=None, l
         raise RangePrefetchError("source does not support HLS prefetch")
     request = request_func or _default_hls_request
     headers = dict(getattr(source, "audio_headers", {}) or {})
+    started_at = time.monotonic()
+    bytes_done = 0
+    refresh_state = {"done": False, "playlist": None, "duration": None}
+
+    def refresh_playlist(expected_len, log_message):
+        """Renew the signed URL once, re-read the manifest and keep it.
+
+        分片是并发预取的（window = concurrency*2 个请求都绑在同一个签名 token
+        上），token 一旦过期通常同时失败多个分片——所以刷新结果必须**留存**给
+        后续失败复用；只按"刷新过一次"就放弃会让整个预取失败、退回慢速 FFmpeg
+        路径（这个特性等于没生效）。
+        """
+        if refresh_state["playlist"] is not None:
+            return refresh_state["playlist"], refresh_state["duration"]
+        if refresher is None or refresh_state["done"]:
+            return None
+        refresh_state["done"] = True
+        try:
+            updated = refresher(source)
+            if isinstance(updated, object) and updated is not source:
+                source.__dict__.update(getattr(updated, "__dict__", {}) or {})
+            headers.clear()
+            headers.update(dict(getattr(source, "audio_headers", {}) or {}))
+            manifest = fetch(source.audio_url).decode("utf-8")
+            playlist, duration = _parse_hls_playlist(manifest, source.audio_url, fetch)
+        except Exception:
+            return None
+        # 位置必须一一对应：刷新拿到的是同一个 VOD 的同一段 DVR 窗口，
+        # 长度不同说明窗口/变体变了，按旧索引续跑会静默错位（重复或漏段）。
+        if expected_len and len(playlist) != expected_len:
+            _log(logger, "Twitch HLS refresh returned a different playlist length; "
+                         "not resuming from stale indices")
+            return None
+        _log(logger, log_message)
+        refresh_state["playlist"] = playlist
+        refresh_state["duration"] = duration
+        return playlist, duration
 
     def fetch(url):
         last_error = None
@@ -344,33 +388,55 @@ def iter_hls_bytes(source, concurrency=DEFAULT_CONCURRENCY, request_func=None, l
 
     try:
         manifest = fetch(source.audio_url).decode("utf-8")
-        playlist_urls = _parse_hls_playlist(manifest, source.audio_url, fetch)
-        _log(logger, f"Twitch HLS prefetch: {len(playlist_urls)} fragments")
+        playlist, media_duration = _parse_hls_playlist(manifest, source.audio_url, fetch)
+        _log(logger, f"Twitch HLS prefetch: {len(playlist)} fragments"
+                     + (f", {media_duration:.1f}s media" if media_duration else ""))
         executor = ThreadPoolExecutor(max_workers=concurrency)
         futures = {}
         next_submit = 0
         next_yield = 0
         buffered = {}
-        completed = 0
+        fetched_media = 0.0
         window = max(1, concurrency * 2)
         try:
-            while next_submit < len(playlist_urls) and len(futures) < window:
-                future = executor.submit(fetch, playlist_urls[next_submit])
+            while next_submit < len(playlist) and len(futures) < window:
+                future = executor.submit(fetch, playlist[next_submit][0])
                 futures[future] = next_submit
                 next_submit += 1
             while futures:
                 completed_future = next(as_completed(tuple(futures)))
                 index = futures.pop(completed_future)
-                buffered[index] = completed_future.result()
+                try:
+                    buffered[index] = completed_future.result()
+                except Exception:
+                    # 分片彻底失败：刷新签名 URL 并用新 manifest 续跑。
+                    # 刷新结果会留存，同一 token 上并发失败的其它分片复用同一次
+                    # 刷新（否则第二个失败就把整段预取打回 FFmpeg 慢路径）。
+                    renewed = refresh_playlist(
+                        len(playlist),
+                        "Twitch HLS fragment failed; refreshing the signed URL")
+                    if renewed is None:
+                        raise
+                    playlist, media_duration = renewed
+                    if index >= len(playlist):
+                        raise
+                    buffered[index] = fetch(playlist[index][0])
                 while next_yield in buffered:
                     data = buffered.pop(next_yield)
-                    completed += len(data)
+                    bytes_done += len(data)
+                    # 刷新后新 manifest 可能更短：已按旧索引完成的在途分片不能
+                    # 用新 playlist 取时长（越界会 IndexError，把整段预取降级成
+                    # FFmpeg 回落）。越界时按 0 计，只影响进度显示。
+                    if next_yield < len(playlist):
+                        fetched_media += playlist[next_yield][1]
                     if progress_callback is not None:
-                        progress_callback(format_transfer_progress(completed, None, 0))
+                        progress_callback(format_hls_progress(
+                            fetched_media, media_duration, time.monotonic() - started_at,
+                            bytes_done))
                     yield data
                     next_yield += 1
-                while next_submit < len(playlist_urls) and len(futures) < window:
-                    future = executor.submit(fetch, playlist_urls[next_submit])
+                while next_submit < len(playlist) and len(futures) < window:
+                    future = executor.submit(fetch, playlist[next_submit][0])
                     futures[future] = next_submit
                     next_submit += 1
         finally:
@@ -384,6 +450,7 @@ def iter_hls_bytes(source, concurrency=DEFAULT_CONCURRENCY, request_func=None, l
 
 
 def _parse_hls_playlist(manifest, base_url, fetch):
+    """Return ([(url, media_seconds), ...], total_media_seconds)."""
     lines = [line.strip() for line in manifest.splitlines() if line.strip()]
     variants = [(line, lines[index + 1]) for index, line in enumerate(lines[:-1])
                 if line.startswith("#EXT-X-STREAM-INF:") and not lines[index + 1].startswith("#")]
@@ -393,13 +460,23 @@ def _parse_hls_playlist(manifest, base_url, fetch):
         child_url = urljoin(base_url, uri)
         return _parse_hls_playlist(fetch(child_url).decode("utf-8"), child_url, fetch)
     result = []
+    pending_duration = 0.0
     for line in lines:
-        if line.startswith("#EXT-X-MAP:"):
+        if line.startswith("#EXTINF:"):
+            try:
+                pending_duration = max(0.0, float(line.split(":", 1)[1].split(",")[0]))
+            except (TypeError, ValueError, IndexError):
+                pending_duration = 0.0
+        elif line.startswith("#EXT-X-MAP:"):
             uri = _hls_attribute(line, "URI")
             if uri:
-                result.append(urljoin(base_url, uri))
+                result.append((urljoin(base_url, uri), 0.0))
+            # MAP（init segment）不消耗前一个 #EXTINF：不重置的话那段时长会
+            # 记到下一个真正分片上，总时长偏大、百分比永远到不了 100。
+            pending_duration = 0.0
         elif not line.startswith("#"):
-            result.append(urljoin(base_url, line))
+            result.append((urljoin(base_url, line), pending_duration))
+            pending_duration = 0.0
     if not result:
         raise RangePrefetchError("HLS manifest contains no media segments")
-    return result
+    return result, sum(item[1] for item in result)

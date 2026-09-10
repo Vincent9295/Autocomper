@@ -12,17 +12,29 @@ from typing import Callable
 
 _MIN_RESOLVE_INTERVAL = 2.0
 _RATE_LIMIT_BACKOFF = (5.0, 15.0, 45.0, 90.0)
+# 批内自适应降速：连续被限流时把 resolve 间隔拉到这些秒数（成功一次就回落）
+_THROTTLE_STEPS = (15.0, 30.0, 60.0, 120.0)
 _RATE_LIMIT_MARKERS = ("412", "precondition failed", "rate limit", "rate-limit",
                        "too many requests", "429")
+# YouTube 的"机器人验证"同一个成因（短时间解析太多），必须同样降速
+_BOT_CHECK_MARKERS = ("not a bot", "sign in to confirm", "confirm you're not a bot",
+                      "unusual traffic", "captcha")
 
 
 class ResolveLimiter:
     """Serialize yt-dlp resolves with a minimum interval between calls."""
 
     def __init__(self, min_interval: float = _MIN_RESOLVE_INTERVAL):
+        self._base_interval = float(min_interval)
         self._min_interval = float(min_interval)
         self._lock = threading.Lock()
         self._last = 0.0
+        self._throttle_index = 0
+
+    @property
+    def min_interval(self) -> float:
+        with self._lock:
+            return self._min_interval
 
     def wait(self) -> None:
         """Block until the minimum interval since the last resolve has passed."""
@@ -33,11 +45,50 @@ class ResolveLimiter:
                 time.sleep(remaining)
             self._last = time.monotonic()
 
+    def penalize(self) -> float:
+        """Slow down after a throttling failure; returns the new interval."""
+        with self._lock:
+            self._throttle_index = min(self._throttle_index + 1,
+                                       len(_THROTTLE_STEPS))
+            self._min_interval = _THROTTLE_STEPS[self._throttle_index - 1]
+            return self._min_interval
+
+    def note_success(self) -> float:
+        """Decay back toward the base interval after a successful resolve."""
+        with self._lock:
+            if self._throttle_index <= 0:
+                self._min_interval = self._base_interval
+                return self._min_interval
+            self._throttle_index -= 1
+            self._min_interval = (_THROTTLE_STEPS[self._throttle_index - 1]
+                                  if self._throttle_index > 0
+                                  else self._base_interval)
+            return self._min_interval
+
 
 def is_rate_limit_error(exc: Exception) -> bool:
     """Return whether an exception looks like a platform rate-limit / 412."""
     lowered = str(exc).lower()
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def is_bot_check_error(exc: Exception) -> bool:
+    """YouTube's "confirm you're not a bot" / unusual-traffic interstitial."""
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in _BOT_CHECK_MARKERS)
+
+
+def is_throttling_error(exc: Exception) -> bool:
+    """Either explicit rate limiting or a bot-check — both mean "slow down"."""
+    return is_rate_limit_error(exc) or is_bot_check_error(exc)
+
+
+def throttle_step(index: int) -> float:
+    """Cooldown for the Nth consecutive throttled resolve (0-based)."""
+    position = max(0, int(index))
+    if position >= len(_THROTTLE_STEPS):
+        return _THROTTLE_STEPS[-1]
+    return _THROTTLE_STEPS[position]
 
 
 def rate_limit_backoff(attempt_index: int) -> float:

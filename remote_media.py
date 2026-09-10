@@ -24,7 +24,19 @@ from remote_prefetch import (
     supports_hls_prefetch,
     supports_range_prefetch,
 )
-from progress import format_transfer_progress
+from progress import format_transfer_progress, format_hls_progress
+
+# "Preparing clips"（远程片段下载）阶段的看门狗参数：
+#   - progress_stall_timeout：out_time 连续这么久不前进即判定卡死并重试
+#     （正常的慢速 CDN 只要有数据前进就会重置计时器）。
+#   - heartbeat_interval：每这么久往日志打一条"仍在下载"的心跳。
+_SEGMENT_PROGRESS_STALL_TIMEOUT = 120.0
+_SEGMENT_HEARTBEAT_INTERVAL = 60.0
+# Audio Cache 的 FFmpeg 回落下载是"单文件、无续传"的：卡死判定后重试会从 0 重新
+# 下载整个 VOD，所以阈值放宽（无输出 30s 看门狗仍然生效，那是真·连接挂死）。
+_AUDIO_CACHE_FALLBACK_STALL_TIMEOUT = 300.0
+_PLATFORM_LABELS = {"youtube": "YouTube", "bilibili": "Bilibili",
+                    "bilibiliweb": "Bilibili", "twitch": "Twitch"}
 
 
 class RemoteMediaError(Exception):
@@ -599,7 +611,8 @@ def fetch_audio_cache(
         duration_value = None
     duration_label = f"{duration_value:g}s" if duration_value is not None else "unknown"
     last_error: Exception | None = None
-    platform_label = "YouTube" if source.platform == "youtube" else "Bilibili"
+    platform_label = _PLATFORM_LABELS.get(
+        str(source.platform or "").lower(), str(source.platform or "Remote"))
 
     if source.platform in {"youtube", "bilibili"} \
             and not supports_range_prefetch(source) \
@@ -738,10 +751,15 @@ def fetch_audio_cache(
         transport_path = Path(transport)
         try:
             report(f"Twitch HLS audio cache prefetch for {cache_label}")
+            if progress_callback is not None:
+                # 立刻切到当前源的进度卡（此前 Twitch 只在 FFmpeg 回落路径
+                # 才有字节监视，HLS 预取期间界面完全没有动静）。
+                progress_callback(format_hls_progress(0.0, duration_value, 0.0))
             with transport_path.open("wb") as handle:
                 for chunk in iter_hls_bytes(
                     source, concurrency=prefetch_concurrency, logger=log,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
+                    refresher=refresh_func,
                 ):
                     handle.write(chunk)
                 handle.flush()
@@ -783,6 +801,12 @@ def fetch_audio_cache(
             command = build_audio_cache_command(source, temporary_path)
             stop_monitor = threading.Event()
             monitor_started = time.monotonic()
+            # 已知源时长且是生产路径时，用 FFmpeg 自己的 -progress（out_time =
+            # 已写入媒体时间）报百分比/实时倍速/ETA：Twitch 没有 Content-Length，
+            # 字节监视只能显示 MB 与 MB/s，界面看起来"没有进度"。
+            use_media_progress = bool(
+                progress_callback is not None and run_func is None
+                and duration_value and duration_value > 0)
 
             def monitor_file():
                 while not stop_monitor.wait(0.75):
@@ -795,13 +819,29 @@ def fetch_audio_cache(
                     progress_callback(format_transfer_progress(
                         current_size, None, time.monotonic() - monitor_started))
 
-            monitor = threading.Thread(target=monitor_file, name="audio-cache-progress", daemon=True)
-            monitor.start()
+            monitor = None
+            if not use_media_progress:
+                monitor = threading.Thread(target=monitor_file,
+                                           name="audio-cache-progress", daemon=True)
+                monitor.start()
             try:
-                result = runner(command, timeout=effective_timeout, text=True)
+                if use_media_progress:
+                    def report_media_progress(current_seconds, total_seconds, elapsed):
+                        progress_callback(format_hls_progress(
+                            current_seconds, total_seconds or duration_value, elapsed))
+                    result = run_tracked_progress(
+                        command, duration=duration_value, timeout=effective_timeout,
+                        progress_callback=report_media_progress, stall_timeout=30,
+                        progress_stall_timeout=_AUDIO_CACHE_FALLBACK_STALL_TIMEOUT,
+                        heartbeat_label=f"{platform_label}:{source.source_id or '?'}",
+                        heartbeat_interval=_SEGMENT_HEARTBEAT_INTERVAL,
+                        heartbeat_verb="downloading")
+                else:
+                    result = runner(command, timeout=effective_timeout, text=True)
             finally:
                 stop_monitor.set()
-                monitor.join(timeout=1)
+                if monitor is not None:
+                    monitor.join(timeout=1)
             return_code = getattr(result, "returncode", 0)
             if return_code != 0:
                 detail = _sanitize_ffmpeg_detail(
@@ -1177,6 +1217,17 @@ def fetch_segment(
         return run_tracked_progress(
             command, duration=expected_duration, timeout=timeout,
             progress_callback=report, stall_timeout=stall_timeout,
+            # "Preparing clips"（materialize 下载）阶段的卡死：ffmpeg 仍在按
+            # 0.5s 打 progress、out_time 却不动时，原有"30s 无输出"看门狗永远
+            # 不触发，界面就停在 "Preparing clips: n/N · ETA 00:00"（测试者反馈）。
+            # 进度不前进超时就抛 ProgressStallTimeout（TimeoutExpired 子类，
+            # 走既有的 retry/refresh 阶梯）；同时每 60s 打一条心跳日志，
+            # 让"在慢跑"和"卡住"在日志里可区分。
+            progress_stall_timeout=_SEGMENT_PROGRESS_STALL_TIMEOUT,
+            heartbeat_label=(f"{source.platform or 'remote'}:"
+                             f"{source.source_id or '?'} {start:g}-{end:g}s"),
+            heartbeat_interval=_SEGMENT_HEARTBEAT_INTERVAL,
+            heartbeat_verb="fetching",
         )
     last_error: Exception | None = None
     refreshed = False
@@ -1518,6 +1569,52 @@ def _should_auto_use_cookies(url: str, exc: Exception) -> bool:
     if _is_bilibili_url(url) or _is_http_412_error(exc):
         return True
     return _looks_like_auth_required_error(exc)
+
+
+def classify_resolve_failure(exc: Exception) -> tuple[str, str]:
+    """Return (short_reason, actionable_hint) for a failed remote resolve.
+
+    测试者报的"YouTube sources failing to resolve constantly"有两类完全不同的
+    成因，日志里必须能一眼区分：
+      - 解析太多被限流/机器人验证（等一会儿/cookies/降速就能恢复）；
+      - yt-dlp 客户端被平台改坏（换新版包才能修，2026 年已发生两次：
+        android_vr 403、tv_downgraded "page needs to be reloaded"）。
+    """
+    detail = str(exc)
+    lowered = detail.lower()
+    from remote_rate import is_throttling_error
+    if "page needs to be reloaded" in lowered:
+        return ("youtube page-reload error (yt-dlp client regression)",
+                "Update AutoComper: this is fixed by the bundled yt-dlp "
+                "(the tester build must be the latest package).")
+    if is_throttling_error(exc):
+        return ("rate limited / bot check",
+                "AutoComper is slowing resolves down automatically; if it keeps "
+                "failing, wait 10-30 minutes, or configure browser cookies / a "
+                "cookies.txt in Remote Settings (signed-in requests get a much "
+                "higher quota).")
+    if _looks_like_auth_required_error(exc):
+        return ("sign-in required",
+                "Configure browser cookies or a cookies.txt file in Remote "
+                "Settings.")
+    for marker in ("unable to extract", "failed to extract any player response",
+                   "nsig extraction failed", "player response",
+                   "signature extraction failed"):
+        if marker in lowered:
+            return ("youtube extraction failed (yt-dlp may be outdated)",
+                    "Update AutoComper to the newest package; if it already is, "
+                    "this is a platform-side extractor break.")
+    if "timed out" in lowered or "timeout" in lowered:
+        return ("timed out",
+                "The network path to the platform is slow/unstable; retry or "
+                "use a different route.")
+    if "unavailable" in lowered or "private" in lowered or "removed" in lowered:
+        return ("unavailable",
+                "The video is private, removed, region-blocked or members-only.")
+    short = detail.strip().replace("\n", " ")
+    if len(short) > 90:
+        short = short[:87] + "..."
+    return (short or exc.__class__.__name__, "")
 
 
 def _classify_hydration_error(exc: Exception) -> str:

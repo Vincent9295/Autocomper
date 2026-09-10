@@ -129,6 +129,52 @@ def format_block_progress(current, total, elapsed, source_duration=None):
     }
 
 
+def format_hls_progress(current, total, elapsed, bytes_done=0):
+    """HLS/Twitch 预取进度：以"已取媒体秒数 / 媒体总秒数"为分母。
+
+    Twitch 的 audio cache 走 HLS 分片预取（`iter_hls_bytes`），没有
+    Content-Length 可用；分母取 m3u8 里 #EXTINF 累加出的媒体总时长，
+    这样 UI 才有真正的百分比/实时倍速/ETA（此前 total=None、elapsed=0，
+    界面永远停在 "Progress: -- / Speed: 0.00 MB/s / ETA: --"）。
+    """
+    current = max(0.0, float(current or 0))
+    elapsed = max(0.0, float(elapsed or 0))
+    total_value = None if total in (None, 0) else max(0.0, float(total))
+    speed = current / elapsed if elapsed > 0 else 0.0
+    percent = None
+    eta = None
+    if total_value and total_value > 0:
+        percent = min(100.0, current / total_value * 100)
+        if speed > 0:
+            eta = max(0.0, (total_value - current) / speed)
+    mb_s = (float(bytes_done or 0) / (1024 * 1024) / elapsed) if elapsed > 0 else 0.0
+    if total_value is not None:
+        current_line = (f"Fetched {_clock_text(current)} / "
+                        f"{_clock_text(total_value)}")
+    else:
+        current_line = f"Fetched {_clock_text(current)}"
+    speed_line = (f"Speed: {speed:.2f}x realtime ({mb_s:.2f} MB/s)"
+                  if speed > 0 else f"Speed: {mb_s:.2f} MB/s")
+    return {
+        "current": current,
+        "total": total_value,
+        "elapsed": elapsed,
+        "percent": percent,
+        "speed_mb_s": mb_s,
+        "eta_seconds": eta,
+        "realtime": speed or None,
+        "stage": "completed" if percent == 100 else "transferring",
+        "title": "Downloading remote audio",
+        "current_line": current_line,
+        "percent_line": f"Progress: {percent:.0f}%" if percent is not None
+                        else "Progress: --",
+        "speed_line": speed_line,
+        "eta_line": f"ETA: {_clock_text(eta)}" if eta is not None else "ETA: --",
+        "text": f"{current_line} | {speed_line}",
+        "phase": "downloading",
+    }
+
+
 def format_compile_progress(current, total, elapsed, stage="FFmpeg"):
     current = max(0.0, float(current or 0))
     total_value = max(0.0, float(total or 0))
