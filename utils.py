@@ -19,6 +19,25 @@ _ACTIVE_PROCS = set()
 _cancel_requested = False
 _cancel_lock = threading.Lock()
 
+# yt-dlp 的 Twitch extractor key 是 TwitchVod / TwitchStream / TwitchClips /
+# TwitchVideos（**永远不是裸的 "twitch"**），本项目自己生成的播放列表描述符用的
+# 是 "twitch-vods"；因此 `platform == "twitch"` 这类精确比较会把所有 Twitch
+# 专属分支变成死代码（实测 tester 的 Twitch VOD 解析结果 platform='twitchvod'，
+# 测试里却一律用 platform="twitch" 的假源，所以一直没暴露）。
+# 按前缀判断可同时覆盖 yt-dlp 现有/将来新增的 Twitch extractor 与本项目的描述符。
+_TWITCH_PLATFORM_PREFIX = "twitch"
+_YOUTUBE_PLATFORM_PREFIX = "youtube"
+
+
+def is_twitch_platform(platform) -> bool:
+    """True for every Twitch platform id yt-dlp or this app can produce."""
+    return str(platform or "").strip().lower().startswith(_TWITCH_PLATFORM_PREFIX)
+
+
+def is_youtube_platform(platform) -> bool:
+    """True for every YouTube platform id (``youtube``, ``youtube-uploads``…)."""
+    return str(platform or "").strip().lower().startswith(_YOUTUBE_PLATFORM_PREFIX)
+
 
 def request_cancel():
     """Set the cooperative cancellation flag; long-running loops stop spawning work."""
@@ -728,7 +747,11 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
         if max_quality in DOWNLOAD_QUALITY_OPTIONS and max_quality != DOWNLOAD_QUALITY_OPTIONS[0] else 'bestvideo+bestaudio/best'
 
     last_error = None
-    with open(os.devnull, 'w') as devnull:
+    # devnull 要显式 UTF-8：yt-dlp 的输出（含视频标题）会写进这个流，用本地
+    # 代码页（中文 Windows = GBK、西文 = cp1252）时，标题里只要有一个该代码页
+    # 编码不了的字符（cp1252 下的西里尔字母、任何平台的 emoji）就抛
+    # UnicodeEncodeError，把下载误报成失败。errors='replace' 保证永不炸。
+    with open(os.devnull, 'w', encoding='utf-8', errors='replace') as devnull:
         for cookie_source in _download_cookie_candidates(browser_cookies):
             ydl_opts = {
                 'outtmpl': f"{filename}.%(ext)s",
@@ -800,7 +823,9 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
 
     os.makedirs(output_location, exist_ok=True)
     last_error = None
-    with open(os.devnull, 'w') as devnull:
+    # 同 download_video：devnull 显式 UTF-8 + replace，标题含本地代码页编不了的
+    # 字符时不能让 yt-dlp 的输出把整个下载炸掉。
+    with open(os.devnull, 'w', encoding='utf-8', errors='replace') as devnull:
         for cookie_source in _download_cookie_candidates(browser_cookies):
             ydl_opts = {
                 'outtmpl': f"{filename}.%(ext)s",

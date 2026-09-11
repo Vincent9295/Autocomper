@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import shutil
 import time
 import tempfile
 import os
@@ -15,10 +16,12 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from utils import FFMPEG_PATH, run_tracked, run_tracked_progress
+from utils import (FFMPEG_PATH, run_tracked, run_tracked_progress,
+                   is_twitch_platform)
 from remote_prefetch import (
     SpeedMonitor,
     _probe_real_size,
+    _parse_hls_playlist,
     iter_hls_bytes,
     iter_range_bytes,
     supports_hls_prefetch,
@@ -37,6 +40,22 @@ _SEGMENT_HEARTBEAT_INTERVAL = 60.0
 _AUDIO_CACHE_FALLBACK_STALL_TIMEOUT = 300.0
 _PLATFORM_LABELS = {"youtube": "YouTube", "bilibili": "Bilibili",
                     "bilibiliweb": "Bilibili", "twitch": "Twitch"}
+
+
+def platform_display_name(platform) -> str:
+    """Human-readable platform name for logs/progress.
+
+    yt-dlp 报的 Twitch key 是 ``twitchvod`` / ``twitchstream`` / ``twitchclips``
+    等，本项目描述符还有 ``twitch-vods``：精确查表会让这些来源在日志/心跳里
+    显示成原始 key，所以按平台族兜底。
+    """
+    key = str(platform or "").strip()
+    label = _PLATFORM_LABELS.get(key.lower())
+    if label:
+        return label
+    if is_twitch_platform(key):
+        return "Twitch"
+    return key or "Remote"
 # 交付比请求短超过这个秒数就重取一次（最后一次尝试仍短则接受并记录）。
 # 以前静默接受：clip 被对齐裁到实际交付长度，结尾比 padding 预期早、切点生硬。
 _SHORT_SEGMENT_TOLERANCE = 0.3
@@ -77,6 +96,44 @@ class RemoteMediaError(Exception):
 
 class SourceResolveError(RemoteMediaError):
     """A single source could not be resolved."""
+
+
+class LiveBroadcastError(SourceResolveError):
+    """The URL points at an ongoing broadcast instead of a finished replay.
+
+    直播/正在进行的 HLS 只有一个几分钟的滑动窗口：检测能"找到片段"（音频按实时
+    读取），但 compile 阶段按绝对时间取片段时，窗口外的片段全部取不到——用户看到
+    的是"找到的片段全部抓取失败"。所以在解析阶段就明确拒绝，让批次跳过该源并给出
+    可操作提示，而不是先花几小时检测再全量失败。
+    """
+
+
+# 只把明确"正在进行中"的标记当作直播：yt-dlp 对回放给 was_live/post_live，
+# 对直播给 is_live。post_live（刚结束、回放仍在转码）不拒绝，只提示。
+_LIVE_STATUSES = {"is_live", "live"}
+
+
+def _live_flags(value) -> tuple[bool, bool]:
+    """Return (is_live, still_processing) from an info dict or MediaSource."""
+    metadata = getattr(value, "metadata", None)
+    if metadata is None:
+        metadata = value if isinstance(value, Mapping) else {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    status = str(metadata.get("live_status") or "").strip().lower()
+    is_live = metadata.get("is_live") is True or status in _LIVE_STATUSES
+    processing = status in {"post_live", "is_upcoming"}
+    return bool(is_live), bool(processing)
+
+
+def source_is_live(value) -> bool:
+    """Whether the resolved metadata describes an ongoing broadcast."""
+    return _live_flags(value)[0]
+
+
+def source_is_still_processing(value) -> bool:
+    """Whether the broadcast just ended / has not started (replay may be partial)."""
+    return _live_flags(value)[1]
 
 
 class SourceExpansionError(RemoteMediaError):
@@ -643,8 +700,7 @@ def fetch_audio_cache(
         duration_value = None
     duration_label = f"{duration_value:g}s" if duration_value is not None else "unknown"
     last_error: Exception | None = None
-    platform_label = _PLATFORM_LABELS.get(
-        str(source.platform or "").lower(), str(source.platform or "Remote"))
+    platform_label = platform_display_name(source.platform)
 
     if source.platform in {"youtube", "bilibili"} \
             and not supports_range_prefetch(source) \
@@ -777,7 +833,7 @@ def fetch_audio_cache(
             temporary_path.unlink(missing_ok=True)
             report(f"{platform_label} audio cache prefetch failed for {cache_label}; falling back to FFmpeg")
 
-    if source.platform == "twitch" and supports_hls_prefetch(source):
+    if is_twitch_platform(source.platform) and supports_hls_prefetch(source):
         fd, transport = tempfile.mkstemp(prefix=".remote-hls-", suffix=".ts", dir=str(destination.parent))
         os.close(fd)
         transport_path = Path(transport)
@@ -968,6 +1024,293 @@ def _segment_number(value: float, name: str) -> str:
     if number < 0:
         raise ValueError(f"{name} must not be negative")
     return format(number, ".12g")
+
+
+# ── fMP4 HLS（Twitch 新版切片）窗口抓取 ─────────────────────────────────────
+# Twitch 的一部分 VOD 用 fMP4 打包 HLS（playlist 带 #EXT-X-MAP 初始化段、分片是
+# .mp4）而不是老的 MPEG-TS。对这种 playlist，ffmpeg 的网络 seek 会退化：它打开
+# 正确分片后仍逐片顺序读取、几十秒内吐不出任何帧（实测 605s 处的 clip：60s 内
+# 输出 0 字节，而同一个分片单独下载只需 0.4s），于是每个 clip 都被 stall/超时
+# 看门狗判失败 → 用户看到"找到的片段全部抓取失败"，且原因落进汇总的
+# "other error" 桶（测试者 2026-09-11 的报告，VOD 2870466234）。
+# 对策：不信 ffmpeg 的网络 seek——自己按 playlist 的 EXTINF 定位分片，下载
+# init + 覆盖窗口的分片，先 copy remux 成本地 mp4，再按普通本地文件精确裁剪
+# （本地 -ss 不走 HLS demuxer 的 seek 路径）。窗口数学已逐像素验证：本地裁剪的
+# 帧序列与"直接从目标分片取参考帧"完全一致（0/276480 字节差异）。
+_HLS_SEGMENT_SUFFIXES = (".mp4", ".m4s", ".cmfv", ".cmfa", ".m4v")
+_HLS_PLAN_TTL = 300.0
+_HLS_SEGMENT_TIMEOUT = 60.0
+_hls_manifest_cache: dict[str, tuple[float, tuple]] = {}
+_hls_manifest_lock = threading.Lock()
+
+
+def _is_hls_manifest(url) -> bool:
+    return urlsplit(str(url or "")).path.lower().endswith((".m3u8", ".m3u"))
+
+
+def _segment_file_suffix(url) -> str:
+    suffix = Path(urlsplit(str(url or "")).path).suffix.lower()
+    return suffix if suffix in _HLS_SEGMENT_SUFFIXES else ".bin"
+
+
+def _http_read_bytes(url, headers, timeout=_HLS_SEGMENT_TIMEOUT) -> bytes:
+    request = Request(str(url), headers={str(k): str(v) for k, v in (headers or {}).items()})
+    with urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def hls_playlist_entries(playlist_url, headers=None, refresh=False):
+    """Parsed HLS playlist for a VOD: ([(url, media_seconds), ...], total).
+
+    Cached per URL for ``_HLS_PLAN_TTL`` seconds: a compile fetches many clips
+    from one source and the playlist itself is small.
+    """
+    key = str(playlist_url)
+    now = time.monotonic()
+    if not refresh:
+        with _hls_manifest_lock:
+            cached = _hls_manifest_cache.get(key)
+        if cached is not None and now - cached[0] <= _HLS_PLAN_TTL:
+            return cached[1]
+    manifest = _http_read_bytes(playlist_url, headers).decode("utf-8", "replace")
+    entries = _parse_hls_playlist(
+        manifest, str(playlist_url),
+        lambda url: _http_read_bytes(url, headers))
+    with _hls_manifest_lock:
+        if len(_hls_manifest_cache) >= 64:
+            _hls_manifest_cache.clear()
+        _hls_manifest_cache[key] = (now, entries)
+    return entries
+
+
+def hls_is_fragmented_mp4(entries) -> bool:
+    """Whether the playlist is fMP4 (init segment via #EXT-X-MAP / .mp4 parts)."""
+    if not entries:
+        return False
+    for url, seconds in entries:
+        if seconds <= 0:                     # #EXT-X-MAP init segment
+            return True
+        if _segment_file_suffix(url) in _HLS_SEGMENT_SUFFIXES:
+            return True
+    return False
+
+
+def plan_hls_window(entries, start, end):
+    """Segments needed for [start, end] (plus seek/read margins), or None.
+
+    Returns ``None`` for TS playlists (ffmpeg seeks those fine over the network)
+    and for windows that cannot be located.
+    """
+    if not hls_is_fragmented_mp4(entries):
+        return None
+    seek_start = max(0.0, float(start) - _REMOTE_SEEK_PAD)
+    window_end = float(end) + _REMOTE_READ_MARGIN
+    picked, offset = [], 0.0
+    for url, seconds in entries:
+        if seconds <= 0:
+            picked.append((url, offset, 0.0))       # init segment, no timeline
+            continue
+        if offset + seconds > seek_start and offset < window_end:
+            picked.append((url, offset, seconds))
+        offset += seconds
+    media = [item for item in picked if item[2] > 0.0]
+    if not media:
+        return None
+    first_offset = media[0][1]
+    inner = max(0.0, seek_start - first_offset)
+    return {
+        "entries": picked,
+        "first_offset": first_offset,
+        "inner_seek": inner,
+        # 窗口文件里第 0 秒对应的时间轴位置（本地裁剪的换算基准）
+        "window_start": first_offset + inner,
+        "media_total": offset,
+    }
+
+
+def hls_window_plan(playlist_url, headers, start, end):
+    """fMP4 window plan for a stream URL, or None when not applicable.
+
+    Any failure here (playlist unreadable, TS playlist, window not found) just
+    means "use the normal network command" — this must never turn a working
+    source into a failing one.
+    """
+    if not _is_hls_manifest(playlist_url):
+        return None
+    try:
+        entries, _total = hls_playlist_entries(playlist_url, headers)
+    except Exception:
+        return None
+    plan = plan_hls_window(entries, start, end)
+    if plan is not None:
+        plan["playlist_url"] = str(playlist_url)
+        plan["headers"] = {str(k): str(v) for k, v in (headers or {}).items()}
+    return plan
+
+
+class _HlsWindow:
+    """A local file holding the needed HLS segments, plus its cleanup.
+
+    ``file_start`` is the media time of the file's first frame (the playlist
+    offset of the first downloaded segment) and ``inner_seek`` the position
+    inside the file that corresponds to the requested read origin — the cut has
+    to be expressed relative to those two, not to the clip start.
+    """
+
+    def __init__(self, path: Path, temp_dir: Path, file_start: float,
+                 inner_seek: float, seconds: float):
+        self.path = Path(path)
+        self.temp_dir = Path(temp_dir)
+        self.file_start = float(file_start)
+        self.inner_seek = float(inner_seek)
+        self.seconds = float(seconds)
+
+    @property
+    def read_origin(self) -> float:
+        """Media time of the frame the local seek lands on."""
+        return self.file_start + self.inner_seek
+
+    def cleanup(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+
+def materialize_hls_window(plan, work_dir, timeout=_HLS_SEGMENT_TIMEOUT,
+                           runner=None, retries=1):
+    """Download a window's segments and remux them into one local MP4.
+
+    Raises SegmentFetchError on failure: at this point we know the source is
+    fMP4, where the network-seek command cannot work, so the caller's existing
+    retry/refresh ladder is the right response (falling back would burn a stall
+    watchdog timeout for nothing).
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".remote-hls-window-", dir=str(work_dir)))
+    headers = dict(plan.get("headers") or {})
+    try:
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:10",
+                 "#EXT-X-PLAYLIST-TYPE:VOD"]
+        seconds_total = 0.0
+        for index, (url, _offset, seconds) in enumerate(plan["entries"]):
+            name = f"s{index:05d}{_segment_file_suffix(url)}"
+            last_error = None
+            for attempt in range(max(1, int(retries) + 1)):
+                try:
+                    data = _http_read_bytes(url, headers, timeout=timeout)
+                    if not data:
+                        raise SegmentFetchError(f"empty HLS segment: {url}")
+                    (temp_dir / name).write_bytes(data)
+                    last_error = None
+                    break
+                except Exception as exc:                            # noqa: BLE001
+                    last_error = exc
+                    if attempt < int(retries):
+                        time.sleep(min(2 ** attempt, 4))
+            if last_error is not None:
+                raise SegmentFetchError(
+                    f"Could not download HLS segment {name}: {last_error}")
+            if seconds <= 0:
+                lines.append(f'#EXT-X-MAP:URI="{name}"')
+            else:
+                lines.append(f"#EXTINF:{seconds:.3f},")
+                lines.append(name)
+                seconds_total += seconds
+        lines.append("#EXT-X-ENDLIST")
+        playlist_path = temp_dir / "window.m3u8"
+        playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        window_file = temp_dir / "window.mp4"
+        command = [
+            str(FFMPEG_PATH), "-y", "-hide_banner", "-loglevel", "error",
+            "-allowed_extensions", "ALL",
+            "-i", str(playlist_path),
+            "-c", "copy", "-movflags", "+faststart",
+            str(window_file),
+        ]
+        result = (runner or run_tracked)(command, timeout=timeout, text=True)
+        return_code = getattr(result, "returncode", 0)
+        if return_code != 0 or not window_file.is_file() or window_file.stat().st_size == 0:
+            detail = _sanitize_ffmpeg_detail(
+                getattr(result, "stderr", "") or getattr(result, "stdout", "")
+                or "no output")
+            raise SegmentFetchError(
+                f"Could not assemble the HLS window (rc={return_code}): {detail}")
+        return _HlsWindow(window_file, temp_dir, plan["first_offset"],
+                          plan["inner_seek"], seconds_total)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def build_local_window_command(window_file, file_start, inner_seek, start, end,
+                               output_file, audio_only=False, codec=None,
+                               has_audio=True):
+    """Cut [start, end] out of a local window file (exact local seek).
+
+    ``file_start`` is the media time of the window file's first frame and
+    ``inner_seek`` the file-relative position to seek to (the plan's read
+    origin). The trim window is then expressed relative to that origin, which is
+    what makes the cut land exactly on [start, end].
+
+    Output options mirror ``build_segment_command`` so the produced clip is
+    interchangeable with the network path's result.
+    """
+    start_value, end_value = float(start), float(end)
+    if end_value <= start_value or start_value < 0:
+        raise ValueError("segment end must be greater than a non-negative start")
+    duration = end_value - start_value
+    inner = max(0.0, float(inner_seek))
+    origin = float(file_start) + inner
+    trim_start = max(0.0, start_value - origin)
+    trim_end = trim_start + duration
+    read_span = trim_end + _REMOTE_READ_MARGIN
+    command = [
+        str(FFMPEG_PATH), "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", _segment_number(inner, "window seek"),
+        "-t", _segment_number(read_span, "window read span"),
+        "-i", str(window_file),
+    ]
+    trim_start_text = _segment_number(trim_start, "trim start")
+    trim_end_text = _segment_number(trim_end, "trim end")
+    if audio_only:
+        command.extend([
+            "-af",
+            f"asetpts=PTS-STARTPTS,atrim=start={trim_start_text}:end={trim_end_text},"
+            "asetpts=PTS-STARTPTS",
+        ])
+    else:
+        command.extend([
+            "-vf",
+            f"setpts=PTS-STARTPTS,trim=start={trim_start_text}:end={trim_end_text},"
+            "setpts=PTS-STARTPTS",
+        ])
+        if has_audio:
+            command.extend([
+                "-af",
+                f"asetpts=PTS-STARTPTS,atrim=start={trim_start_text}:end={trim_end_text},"
+                "asetpts=PTS-STARTPTS",
+            ])
+    command.extend(["-t", _segment_number(duration, "duration")])
+    if audio_only:
+        command.append("-vn")
+        if codec:
+            command.extend(["-c:a", str(codec)])
+    else:
+        command.extend(["-map", "0:v:0"])
+        if has_audio:
+            command.extend(["-map", "0:a:0", "-c:a", "aac", "-shortest"])
+        else:
+            command.extend(["-map", "0:a:0?"])
+        if codec:
+            command.extend(["-c:v", str(codec)])
+    command.extend([
+        "-avoid_negative_ts", "make_zero",
+        "-reset_timestamps", "1",
+    ])
+    if Path(output_file).suffix.lower() in {".mp4", ".m4a", ".mov"}:
+        command.extend(["-movflags", "+faststart"])
+    command.append(str(output_file))
+    return command
 
 
 def build_segment_command(
@@ -1286,15 +1629,54 @@ def fetch_segment(
                 f"{max_total_duration:g}s budget; giving up on this clip "
                 f"(the VOD stream for this interval may be unavailable).")
         try:
-            command = build_segment_command(
-                source,
-                max(0.0, float(start) - float(padding_before)),
-                float(end) + float(padding_after),
-                temporary_path,
-                audio_only=audio_only,
-                codec=codec,
-            )
-            result = run_command(command)
+            fetch_start = max(0.0, float(start) - float(padding_before))
+            fetch_end = float(end) + float(padding_after)
+            # fMP4 HLS（Twitch 新版切片）：ffmpeg 的网络 seek 在这种 playlist 上
+            # 会退化成逐片顺序读取、吐不出帧，所以改成"下载窗口分片 + 本地裁剪"。
+            # 任何准备阶段的失败都退回原来的网络命令（不能把本来能用的源搞坏）。
+            hls_window = None
+            if run_func is None:
+                embedded_audio = source_has_embedded_audio(source)
+                if audio_only:
+                    window_url = source.audio_url
+                    window_headers = source.audio_headers or source.http_headers
+                    window_has_audio = True
+                elif source.video_url and (embedded_audio or not source.audio_url):
+                    # 分片窗口只覆盖一个 playlist：音视频分开的源（视频轨无音轨 +
+                    # 独立 audio_url）继续走网络命令，避免窗口里没有音轨。
+                    window_url = source.video_url
+                    window_headers = source.video_headers or source.http_headers
+                    window_has_audio = embedded_audio
+                else:
+                    window_url = ""
+                    window_headers = {}
+                    window_has_audio = False
+                if window_url:
+                    plan = hls_window_plan(window_url, window_headers, fetch_start, fetch_end)
+                    if plan is not None:
+                        hls_window = materialize_hls_window(
+                            plan, Path(temporary_path).parent, timeout=timeout)
+            try:
+                if hls_window is not None:
+                    command = build_local_window_command(
+                        hls_window.path, hls_window.file_start, hls_window.inner_seek,
+                        fetch_start, fetch_end, temporary_path,
+                        audio_only=audio_only, codec=codec,
+                        has_audio=window_has_audio,
+                    )
+                else:
+                    command = build_segment_command(
+                        source,
+                        fetch_start,
+                        fetch_end,
+                        temporary_path,
+                        audio_only=audio_only,
+                        codec=codec,
+                    )
+                result = run_command(command)
+            finally:
+                if hls_window is not None:
+                    hls_window.cleanup()
             return_code = getattr(result, "returncode", 0)
             if return_code != 0:
                 raw_detail = (getattr(result, "stderr", "")
@@ -1652,6 +2034,13 @@ def classify_resolve_failure(exc: Exception) -> tuple[str, str]:
     detail = str(exc)
     lowered = detail.lower()
     from remote_rate import is_throttling_error
+    if isinstance(exc, LiveBroadcastError):
+        return ("live broadcast (no replay yet)",
+                "A live playlist only keeps the last few minutes, so clips found "
+                "now could not be fetched later - AutoComper skipped this source "
+                "instead of losing every clip. Wait until the stream ends and the "
+                "replay is processed, then use the replay URL "
+                "(e.g. twitch.tv/videos/<id>).")
     if "page needs to be reloaded" in lowered:
         return ("youtube page-reload error (yt-dlp client regression)",
                 "Update AutoComper: this is fixed by the bundled yt-dlp "
@@ -2180,7 +2569,7 @@ def _descriptor_from_info(
                 entry.webpage_url, ydl_factory, browser_cookies, extract_flat=False,
                 resolve_timeout=resolve_timeout
             )
-    elif platform.startswith("youtube") or platform in {"twitch", "twitch-vods"}:
+    elif platform.startswith("youtube") or is_twitch_platform(platform):
         def hydrate_entry(entry: PlaylistEntry) -> Mapping[str, Any] | None:
             if entry.title != "Unknown" and entry.duration is not None and entry.upload_date:
                 return None
@@ -2265,6 +2654,14 @@ def normalize_youtube_playlist_url(url: str) -> str:
 def _source_from_info(url: str, info: Mapping[str, Any], max_height: int | None = None) -> MediaSource:
     if info.get("_type") in ("playlist", "multi_video"):
         raise SourceResolveError(f"Source is a playlist, not a single VOD: {url}")
+    if source_is_live(info):
+        # 直播中：HLS 只有几分钟滑动窗口，检测完再取片段必然大面积失败。
+        # 这里直接拒绝（批次会跳过该源并给出提示），而不是花几小时检测。
+        raise LiveBroadcastError(
+            f"{url} is still live, not a finished replay. A live playlist only "
+            "keeps the last few minutes, so clips detected now cannot be fetched "
+            "afterwards. Wait until the stream ends and the replay is processed, "
+            "then process the replay URL (e.g. twitch.tv/videos/<id>).")
 
     platform = str(info.get("extractor_key") or info.get("extractor") or "unknown").lower()
     source_url = str(info.get("webpage_url") or info.get("original_url") or url)

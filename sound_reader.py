@@ -14,7 +14,8 @@ import onnxruntime as ort
 from typing import Generator, Any, Dict, Tuple
 from collections import OrderedDict
 
-from utils import FFMPEG_PATH, run_tracked, register_proc, unregister_proc
+from utils import (FFMPEG_PATH, run_tracked, register_proc, unregister_proc,
+                   is_twitch_platform)
 from proglog import default_bar_logger
 from remote_media import MediaSource, stable_source_id
 from remote_prefetch import (
@@ -246,9 +247,10 @@ def load_audio(file: str | MediaSource, sr: int, frame_count: int,
                 select_candidate_func
             )
             return
-    if isinstance(file, MediaSource) and str(file.platform).lower() == "twitch":
-        # Twitch HLS 签名/片段 URL 也会过期：给裸的 _load_audio_direct 补上
-        # 停滞超时 + refresh 重试，避免静默卡死。
+    if isinstance(file, MediaSource) and is_twitch_platform(file.platform):
+        # Twitch（含 yt-dlp 的 twitchvod/twitchstream 等 key）HLS 签名/片段 URL
+        # 也会过期：给裸的 _load_audio_direct 补上停滞超时 + refresh 重试，
+        # 避免静默卡死。平台判断必须用平台族：yt-dlp 不返回裸的 "twitch"。
         # 只用于重试次数缩放，直接用元数据时长，避免额外的 ffmpeg 探测。
         duration = file.duration if file.duration is not None else None
         yield from _load_audio_twitch_retry(

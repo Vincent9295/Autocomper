@@ -9,6 +9,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from progress import format_transfer_progress, format_hls_progress
+from utils import is_twitch_platform
 
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
@@ -79,9 +80,15 @@ def supports_range_prefetch(source):
 
 
 def supports_hls_prefetch(source):
+    """Twitch HLS prefetch eligibility.
+
+    用平台族判断（``twitchvod``/``twitchstream``/``twitchclips``…）而不是裸平台名
+    相等比较：yt-dlp 从不返回裸的 ``twitch``，精确比较会让 Twitch 的 HLS 分片
+    预取（含签名 URL 刷新与媒体秒进度）永远不生效。
+    """
     platform = str(getattr(source, "platform", "")).lower()
     url = str(getattr(source, "audio_url", ""))
-    return platform == "twitch" and url.startswith(("http://", "https://"))
+    return is_twitch_platform(platform) and url.startswith(("http://", "https://"))
 
 
 def _default_request(url, start, end, headers, timeout):

@@ -258,6 +258,10 @@ AutoComper mitigates transient failures by retrying remote chunks, monitoring th
 
 Active live streams, DRM-protected media, and every private or region-restricted source are not guaranteed to work.
 
+**Live broadcasts are refused on purpose.** A live HLS playlist only keeps the last few minutes of history, so clips detected while a stream is running cannot be fetched afterwards — the run would spend hours detecting and then lose every clip. When a URL resolves to an ongoing broadcast, AutoComper skips that source with `live broadcast (no replay yet)` and tells you to wait for the stream to end and use the replay URL (`twitch.tv/videos/<id>`, `youtube.com/watch?v=…`). If a stream *just* ended, the log adds a note that the replay may still be processing, so clips near the end can fail until it finishes.
+
+**Twitch's newer fMP4 VOD packaging is fetched segment by segment.** Some newly recorded Twitch VODs use fMP4 HLS (`#EXT-X-MAP` init segment, `.mp4` parts) instead of MPEG-TS. FFmpeg cannot seek those playlists over the network (it opens the right segment and then keeps reading without producing a frame), so AutoComper locates the needed segments from the playlist itself, downloads the init segment plus the covering parts, and cuts the clip from a local copy. TS-packaged VODs keep the previous direct path, and when the playlist cannot be read the old command is used unchanged.
+
 ### Re-verify Details
 
 Re-verify uses DRC (Dynamic Range Compression) to boost quiet sounds near detected clips. Key behaviors:

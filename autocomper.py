@@ -70,6 +70,7 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            PlaylistDescriptor, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
                            stable_source_id, SourceResolveError,
+                           LiveBroadcastError,
                            apply_video_quality_limit,
                            resolve_cached_audio,
                            source_from_hydrated_entry,
@@ -79,6 +80,8 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            classify_resolve_failure,
                            reset_short_delivery_records,
                            short_delivery_records,
+                           source_is_still_processing,
+                           platform_display_name,
                            _audio_cache_format_identity)
 from remote_cache import CacheStore
 from remote_rate import (LimitedRefresher, ResolveLimiter, is_throttling_error,
@@ -91,7 +94,8 @@ from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
                      run_tracked_progress, check_compile_disk_space,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
-                     unique_download_stem, yt_dlp_version)
+                     unique_download_stem, yt_dlp_version,
+                     is_twitch_platform, is_youtube_platform)
 
 # timestamps .txt 里"看起来像本地媒体文件"的标题判据（视频 + 音频都算）。
 _TIMESTAMPS_MEDIA_SUFFIXES = VIDEO_SUFFIXES | AUDIO_SUFFIXES
@@ -1083,6 +1087,10 @@ def resolve_remote_uploads(
                         source = resolver(source_url, browser_cookies=browser_cookies)
                     last_exc = None
                     break
+                except LiveBroadcastError:
+                    # 确定性失败：直播中的地址重试 3 次只会白等 ~6s。直接交给
+                    # 上层的失败分类（会打印 "live broadcast (no replay yet)"）。
+                    raise
                 except Exception as exc:
                     last_exc = exc
             if last_exc is not None:
@@ -1098,6 +1106,13 @@ def resolve_remote_uploads(
         failures.pop(id(upload), None)
         if limiter is not None:
             limiter.note_success()
+        if source_is_still_processing(source) and logger is not None:
+            # 刚结束（post_live，回放仍在转码）/ 尚未开播：回放可能还没生成完整
+            # 画面，尾部 clip 会取不到。提前告知，别让它看起来像随机故障。
+            logger(
+                f"{Fore.YELLOW}Note: {get_source_display_name(source)} just ended - "
+                f"the replay may still be processing, so clips near the end can "
+                f"fail to fetch. Re-run later if that happens.{Style.RESET_ALL}")
 
     for upload in uploaded_videos:
         if not upload.get_is_url():
@@ -1836,6 +1851,14 @@ def _summarize_remote_failures(failures, max_examples=3):
         elif ("beyond the available video stream" in lowered
               or "no footage" in lowered):
             cause = "detection beyond video end (recording's video track ended early)"
+        elif any(marker in lowered for marker in (
+                "no data from ffmpeg", "kept failing for", "made no progress",
+                "timed out", "unreadable segment", "truncated segment",
+                "could not download hls segment", "could not assemble the hls window",
+                "empty hls segment")):
+            # 这一类以前全落进 "other error"：测试者只能看到一句无从下手的
+            # "other error"（实例：fMP4 HLS 的网络 seek 退化 = 一直吐不出帧）。
+            cause = "clip fetch stalled / no usable data delivered"
         else:
             cause = "other error"
         counts[cause] = counts.get(cause, 0) + 1
@@ -4667,8 +4690,12 @@ class VideoProcessorApp:
         def hydrate_page_entry(entry, render_page_index, render_generation, visible_ids):
             try:
                 # 只节流全量提取平台（YouTube/Twitch 的 bot-check 风险）；
-                # Bilibili 走轻量 view API，串行节流会白白拖慢大页
-                if str(getattr(entry, "platform", "")).lower() in {"youtube", "twitch"}:
+                # Bilibili 走轻量 view API，串行节流会白白拖慢大页。
+                # 必须按平台族判断：描述符平台是 "youtube-uploads" /
+                # "twitch-vods"，精确比较 {"youtube","twitch"} 会让这两个平台的
+                # 播放列表 hydration 完全不节流（正是"翻页→批量提取→被限流"的成因）。
+                if (is_youtube_platform(getattr(entry, "platform", ""))
+                        or is_twitch_platform(getattr(entry, "platform", ""))):
                     hydration_limiter.wait()
                 descriptor.hydrate_entry(entry)
             finally:
