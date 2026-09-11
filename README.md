@@ -150,6 +150,19 @@ A compiled video can be shorter than the sum of the clips you selected for two r
 
 The `timestamps.txt` files themselves always keep the detected (unpadded) times, so re-running from a saved file reproduces the same clips.
 
+#### Clips Whose Content Comes Back Shifted
+
+A clip can have exactly the requested length and still hold the *wrong* moment: the fetched window comes back a fraction of a second to a couple of seconds off, so the start of the moment is missing and the tail runs past it (this reads as "the clip stops too early", and padding cannot fix it). Two causes have been measured on real VODs:
+
+- a video rendition whose seek misplaces a window (seen on Twitch's fMP4 VODs: the same position on the audio-only rendition is exact while the video rendition lands ~0.6s late, and nudging the request inside that zone does not help);
+- a cached detection audio that drifted from the live stream (seen on Bilibili in **Audio Cache** mode: the cache and the stream are several seconds apart, so the timestamps are right in the cache and early on the stream).
+
+AutoComper now verifies every fetched clip against the timeline the timestamps were detected on (the cached audio in **Audio Cache** mode, the live audio-only stream in **Remote Stream** mode) by correlating the clip's audio with that reference. Anything off by more than 0.15s is repaired while fetching: the interval is re-requested at the measured offset, and if that does not land it is re-fetched with a pre-roll and cut locally at the measured position. The repair result is verified again before it is kept. Segment cache entries are re-checked too, so clips you cached with an older build are corrected on the next run instead of being reused forever.
+
+The log reports what happened: `N clip(s) came back at the wrong content position (up to X.XXs off the detected moment) and were re-aligned while fetching (remaining offset <= Y.YYs).` If a clip cannot be repaired it is kept as fetched, with a summary line naming the affected sources. Verification is skipped for previews, for sources with no audio to compare against, and for passages that are too quiet or too repetitive to measure reliably, in which case clips are used exactly as fetched (an aggregate line tells you how many).
+
+If your **Audio Cache** audio and the stream disagree, the log also says so once per cached file, with the measured offset: `Cached audio for <source> disagrees with the live stream by up to X.XXs (worst at Ymin, N position(s) checked).` Clips are still re-aligned individually, so this is informational — if your exported timestamps look shifted when you check them against the VOD, delete that cached file so it is downloaded again. The check runs once per cached file (its result is stored in the cache metadata) and costs no requests afterwards unless the file changes.
+
 #### When Resolving Is Rate Limited
 
 Resolving a large list of URLs (a whole channel or playlist) can hit the platform's quota. AutoComper detects this class of failure, spaces out the remaining resolves, and then asks whether to wait:
@@ -248,6 +261,8 @@ Remote speed depends on more than the local internet connection. Common causes i
 - a platform selecting a slower audio CDN or format.
 
 AutoComper mitigates transient failures by retrying remote chunks, monitoring throughput, refreshing signed URLs when sustained speed drops, resuming Audio Cache downloads from the completed byte offset, and retrying Bilibili Remote Stream blocks independently. These measures cannot remove a persistent ISP/CDN speed cap. If a source remains slow, try another network route, disable or change the VPN, use **Audio Cache** so later runs do not redownload audio, or use **Full Download**.
+
+During **Preparing clips**, a clip that makes no progress for 30 seconds prints a heartbeat line plus a short hint explaining that this is normally caused by **Max Download Concurrency** being too high for the connection or by an unstable network path, and that the clip is retried automatically. The hint appears at most once per clip, and a download that keeps making progress never prints it. Each clip's failure timeout is also sized from its own expected size (between 2 and 10 minutes) instead of a flat 10 minutes, so a short clip stuck on a dead connection is abandoned quickly while a long clip on a slow but working line is still allowed to finish.
 
 #### Cookies, GPU, and Network Responsibilities
 

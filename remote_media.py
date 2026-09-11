@@ -32,9 +32,27 @@ from progress import format_transfer_progress, format_hls_progress
 # "Preparing clips"（远程片段下载）阶段的看门狗参数：
 #   - progress_stall_timeout：out_time 连续这么久不前进即判定卡死并重试
 #     （正常的慢速 CDN 只要有数据前进就会重置计时器）。
-#   - heartbeat_interval：每这么久往日志打一条"仍在下载"的心跳。
+#   - heartbeat：只在"确实卡了"（进度停滞 ≥30s）时每 30s 打一条，并附一条
+#     成因提示。以前每 60s 无条件打一条，慢线路下满屏都是心跳；现在正常的
+#     （哪怕偏慢但有前进的）下载完全不刷日志。
 _SEGMENT_PROGRESS_STALL_TIMEOUT = 120.0
-_SEGMENT_HEARTBEAT_INTERVAL = 60.0
+_SEGMENT_HEARTBEAT_INTERVAL = 30.0
+_SEGMENT_HEARTBEAT_STALL_THRESHOLD = 30.0
+_SEGMENT_HEARTBEAT_HINT = (
+    "Note: a clip fetch this slow is usually caused by Max Download Concurrency "
+    "being too high for your connection, or by an unstable network path to the CDN. "
+    "Lowering Max Download Concurrency in Remote Settings (or waiting for a stable "
+    "network) normally fixes it. The clip is retried automatically, the run is not "
+    "frozen.")
+# 单次取片段的超时不再一律 600s：按"这个 clip 预计要下多少字节"算，5 秒的
+# clip 不该独占 10 分钟。下限保证慢但稳定的线路仍能跑完（约 0.15 MB/s ≈
+# 1.2 Mbit/s 的持续吞吐就来得及），上限维持原来的 600s。
+_SEGMENT_TIMEOUT_FLOOR = 120.0
+_SEGMENT_TIMEOUT_CAP = 600.0
+_SEGMENT_MIN_THROUGHPUT = 0.15 * 1024 * 1024          # bytes/second
+# 与 utils.check_compile_disk_space 同一套码率估算（每秒钟媒体约多少字节）。
+_QUALITY_BYTES_PER_SECOND = ((480, 200 * 1024), (720, 350 * 1024), (1080, 500 * 1024))
+_DEFAULT_BYTES_PER_SECOND = 500 * 1024
 # Audio Cache 的 FFmpeg 回落下载是"单文件、无续传"的：卡死判定后重试会从 0 重新
 # 下载整个 VOD，所以阈值放宽（无输出 30s 看门狗仍然生效，那是真·连接挂死）。
 _AUDIO_CACHE_FALLBACK_STALL_TIMEOUT = 300.0
@@ -1175,14 +1193,20 @@ class _HlsWindow:
 
 
 def materialize_hls_window(plan, work_dir, timeout=_HLS_SEGMENT_TIMEOUT,
-                           runner=None, retries=1):
+                           runner=None, retries=1, remux_timeout=None):
     """Download a window's segments and remux them into one local MP4.
+
+    ``timeout`` bounds ONE segment read (a segment is a few MB, 60s is generous
+    even on a slow line); ``remux_timeout`` bounds the local remux that assembles
+    them, which is proportional to the whole window, so callers pass the clip's
+    adaptive budget instead of the flat 60s.
 
     Raises SegmentFetchError on failure: at this point we know the source is
     fMP4, where the network-seek command cannot work, so the caller's existing
     retry/refresh ladder is the right response (falling back would burn a stall
     watchdog timeout for nothing).
     """
+    remux_timeout = timeout if remux_timeout is None else float(remux_timeout)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=".remote-hls-window-", dir=str(work_dir)))
@@ -1227,7 +1251,7 @@ def materialize_hls_window(plan, work_dir, timeout=_HLS_SEGMENT_TIMEOUT,
             "-c", "copy", "-movflags", "+faststart",
             str(window_file),
         ]
-        result = (runner or run_tracked)(command, timeout=timeout, text=True)
+        result = (runner or run_tracked)(command, timeout=remux_timeout, text=True)
         return_code = getattr(result, "returncode", 0)
         if return_code != 0 or not window_file.is_file() or window_file.stat().st_size == 0:
             detail = _sanitize_ffmpeg_detail(
@@ -1530,6 +1554,801 @@ def _rotate_video_candidate(source: MediaSource) -> bool:
     return False
 
 
+# ═══ 片段落点校验（placement verification）═══════════════════════════════════
+# 取回的区间不一定是请求的区间。"内容整体挪了、时长却完全正确"是同一类故障：
+#   * Twitch（fMP4 HLS 视频轨，VOD 2840821927 @15501.40s）：窗口里的内容比请求
+#     位置晚 0.61s，而同一位置的 audio-only 轨是准的（+0.01s）。同一 VOD 在
+#     15493.40/15503.40 却完全准确——说明是"某个请求位置刚好落进坏区间"
+#     （playlist 段偏移与段内媒体时间戳不一致），不是整条流的固定偏移。
+#   * Bilibili Audio Cache（BV1NG4y1r7nK）：缓存的检测音频与线上流整体差
+#     3.25s，时间戳在缓存里是对的，落到流上就早了 3.25s（与请求位置无关）。
+# 用户看到的就是"clip 太早停/开头被吃掉"。这类问题只能在内容层面测：把 clip
+# 开头的音频与"检测时间轴"做逐延迟归一化互相关，量出真实落点偏移 δ 再修。
+#   1. |δ| ≤ 容差 → 不动（绝大多数 clip，只多两次本地解码）。
+#   2. 按 start−δ 重取（Bilibili 这类整体偏移，实测一次就落到目标上）。
+#   3. 仍不准 → 带 pre-roll 重取，按量出来的偏移在本地裁（Twitch 这类"请求
+#      位置落进坏区间"的情况，实测 pre-roll 后 δ=-0.02s，裁出来 δ=-0.00s）。
+# 修不动就保留原片段并记录（可见性优先），校验本身的任何异常都不让 clip 失败。
+_PLACEMENT_SR = 8000                # 互相关采样率
+_PLACEMENT_TOLERANCE = 0.15         # |δ| ≤ 该值视为对齐（≈2 帧 @60fps 余量）
+_PLACEMENT_PROBE_SECONDS = 4.0
+_PLACEMENT_MAX_LAG = 8.0            # 在"意图位置 ± 该值"范围内找峰值
+_PLACEMENT_STABLE_SPREAD = 0.25     # 头/尾两次测量的最大分歧（超过即视为内部错乱）
+_PLACEMENT_PREROLL = 8.0            # 修复用 pre-roll / post-roll
+_PLACEMENT_MAX_SPAN = 180.0         # 参与测量的最大跨度（超长合并 clip 不必整段进 FFT）
+_PLACEMENT_MIN_CORRELATION = 0.5    # 峰值质量门槛：低于它不修（宁可不动）
+_PLACEMENT_PEAK_MARGIN = 0.92       # 最佳峰须明显高于次佳峰（挖掉 ±0.5s 后的）
+_PLACEMENT_MIN_LEVEL = 40.0         # int16 RMS 下限：静音区间测不了
+_PLACEMENT_CACHE_SPREAD = 1.5       # 缓存抽查：两个采样点允许的最大偏移分歧
+_PLACEMENT_CACHE_KEY = "cache_placement"   # 缓存 sidecar 里的抽查结果字段
+_CACHE_START_TOLERANCE = 0.05       # 片段缓存命中：起点允许的偏差
+_PLACEMENT_DECODE_TIMEOUT = 120.0
+_placement_records: list[dict[str, Any]] = []
+_placement_lock = threading.Lock()
+
+
+def reset_placement_records() -> None:
+    """Clear the per-run placement log (called before materialize)."""
+    with _placement_lock:
+        _placement_records.clear()
+
+
+def placement_records() -> list[dict[str, Any]]:
+    """Per-clip placement measurements taken while fetching remote segments."""
+    with _placement_lock:
+        return list(_placement_records)
+
+
+def _record_placement(record: dict[str, Any]) -> None:
+    with _placement_lock:
+        _placement_records.append(record)
+
+
+def _placement_numpy():
+    """numpy 是打包依赖，但只在真正做落点校验时才需要（惰性导入）。"""
+    try:
+        import numpy
+    except Exception:                                    # pragma: no cover - 环境问题
+        return None
+    return numpy
+
+
+def _placement_source_label(source) -> str:
+    return f"{getattr(source, 'platform', None) or 'remote'}:" \
+           f"{getattr(source, 'source_id', None) or '?'}"
+
+
+def _cached_reference_path(source, cache_store) -> Path | None:
+    """The cached detection audio for ``source`` when it is already on disk."""
+    if cache_store is None:
+        return None
+    try:
+        cached = resolve_cached_audio(source, cache_store)
+    except Exception:                                    # noqa: BLE001
+        return None
+    if cached is None:
+        return None
+    path = Path(cached)
+    return path if path.is_file() else None
+
+
+def _decode_placement_pcm(path, start=None, duration=None):
+    """Decode a window of a local file to mono int16 samples (None on failure).
+
+    Uses a plain ``subprocess.run`` (like ``compile._decode_audio_region``): this
+    is a short local decode that runs two or three times per clip, and
+    ``run_tracked``'s watchdog polling costs ~0.3s per call — measurable at this
+    frequency. Cancellation stays responsive because the network fetches and the
+    repair cut (the long steps) all go through the tracked runners.
+    """
+    numpy = _placement_numpy()
+    if numpy is None:
+        return None
+    command = [str(FFMPEG_PATH), "-v", "error"]
+    if start is not None:
+        command += ["-ss", f"{max(0.0, float(start)):.3f}"]
+    if duration is not None:
+        command += ["-t", f"{max(0.05, float(duration)):.3f}"]
+    command += ["-i", str(path), "-vn", "-map", "0:a:0?", "-ac", "1",
+                "-ar", str(int(_PLACEMENT_SR)), "-f", "s16le", "-"]
+    try:
+        result = subprocess.run(command, capture_output=True,
+                                timeout=_PLACEMENT_DECODE_TIMEOUT,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:                                    # noqa: BLE001
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    samples = numpy.frombuffer(result.stdout, dtype=numpy.int16).astype(numpy.float64)
+    return samples if len(samples) else None
+
+
+def _placement_level(samples) -> float:
+    if samples is None or len(samples) == 0:
+        return 0.0
+    return math.sqrt(float((samples * samples).mean()))
+
+
+def _placement_span(duration) -> float:
+    """How much of the clip is measured.
+
+    A merged/very long clip does not need its whole length in the correlation:
+    the head and a second probe inside the measured span are enough to tell a
+    uniform offset from an internally scrambled window, and capping the span
+    keeps the reference window, the decode and the FFT bounded.
+    """
+    return max(0.0, min(float(duration), _PLACEMENT_MAX_SPAN))
+
+
+def _slice_reference(samples, base, at, seconds):
+    """Slice ``seconds`` of reference audio that starts at absolute time ``at``."""
+    numpy = _placement_numpy()
+    if numpy is None or samples is None:
+        return None
+    start = int(round((float(at) - float(base)) * _PLACEMENT_SR))
+    length = int(round(float(seconds) * _PLACEMENT_SR))
+    if start < 0 or length <= 0 or start + length > len(samples):
+        return None
+    return samples[start:start + length]
+
+
+def _locate_probe(probe, region, region_base, intended, max_lag=_PLACEMENT_MAX_LAG):
+    """Locate ``probe`` inside ``region`` near absolute time ``intended``.
+
+    Returns ``(correlation, measured_seconds)`` or None when the match is too
+    weak or ambiguous to trust. Per-lag energy normalisation is required: with a
+    global normalisation a short probe against a long region peaks at about
+    sqrt(len(probe)/len(region)) no matter where it actually belongs, which is
+    how an earlier investigation wrongly concluded "the content is uncorrelated".
+    """
+    numpy = _placement_numpy()
+    if numpy is None or probe is None or region is None:
+        return None
+    count = int(len(probe))
+    if count < _PLACEMENT_SR // 2 or len(region) < count:
+        return None
+    if _placement_level(probe) < _PLACEMENT_MIN_LEVEL:
+        return None
+    lag = int(round(max(0.0, float(max_lag)) * _PLACEMENT_SR))
+    center = int(round((float(intended) - float(region_base)) * _PLACEMENT_SR))
+    low = max(0, center - lag)
+    high = min(len(region) - count, center + lag)
+    if high <= low:
+        return None
+    window = region[low:high + count]
+    base = float(region_base) + low / _PLACEMENT_SR
+    centered_probe = probe - probe.mean()
+    centered = window - window.mean()
+    energy = float((centered_probe ** 2).sum())
+    if energy <= 0:
+        return None
+    size = 1 << int(numpy.ceil(numpy.log2(len(centered) + count)))
+    cross = numpy.fft.irfft(
+        numpy.fft.rfft(centered, size) * numpy.conj(numpy.fft.rfft(centered_probe, size)),
+        size)[:len(centered) - count + 1]
+    cumulative = numpy.concatenate(([0.0], numpy.cumsum(centered ** 2)))
+    denominator = numpy.sqrt((cumulative[count:] - cumulative[:-count]) * energy)
+    values = numpy.divide(cross, denominator, out=numpy.zeros_like(cross),
+                          where=denominator > 0)
+    index = int(numpy.argmax(values))
+    peak = float(values[index])
+    if peak < _PLACEMENT_MIN_CORRELATION:
+        return None
+    # 歧义检查：把最佳峰 ±0.5s 挖掉后，次佳峰不能接近最佳峰（音乐/重复段落会
+    # 出现多个等高峰，此时任何"纠正"都是猜）。
+    guard = max(1, int(0.5 * _PLACEMENT_SR))
+    others = numpy.concatenate((values[:max(0, index - guard)],
+                                values[min(len(values), index + guard + 1):]))
+    if len(others) and float(others.max()) > peak * _PLACEMENT_PEAK_MARGIN:
+        return None
+    return peak, base + index / _PLACEMENT_SR
+
+
+class _PlacementReference:
+    """Audio of the detection timeline, used to locate a clip's real content.
+
+    Audio Cache batches detect on the cached file, so that file is the authority
+    (a local full download: no seek involved, absolutely trustworthy). Remote
+    Stream batches detect on the live audio-only rendition, so a small window of
+    it is fetched — a few hundred KB, ~1% of the video clip it validates.
+    """
+
+    def __init__(self, source, mode, cache_store, scratch_dir, logger=None):
+        self.source = source
+        self.mode = str(mode or "auto")
+        self.cache_store = cache_store
+        self.scratch_dir = Path(scratch_dir) if scratch_dir else Path(tempfile.gettempdir())
+        self.logger = logger
+        self.cached = (_cached_reference_path(source, cache_store)
+                       if self.mode in ("cache", "auto") else None)
+        self._windows: dict[tuple[float, float], Any] = {}
+
+    @property
+    def available(self) -> bool:
+        if self.cached is not None:
+            return True
+        # Audio Cache 批次的时间戳定义在缓存音频上：缓存不在时绝不能用线上流当
+        # 参照（两者本来就可能差好几秒，那会把 clip 对齐到错误的时间轴），
+        # 而是放弃校验、保留原片段。Remote Stream / auto 才允许现取线上音频。
+        if self.mode == "cache":
+            return False
+        return bool(getattr(self.source, "audio_url", None))
+
+    @property
+    def absolute(self) -> bool:
+        """True when the reference needs no self-check (a local full download)."""
+        return self.cached is not None
+
+    def read(self, start, seconds):
+        key = (round(float(start), 2), round(float(seconds), 2))
+        if key not in self._windows:
+            self._windows[key] = self._read(start, seconds)
+        return self._windows[key]
+
+    def _read(self, start, seconds):
+        start = max(0.0, float(start))
+        seconds = float(seconds)
+        if seconds <= 0:
+            return None
+        if self.cached is not None:
+            samples = _decode_placement_pcm(self.cached, start, seconds)
+            if samples is not None:
+                return samples, start
+            return None
+        if self.mode == "cache" or not getattr(self.source, "audio_url", None):
+            return None
+        try:
+            handle, name = tempfile.mkstemp(prefix=".placement-ref-", suffix=".wav",
+                                            dir=str(self.scratch_dir))
+            os.close(handle)
+        except OSError:
+            return None
+        window_path = Path(name)
+        try:
+            fetch_segment(self.source, start, start + seconds, window_path,
+                          timeout=None, retries=1, audio_only=True,
+                          codec="pcm_s16le", verify_placement=False,
+                          allow_covering_cache=False, logger=None)
+            samples = _decode_placement_pcm(window_path)
+        except InterruptedError:
+            raise
+        except Exception:                                # noqa: BLE001
+            return None
+        finally:
+            try:
+                window_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if samples is None or len(samples) == 0:
+            return None
+        return samples, start
+
+
+def measure_clip_placement(path, nominal_start, duration, read_reference):
+    """Measure where a local clip file's content actually sits on the timeline.
+
+    ``nominal_start`` is the media time the file's first sample is supposed to
+    hold. Returns ``{"delta", "head", "tail", "spread", "stable",
+    "correlation", "probes"}`` in seconds — ``delta`` > 0 means the content sits
+    that much LATER than intended (the beginning of the moment got cut off) —
+    or None when it cannot be measured (silence, no reference, weak/ambiguous
+    match, too short).
+    """
+    if read_reference is None:
+        return None
+    duration = float(duration)
+    span = _placement_span(duration)
+    if span < 2.0:
+        return None
+    probe_seconds = min(_PLACEMENT_PROBE_SECONDS, max(1.0, span * 0.4))
+    head_at = 0.2
+    tail_at = max(head_at, span - probe_seconds - 0.2)
+    head = _decode_placement_pcm(path, head_at, probe_seconds)
+    if head is None or len(head) < _PLACEMENT_SR // 2:
+        return None
+    tail = _decode_placement_pcm(path, tail_at, probe_seconds) \
+        if tail_at > head_at + 0.5 else None
+    span_start = max(0.0, float(nominal_start) - _PLACEMENT_MAX_LAG)
+    span_seconds = (float(nominal_start) + span + _PLACEMENT_MAX_LAG) - span_start
+    reference = read_reference(span_start, span_seconds)
+    if reference is None:
+        return None
+    samples, base = reference
+    found = []
+    for name, samples_probe, at in (("head", head, float(nominal_start) + head_at),
+                                    ("tail", tail, float(nominal_start) + tail_at)):
+        if samples_probe is None:
+            continue
+        hit = _locate_probe(samples_probe, samples, base, at)
+        if hit is not None:
+            found.append((name, hit[0], hit[1] - at))
+    if not found:
+        return None
+    head_delta = next((delta for name, _corr, delta in found if name == "head"), None)
+    tail_delta = next((delta for name, _corr, delta in found if name == "tail"), None)
+    deltas = [delta for _name, _corr, delta in found]
+    spread = (max(deltas) - min(deltas)) if len(deltas) > 1 else 0.0
+    # 只有尾部探针可测时不算"一致"：便宜的做法（改请求区间）动的是整段内容，
+    # 而尾部偏移并不代表开头（开头可能是淡入/静音，量不出来）。头部单点可测
+    # 就够了——落点偏移本来就是按开头定义的。
+    stable = spread <= _PLACEMENT_STABLE_SPREAD and (len(found) > 1 or head_delta is not None)
+    return {"delta": sum(deltas) / len(deltas),
+            "head": head_delta, "tail": tail_delta, "spread": spread,
+            "stable": stable,
+            "correlation": max(corr for _name, corr, _delta in found),
+            "probes": len(found)}
+
+
+def _placement_reference_stable(reference, nominal_start, duration) -> bool:
+    """Is the reference's own timeline self-consistent?
+
+    Only Remote Stream mode needs this: there the reference is a freshly fetched
+    window of the same rendition family the clip comes from, so a rendition that
+    misplaces content on seek could bias the measurement (and "correcting" a
+    good clip is worse than doing nothing). Re-read the same span with a
+    pre-roll — a different window plan — and require the overlap to agree.
+    """
+    span_start = max(0.0, float(nominal_start) - _PLACEMENT_MAX_LAG)
+    span_seconds = ((float(nominal_start) + _placement_span(duration)
+                     + _PLACEMENT_MAX_LAG) - span_start)
+    first = reference.read(span_start, span_seconds)
+    if first is None:
+        return False
+    shifted = reference.read(max(0.0, span_start - _PLACEMENT_PREROLL),
+                             span_seconds + _PLACEMENT_PREROLL)
+    if shifted is None:
+        return False
+    probe_at = span_start + min(3.0, span_seconds / 3.0)
+    probe = _slice_reference(first[0], first[1], probe_at, _PLACEMENT_PROBE_SECONDS)
+    if probe is None:
+        return False
+    hit = _locate_probe(probe, shifted[0], shifted[1], probe_at)
+    if hit is None:
+        return False
+    return abs(hit[1] - probe_at) <= _PLACEMENT_TOLERANCE
+
+
+def _placement_fetch(source, fetch_start, fetch_end, destination, *, timeout,
+                     stall_timeout, progress_callback, logger, refresh_func=None,
+                     audio_only=False, codec=None) -> bool:
+    """Fetch one repair window into ``destination`` (False when it failed).
+
+    Written to its own path so the already-fetched clip stays usable: a repair
+    that fails must leave the original segment untouched. Cache is bypassed on
+    purpose — a repair must read the stream, not the very data being checked.
+    ``timeout`` is normally None so the fetch sizes its own budget from the
+    repair window (the pre-roll window is bigger than the clip it repairs).
+    """
+    if fetch_start < 0 or fetch_end <= fetch_start:
+        return False
+    destination = Path(destination)
+    destination.unlink(missing_ok=True)
+    try:
+        fetch_segment(source, float(fetch_start), float(fetch_end), destination,
+                      cache_store=None, timeout=timeout, retries=1, logger=logger,
+                      progress_callback=progress_callback,
+                      stall_timeout=stall_timeout, verify_placement=False,
+                      allow_covering_cache=False, refresh_func=refresh_func,
+                      audio_only=bool(audio_only), codec=codec)
+    except InterruptedError:
+        raise
+    except Exception as exc:                             # noqa: BLE001
+        if logger is not None:
+            logger(f"Clip placement repair fetch failed "
+                   f"({fetch_start:g}-{fetch_end:g}s): {_sanitize_ffmpeg_detail(exc)}")
+        return False
+    return destination.is_file() and destination.stat().st_size > 0
+
+
+def _placement_cut(window_file, offset, duration, output_file, *, has_audio,
+                   timeout, logger=None, audio_only=False, codec=None) -> bool:
+    """Cut [offset, offset+duration] out of a local window file (exact trim).
+
+    Reuses the fMP4 window path's cut command, so a repaired clip is byte-for-byte
+    the same kind of file as a normal one (compile cannot tell them apart).
+    """
+    command = build_local_window_command(
+        window_file, 0.0, 0.0, float(offset), float(offset) + float(duration),
+        output_file, audio_only=bool(audio_only), codec=codec,
+        has_audio=bool(has_audio))
+    try:
+        result = run_tracked(command, timeout=timeout, text=True)
+    except InterruptedError:
+        raise
+    except Exception as exc:                             # noqa: BLE001
+        if logger is not None:
+            logger(f"Clip placement cut failed: {_sanitize_ffmpeg_detail(exc)}")
+        return False
+    return_code = getattr(result, "returncode", 0)
+    if return_code != 0:
+        if logger is not None:
+            logger(f"Clip placement cut failed (rc={return_code}): "
+                   f"{_sanitize_ffmpeg_detail(getattr(result, 'stderr', '') or '')}")
+        return False
+    return Path(output_file).is_file() and Path(output_file).stat().st_size > 0
+
+
+def cached_segment_is_aligned(source, path, nominal_start, duration, *, cache_store=None,
+                              mode="auto", logger=None, scratch_dir=None) -> bool | None:
+    """Is a cached segment's content still on the detected moment?
+
+    True/False when it can be measured, None when it cannot (silence, a missing
+    reference, a weak match) — in which case the caller keeps using the cache.
+    ``scratch_dir`` should be a temp directory: for a stream reference the
+    fetcher writes a window file, and the cache tree is not the place for it.
+    """
+    reference = _PlacementReference(source, mode, cache_store,
+                                    scratch_dir or Path(path).parent, logger=logger)
+    if not reference.available:
+        return None
+    measured = measure_clip_placement(path, nominal_start, duration, reference.read)
+    if measured is None:
+        return None
+    return abs(float(measured["delta"])) <= _PLACEMENT_TOLERANCE
+
+
+def cached_segment_span(path):
+    """(nominal start, duration) a cached segment claims, or None if unknown.
+
+    ``CacheStore.find_cached_segment`` may return a *covering* entry — a
+    reverify/preview window that spans the requested clip — so the file's head is
+    not necessarily the requested window's head. Measuring against the wrong
+    origin would report a bogus offset and re-download a perfectly good clip, so
+    the entry's own sidecar metadata is the only safe origin.
+    """
+    try:
+        metadata = json.loads(Path(path).with_suffix(".json").read_text(encoding="utf-8"))
+        start = float(metadata["start"])
+        end = float(metadata["end"])
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not math.isfinite(start) or not math.isfinite(end) or end - start < 2.0:
+        return None
+    return start, end - start
+
+
+def correct_clip_placement(source, path, nominal_start, duration, *, cache_store=None,
+                           mode="auto", logger=None, timeout=None, stall_timeout=30,
+                           progress_callback=None, refresh_func=None,
+                           has_audio=None, audio_only=False, codec=None) -> dict[str, Any]:
+    """Measure a fetched clip's content position and repair it when it drifted.
+
+    Always returns a record (also appended to ``placement_records()`` for the
+    run summary) and never raises for a repair problem: the calling fetch is
+    already successful, a clip with imperfect placement beats no clip at all.
+    """
+    path = Path(path)
+    record: dict[str, Any] = {
+        "name": _placement_source_label(source),
+        "start": float(nominal_start),
+        "end": float(nominal_start) + float(duration),
+        "delta": None, "head": None, "tail": None, "correlation": None,
+        "action": "unmeasurable", "corrected": False, "mislocated": False,
+        "delta_before": None, "reason": "",
+    }
+    reference = _PlacementReference(source, mode, cache_store, path.parent, logger=logger)
+    if not reference.available:
+        record["reason"] = "no-reference"
+        _record_placement(record)
+        return record
+    measured = measure_clip_placement(path, nominal_start, duration, reference.read)
+    if measured is None:
+        record["reason"] = "unmeasurable"
+        _record_placement(record)
+        return record
+    record.update({key: measured[key] for key in
+                   ("delta", "head", "tail", "correlation", "spread")})
+    # 修复成功后 delta 会被替换成"修复后"的值；原始偏移单独留一份给汇总。
+    record["delta_before"] = record["delta"]
+    delta = float(measured["delta"])
+    if abs(delta) <= _PLACEMENT_TOLERANCE:
+        record["action"] = "aligned"
+        _record_placement(record)
+        return record
+    record["mislocated"] = True
+    if not measured["stable"]:
+        # 头尾量出来的偏移不一致：窗口内部被拉伸/错乱，没有单一的平移量可修。
+        record["action"] = "unstable"
+        _record_placement(record)
+        return record
+    if not reference.absolute and not _placement_reference_stable(
+            reference, float(nominal_start), float(duration)):
+        record["action"] = "reference-unstable"
+        _record_placement(record)
+        return record
+    if logger is not None:
+        logger(f"Clip {record['start']:g}-{record['end']:g}s content sits "
+               f"{delta:+.2f}s off the detection timeline "
+               f"(correlation {measured['correlation']:.2f}); re-aligning")
+    # 修复的代价与 clip 长度成正比（重取同长度窗口，pre-roll 那条再多 16s）：这是
+    # 把整段内容搬到正确位置的必要成本，且只有偏移的 clip 才会付。每次修复都用
+    # 自己的自适应 timeout 取，取不到就退回"保留原片段 + 汇报"，不会把 clip 弄丢。
+    if has_audio is None:
+        has_audio = source_has_embedded_audio(source)
+    # 候选文件名必须保留原扩展名：裁剪命令的输出格式由扩展名决定（.mp4/.m4a/.wav）。
+    candidate = path.with_name(f"{path.stem}.placement{path.suffix}")
+    duration = float(duration)
+    # 修法 1：整体平移请求区间。Bilibili Audio Cache 那种"缓存与流整体差 X 秒"
+    # 一次就够（实测请求 +3.25s 后内容正好落在目标上）。
+    if _placement_fetch(source, float(nominal_start) - delta,
+                        float(nominal_start) - delta + duration, candidate,
+                        timeout=None, stall_timeout=stall_timeout,
+                        progress_callback=progress_callback, logger=logger,
+                        refresh_func=refresh_func, audio_only=audio_only, codec=codec):
+        re_measured = measure_clip_placement(candidate, nominal_start, duration,
+                                             reference.read)
+        if re_measured is not None and abs(re_measured["delta"]) <= _PLACEMENT_TOLERANCE:
+            os.replace(candidate, path)
+            record.update({"action": "shifted", "corrected": True,
+                           "delta": re_measured["delta"], "head": re_measured["head"],
+                           "tail": re_measured["tail"],
+                           "correlation": re_measured["correlation"]})
+            _record_placement(record)
+            return record
+        candidate.unlink(missing_ok=True)
+    # 修法 2：带 pre-roll 重取，按量出来的偏移在本地裁。Twitch 那种"某个请求
+    # 位置落进坏区间"的偏移（±1-2s 的窄带）平移请求救不了，pre-roll 能绕开。
+    pre = _PLACEMENT_PREROLL
+    pre_start = max(0.0, float(nominal_start) - pre)
+    pre_end = float(nominal_start) + duration + pre
+    if _placement_fetch(source, pre_start, pre_end, candidate, timeout=None,
+                        stall_timeout=stall_timeout,
+                        progress_callback=progress_callback, logger=logger,
+                        refresh_func=refresh_func, audio_only=audio_only, codec=codec):
+        pre_duration = _segment_duration(candidate) or (pre_end - pre_start)
+        inside = measure_clip_placement(candidate, pre_start, pre_duration, reference.read)
+        if inside is not None and inside["stable"] and inside["head"] is not None:
+            # 窗口内"意图起点"的位置：窗口自身的落点偏移是 head，窗口里偏移 o 的
+            # 内容对应的媒体时间 = pre_start + o + head，令它等于意图起点即可。
+            # （实测 Twitch：pre_start=15495.40、head=-0.02 → 偏移 6.02s。）
+            offset = (float(nominal_start) - pre_start) - float(inside["head"])
+            if offset >= 0.0 and offset + duration <= pre_duration + _PLACEMENT_TOLERANCE:
+                cut = path.with_name(f"{path.stem}.cut{path.suffix}")
+                cut.unlink(missing_ok=True)
+                if _placement_cut(candidate, offset, duration, cut, has_audio=has_audio,
+                                  timeout=timeout, logger=logger, audio_only=audio_only,
+                                  codec=codec):
+                    final = measure_clip_placement(cut, nominal_start, duration,
+                                                   reference.read)
+                    if (final is not None
+                            and abs(final["delta"]) <= _PLACEMENT_TOLERANCE):
+                        os.replace(cut, path)
+                        record.update({"action": "preroll", "corrected": True,
+                                       "offset": offset, "delta": final["delta"],
+                                       "head": final["head"], "tail": final["tail"],
+                                       "correlation": final["correlation"]})
+                        _record_placement(record)
+                        return record
+                cut.unlink(missing_ok=True)
+        candidate.unlink(missing_ok=True)
+    record["action"] = "unfixed"
+    if logger is not None:
+        logger(f"Clip {record['start']:g}-{record['end']:g}s could not be re-aligned "
+               f"({delta:+.2f}s off); keeping it as fetched")
+    _record_placement(record)
+    return record
+
+
+def _placement_stream_self_consistent(reference, position, probe_seconds) -> bool:
+    """Is the live reference's own timeline self-consistent at ``position``?
+
+    Second opinion before telling the user their cached audio is out of sync:
+    re-read the same span with a pre-roll (a different window plan) and require
+    the overlap to agree. A rendition whose seek is unreliable at that position
+    would otherwise produce a false "your cache drifted" warning.
+    """
+    first = reference.read(max(0.0, float(position) - _PLACEMENT_MAX_LAG),
+                           float(probe_seconds) + 2 * _PLACEMENT_MAX_LAG)
+    if first is None:
+        return False
+    probe = _slice_reference(first[0], first[1], float(position), float(probe_seconds))
+    if probe is None:
+        return False
+    shifted = reference.read(
+        max(0.0, float(position) - _PLACEMENT_MAX_LAG - _PLACEMENT_PREROLL),
+        float(probe_seconds) + 2 * _PLACEMENT_MAX_LAG + _PLACEMENT_PREROLL)
+    if shifted is None:
+        return False
+    hit = _locate_probe(probe, shifted[0], shifted[1], float(position))
+    return hit is not None and abs(hit[1] - float(position)) <= _PLACEMENT_TOLERANCE
+
+
+def _cache_drift_lines(source, path, at, delta, checked, spread=None) -> list[str]:
+    """The warning shown when a cached detection audio is off the stream.
+
+    Deliberately hedged about the cause: a cache↔stream mismatch means either the
+    cached download has duplicated/missing audio (re-download it) or the
+    rendition's own seek is unreliable at that position (re-downloading changes
+    nothing). The clips are re-aligned individually either way.
+    """
+    varies = ""
+    if spread is not None and spread > _PLACEMENT_CACHE_SPREAD:
+        varies = (f" The offset varies by {spread:.1f}s between the sampled "
+                  f"positions, which points at duplicated/missing audio inside the "
+                  f"cached download rather than a single constant shift.")
+    return [
+        f"Cached audio for {_placement_source_label(source)} disagrees with the live "
+        f"stream by up to {delta:+.2f}s (worst at {at / 60:.0f}min, "
+        f"{checked} position(s) checked).{varies}",
+        f"Clips from this source are re-aligned individually while fetching, so they "
+        f"still land on the detected moment. If the exported timestamps look shifted "
+        f"when you check them against the VOD, delete {path.name} from the remote "
+        f"cache so it is downloaded again; if they look right, this is the stream's "
+        f"own seek rather than your cache and nothing needs to be done.",
+    ]
+
+
+def _load_cache_check(cache_path) -> dict[str, Any] | None:
+    """The previous verification of this exact cache file, if it still applies.
+
+    The Audio Cache pre-pass is deliberately probe-free on cache hits (probing
+    every source tripped bilibili's CDN rate limit before). The result is stored
+    in the cache's own sidecar metadata keyed by size+mtime, so a source is
+    checked once per downloaded file: repeat runs cost no requests, a re-download
+    invalidates the record, and a known drift is re-reported for free.
+    """
+    marker = Path(cache_path).with_suffix(".json")
+    try:
+        record = json.loads(marker.read_text(encoding="utf-8")).get(_PLACEMENT_CACHE_KEY)
+        stat = Path(cache_path).stat()
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not isinstance(record, dict):
+        return None
+    try:
+        if int(record.get("size", -1)) != int(stat.st_size):
+            return None
+        if abs(float(record.get("mtime", 0.0)) - stat.st_mtime) > 1.0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return record
+
+
+def _save_cache_check(cache_path, *, checked, drift=None, at=None, spread=None) -> None:
+    """Persist a verification result next to the cache (never creates the file)."""
+    marker = Path(cache_path).with_suffix(".json")
+    temporary = marker.with_name(marker.name + ".placement.tmp")
+    try:
+        if not marker.is_file():
+            return
+        metadata = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            return
+        stat = Path(cache_path).stat()
+        metadata[_PLACEMENT_CACHE_KEY] = {
+            "size": int(stat.st_size), "mtime": float(stat.st_mtime),
+            "checked": int(checked), "drift": None if drift is None else float(drift),
+            "at": None if at is None else float(at),
+            "spread": None if spread is None else float(spread),
+        }
+        temporary.write_text(json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+                             encoding="utf-8")
+        os.replace(temporary, marker)
+    except Exception:                                    # noqa: BLE001
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def verify_cached_audio_alignment(source, cache_path, *, cache_store=None,
+                                  samples=2, probe_seconds=6.0, logger=None,
+                                  scratch_dir=None, refresh=False) -> list[str]:
+    """Spot-check that a cached detection audio still matches the live stream.
+
+    Audio Cache batches detect on the cached file and compile from the stream, so
+    a cache that drifted from the stream shifts every timestamp it produced (the
+    per-clip placement check still re-aligns the clips, but the user should know
+    the cache is off, because re-downloading it is the real fix). Returns
+    printable lines; an empty list means "checked and aligned" or "not checked".
+
+    Each cache file is verified once: the result is stored in its sidecar
+    metadata (see ``_load_cache_check``) and replayed from there afterwards, so a
+    repeat run neither re-probes the CDN nor loses a known warning.
+    """
+    path = Path(cache_path)
+    if not path.is_file() or not getattr(source, "audio_url", None):
+        return []
+    if not refresh:
+        previous = _load_cache_check(path)
+        if previous is not None:
+            if previous.get("drift") is None:
+                return []
+            return _cache_drift_lines(source, path, float(previous.get("at") or 0.0),
+                                      float(previous["drift"]),
+                                      int(previous.get("checked") or 0),
+                                      spread=previous.get("spread"))
+    duration = _segment_duration(path)
+    if not duration or duration < 300.0:
+        return []
+    reference = _PlacementReference(source, "stream", cache_store,
+                                    scratch_dir or Path(tempfile.gettempdir()),
+                                    logger=logger)
+    if not reference.available:
+        return []
+    margin = 30.0
+    count = max(1, int(samples))
+    span = duration - 2 * margin
+    positions = [margin + span * (index + 1) / (count + 1) for index in range(count)]
+    checked, deltas, worst = 0, [], None
+    for position in positions:
+        probe = _decode_placement_pcm(path, position, probe_seconds)
+        if probe is None:
+            continue
+        window = reference.read(max(0.0, position - _PLACEMENT_MAX_LAG),
+                                probe_seconds + 2 * _PLACEMENT_MAX_LAG)
+        if window is None:
+            continue
+        hit = _locate_probe(probe, window[0], window[1], position)
+        if hit is None:
+            continue
+        checked += 1
+        delta = hit[1] - position
+        deltas.append(delta)
+        if worst is None or abs(delta) > abs(worst[1]):
+            worst = (position, delta, hit[0])
+    if not checked:
+        return []
+    if all(abs(delta) <= _PLACEMENT_TOLERANCE for delta in deltas):
+        _save_cache_check(path, checked=checked)
+        return []
+    worst_at, worst_delta, _worst_corr = worst
+    spread = (max(deltas) - min(deltas)) if len(deltas) > 1 else 0.0
+    # 报之前先确认这不是"线上流自己 seek 抖动"：多个采样点一致（缓存整体错位就是
+    # 这样）就够了；采样点之间分歧较大时（缓存可能中间有重复/缺失音频），必须再
+    # 确认最坏那一点上流自身是自洽的。证据不足就不报——误报会让用户白重下几十 GB。
+    if spread > _PLACEMENT_CACHE_SPREAD and not _placement_stream_self_consistent(
+            reference, worst_at, probe_seconds):
+        return []
+    _save_cache_check(path, checked=checked, drift=worst_delta, at=worst_at,
+                      spread=spread)
+    lines = _cache_drift_lines(source, path, worst_at, worst_delta, checked,
+                               spread=spread)
+    if logger is not None:
+        for line in lines:
+            logger(line)
+    return lines
+
+
+def estimate_segment_fetch_timeout(source, duration, explicit=None) -> float:
+    """Per-clip fetch timeout derived from the clip's expected download size.
+
+    以前每次尝试固定 600s：一个 5 秒的 clip 卡在网络里也要独占 10 分钟。现在
+    按 "预计字节数 / 可接受的最低持续吞吐" 计算，这样慢但稳定的线路（≥0.15 MB/s）
+    依然来得及下完，只有真正没进展的才会更早被放弃。要看更早的失败由
+    progress-stall 看门狗（120s 无进展）负责。显式传入的 timeout 优先。
+    """
+    if explicit is not None and float(explicit) > 0:
+        return float(explicit)
+    per_second = _DEFAULT_BYTES_PER_SECOND
+    height = None
+    try:
+        value = int(getattr(source, "max_height", None) or 0)
+        height = value if value > 0 else None
+    except (TypeError, ValueError):
+        height = None
+    if height is None:
+        for candidate in (getattr(source, "video_candidates", None) or []):
+            try:
+                value = int(candidate.get("height") or 0)
+            except (TypeError, ValueError, AttributeError):
+                value = 0
+            if value > 0:
+                height = value
+                break
+    if height:
+        for limit, bytes_per_second in _QUALITY_BYTES_PER_SECOND:
+            if height <= limit:
+                per_second = bytes_per_second
+                break
+        else:
+            per_second = 800 * 1024
+    expected_bytes = max(1.0, float(duration)) * per_second
+    return min(_SEGMENT_TIMEOUT_CAP,
+               max(_SEGMENT_TIMEOUT_FLOOR, expected_bytes / _SEGMENT_MIN_THROUGHPUT))
+
+
 def fetch_segment(
     source: MediaSource,
     start: float,
@@ -1538,7 +2357,7 @@ def fetch_segment(
     cache_store: Any | None = None,
     padding_before: float = 0,
     padding_after: float = 0,
-    timeout: float = 600,
+    timeout: float | None = None,
     retries: int = 2,
     run_func: Callable[..., Any] | None = None,
     audio_only: bool = False,
@@ -1549,8 +2368,14 @@ def fetch_segment(
     progress_callback: Callable[..., Any] | None = None,
     stall_timeout: float = 30,
     max_total_duration: float = 0,
+    verify_placement: bool = True,
+    placement_reference: str = "auto",
 ) -> Path:
     """Fetch a requested remote interval, optionally reusing covering cache.
+
+    ``timeout`` bounds ONE ffmpeg attempt. When omitted it is derived from the
+    clip's expected size (see ``estimate_segment_fetch_timeout``) instead of the
+    old flat 600s.
 
     ``max_total_duration`` optionally bounds the WHOLE segment fetch (all
     retries, source refreshes and backoff sleeps). It defaults to 0 (unbounded):
@@ -1559,11 +2384,22 @@ def fetch_segment(
     budget — the per-attempt ``stall_timeout`` already abandons a genuinely
     hung connection (no data). Only a caller with a specific reason may pass a
     positive budget.
+
+    ``verify_placement`` measures the fetched clip's real content position and
+    repairs it when the rendition handed back a shifted window (see the
+    placement block above); ``placement_reference`` selects what "the detection
+    timeline" is: ``"cache"`` (Audio Cache batches: the cached file detection ran
+    on), ``"stream"`` (Remote Stream batches: the live audio-only rendition) or
+    ``"auto"`` (prefer the cache). Repair fetches pass ``verify_placement=False``
+    so a check never recurses into itself.
     """
     if padding_before < 0 or padding_after < 0:
         raise ValueError("segment padding must not be negative")
     if retries < 0:
         raise ValueError("retries must not be negative")
+    expected_seconds = ((float(end) + float(padding_after))
+                        - max(0.0, float(start) - float(padding_before)))
+    timeout = estimate_segment_fetch_timeout(source, expected_seconds, explicit=timeout)
     _fetch_started = time.monotonic()
 
     identity = stable_source_id(source)
@@ -1576,7 +2412,36 @@ def fetch_segment(
                 identity, start, end, padding, extension=extension, media_type=media_type
             )
             if cached is not None:
-                return Path(cached)
+                # 命中条目可能比请求区间宽：`find_cached_segment` 是"覆盖即命中"
+                # （上次跑用了更大的 padding、或旧版本的扩展窗口都会产生这种条目），
+                # 而 materialize 交给 compile 的语义是"这个文件就是整个 clip"
+                # （时间戳 [0, duration]）——从更宽的条目里按 clip 时长切，内容就会
+                # 从条目自己的起点开始，整体错位。所以只接受"起点一致"的命中
+                # （尾部多余无所谓：compile 按 clip 时长裁掉）。
+                requested_start = max(0.0, float(start) - float(padding_before))
+                span = cached_segment_span(cached)
+                starts_exact = (span is not None
+                                and abs(span[0] - requested_start)
+                                <= _CACHE_START_TOLERANCE)
+                if not starts_exact:
+                    if logger is not None:
+                        logger("Cached clip starts at a different position than "
+                               "requested; re-fetching the exact window")
+                elif (verify_placement and run_func is None
+                        and not (max_total_duration and max_total_duration > 0)
+                        and _fetch_has_audio(source, audio_only)):
+                    aligned = cached_segment_is_aligned(
+                        source, cached, span[0], span[1], cache_store=cache_store,
+                        mode=placement_reference, logger=logger,
+                        scratch_dir=Path(output_file).parent)
+                    if aligned is False:
+                        if logger is not None:
+                            logger("Cached clip content is off the detected moment; "
+                                   "re-fetching it instead of reusing the cache")
+                    else:
+                        return Path(cached)
+                else:
+                    return Path(cached)
 
     destination = Path(output_file)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1603,13 +2468,16 @@ def fetch_segment(
             # 0.5s 打 progress、out_time 却不动时，原有"30s 无输出"看门狗永远
             # 不触发，界面就停在 "Preparing clips: n/N · ETA 00:00"（测试者反馈）。
             # 进度不前进超时就抛 ProgressStallTimeout（TimeoutExpired 子类，
-            # 走既有的 retry/refresh 阶梯）；同时每 60s 打一条心跳日志，
-            # 让"在慢跑"和"卡住"在日志里可区分。
+            # 走既有的 retry/refresh 阶梯）。
             progress_stall_timeout=_SEGMENT_PROGRESS_STALL_TIMEOUT,
+            # 心跳只在进度停滞 ≥30s 后每 30s 打一条（正常的慢下载不再刷屏），
+            # 并附一条成因提示（并发过高 / 线路不稳），让用户知道不是卡死。
             heartbeat_label=(f"{source.platform or 'remote'}:"
                              f"{source.source_id or '?'} {start:g}-{end:g}s"),
             heartbeat_interval=_SEGMENT_HEARTBEAT_INTERVAL,
             heartbeat_verb="fetching",
+            heartbeat_stall_threshold=_SEGMENT_HEARTBEAT_STALL_THRESHOLD,
+            heartbeat_hint=_SEGMENT_HEARTBEAT_HINT,
         )
     last_error: Exception | None = None
     refreshed = False
@@ -1654,8 +2522,11 @@ def fetch_segment(
                 if window_url:
                     plan = hls_window_plan(window_url, window_headers, fetch_start, fetch_end)
                     if plan is not None:
+                        # 分片读取用固定的 60s/次读（单个分片几 MB，够宽松）；窗口
+                        # remux 是整个窗口的本地活，用本 clip 的自适应 timeout
+                        # （长合并 clip 的窗口可能几百 MB，60s 会误杀并触发整窗重下）。
                         hls_window = materialize_hls_window(
-                            plan, Path(temporary_path).parent, timeout=timeout)
+                            plan, Path(temporary_path).parent, remux_timeout=timeout)
             try:
                 if hls_window is not None:
                     command = build_local_window_command(
@@ -1745,6 +2616,26 @@ def fetch_segment(
                         _log_short_delivery(source, start, end, actual_duration,
                                             expected_duration)
                         short_delivery = True
+            if (verify_placement and run_func is None and not short_delivery
+                    and _fetch_has_audio(source, audio_only)
+                    and not (max_total_duration and max_total_duration > 0)):
+                # 落点校验：取回的内容是否真的落在请求的位置上（见 placement
+                # 说明块）。只对有音轨的取回做（音频是唯一便宜的内容锚点）；
+                # 任何异常都不影响已经成功的这次取回。
+                try:
+                    correct_clip_placement(
+                        source, temporary_path, fetch_start,
+                        float(end) + float(padding_after) - fetch_start,
+                        cache_store=cache_store, mode=placement_reference,
+                        logger=logger, timeout=timeout, stall_timeout=stall_timeout,
+                        progress_callback=progress_callback, refresh_func=refresh_func,
+                        audio_only=audio_only, codec=codec)
+                except InterruptedError:
+                    raise
+                except Exception as exc:                     # noqa: BLE001
+                    if logger is not None:
+                        logger("Clip placement check skipped: "
+                               f"{_sanitize_ffmpeg_detail(exc)}")
             data = temporary_path.read_bytes()
             if cache_store is not None and not short_delivery:
                 # 短交付的片段不写缓存：缓存命中是按"声称覆盖了请求区间"判断的，
@@ -1766,10 +2657,18 @@ def fetch_segment(
         except InterruptedError:
             raise
         except Exception as exc:
-            last_error = exc if isinstance(exc, SegmentFetchError) else SegmentFetchError(
-                f"Could not fetch remote segment {start}-{end}: "
-                f"{_sanitize_ffmpeg_detail(exc)}"
-            )
+            if isinstance(exc, subprocess.TimeoutExpired):
+                # 这条超时是按 clip 体量算出来的（见 estimate_segment_fetch_timeout），
+                # 不再把整条 ffmpeg 命令行灌进日志；直接说清楚"允许多久 + 可能原因"。
+                last_error = SegmentFetchError(
+                    f"Segment fetch for {start:g}-{end:g}s timed out after "
+                    f"{timeout:g}s (this clip's size allows {timeout:g}s); the CDN "
+                    f"delivered no usable data in time")
+            else:
+                last_error = exc if isinstance(exc, SegmentFetchError) else SegmentFetchError(
+                    f"Could not fetch remote segment {start}-{end}: "
+                    f"{_sanitize_ffmpeg_detail(exc)}"
+                )
             # 持续失败预算：连续失败累计超 90s 仍无成功 → 放弃该片段。
             # 防止单个坏片段（VOD 区间流不可用）无限 refresh 探测，拖住
             # 整个 materialize（Addendum 17 移除总时长预算后无兜底）。
@@ -1827,6 +2726,21 @@ def source_has_embedded_audio(source: MediaSource) -> bool:
     """Return whether the selected video stream contains an audio codec."""
     acodec = source.metadata.get("acodec")
     return bool(acodec) and str(acodec).strip().lower() != "none"
+
+
+def _fetch_has_audio(source: MediaSource, audio_only: bool) -> bool:
+    """Will this segment fetch produce a file with an audio track?
+
+    Audio is the only cheap content anchor, so this gates the placement check:
+    an audio-only fetch always has it, a video rendition with embedded audio has
+    it, and a video-only rendition plus a separate ``audio_url`` gets the audio
+    muxed in as a second input (``build_segment_command`` maps ``1:a:0``) — which
+    is exactly the Bilibili/YouTube shape whose cached audio drifts from the
+    stream.
+    """
+    if audio_only:
+        return True
+    return source_has_embedded_audio(source) or bool(source.audio_url)
 
 
 def parse_url_list(text: str) -> list[str]:

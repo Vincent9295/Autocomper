@@ -348,7 +348,8 @@ def run_tracked(cmd, timeout=None, text=False):
 def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=None,
                          stall_timeout=None, progress_stall_timeout=None,
                          heartbeat_label=None, heartbeat_interval=60.0,
-                         heartbeat_verb="encoding"):
+                         heartbeat_verb="encoding", heartbeat_stall_threshold=0.0,
+                         heartbeat_hint=None):
     """Run FFmpeg while forwarding its machine-readable progress output.
 
     ``stall_timeout`` (seconds) adds a no-data watchdog: if FFmpeg produces no
@@ -392,7 +393,8 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
                                         timeout, effective_stall, command,
                                         progress_stall_timeout,
                                         heartbeat_label, heartbeat_interval,
-                                        heartbeat_verb)
+                                        heartbeat_verb, heartbeat_stall_threshold,
+                                        heartbeat_hint)
     finally:
         _ACTIVE_PROCS.discard(p)
 
@@ -400,7 +402,8 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
 def _run_progress_with_stall(p, state, output, duration, progress_callback,
                              started_at, timeout, stall_timeout, command,
                              progress_stall_timeout=None, heartbeat_label=None,
-                             heartbeat_interval=60.0, heartbeat_verb="encoding"):
+                             heartbeat_interval=60.0, heartbeat_verb="encoding",
+                             heartbeat_stall_threshold=0.0, heartbeat_hint=None):
     import queue as _queue
     import threading as _threading
 
@@ -422,6 +425,7 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
     last_advance_at = time.monotonic()
     last_progress_value = None
     last_heartbeat = time.monotonic()
+    heartbeat_hint_printed = False
     try:
         while True:
             if cancel_pending():
@@ -469,7 +473,8 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
                     f"encode made no progress for {progress_stall_timeout:g}s "
                     f"(stuck at {last_progress_value if last_progress_value is not None else 0:.1f}s)")
             if (heartbeat_label and heartbeat_interval > 0
-                    and now - last_heartbeat >= heartbeat_interval):
+                    and now - last_heartbeat >= heartbeat_interval
+                    and now - last_advance_at >= heartbeat_stall_threshold):
                 last_heartbeat = now
                 elapsed = now - started_at
                 encoded = last_progress_value or 0.0
@@ -478,6 +483,11 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
                 print(f"  [{heartbeat_label}] still {heartbeat_verb}: "
                       f"{encoded:.0f}s / {total_text} ({speed}, "
                       f"{now - last_advance_at:.0f}s since last progress change)")
+                # 只在"确实卡住"时打一行成因提示：满屏心跳对用户没意义，但
+                # 完全不说话又会让人以为程序挂了。每条任务只提示一次。
+                if heartbeat_hint and not heartbeat_hint_printed:
+                    heartbeat_hint_printed = True
+                    print(f"  {heartbeat_hint}")
             if timeout is not None and time.monotonic() - started_at > timeout:
                 p.kill()
                 raise subprocess.TimeoutExpired(command, timeout)

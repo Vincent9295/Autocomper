@@ -80,6 +80,9 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            classify_resolve_failure,
                            reset_short_delivery_records,
                            short_delivery_records,
+                           reset_placement_records,
+                           placement_records,
+                           verify_cached_audio_alignment,
                            source_is_still_processing,
                            platform_display_name,
                            _audio_cache_format_identity)
@@ -964,6 +967,34 @@ def remote_detection_input(upload, mode, audio_cache_paths):
     return upload.get_path()
 
 
+def _placement_reference_mode(remote_mode):
+    """Which timeline this mode's timestamps live on (see remote_media).
+
+    Audio Cache batches detect on the cached audio file while compile fetches
+    from the live stream, so the cached file is the reference; Remote Stream
+    batches detect on the live audio-only rendition, which is then the reference.
+    """
+    return "cache" if str(remote_mode) == "Audio Cache" else "stream"
+
+
+def _report_cached_audio_alignment(source, cache_path, cache_store, limiter=None):
+    """Spot-check a cached detection audio against the stream and report drift."""
+    try:
+        if limiter is not None:
+            # 与 CDN 候选探测共用限流器：抽查要抓两小段线上音频，别把它变成
+            # 新一轮请求洪峰（bilibili 限流的代价远高于这几秒）。
+            limiter.wait()
+        for line in verify_cached_audio_alignment(source, cache_path,
+                                                  cache_store=cache_store, logger=print,
+                                                  scratch_dir=TEMP_DIR):
+            print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
+    except InterruptedError:
+        raise
+    except Exception as exc:                             # noqa: BLE001
+        print(f"{Fore.YELLOW}Audio cache alignment check skipped: "
+              f"{type(exc).__name__}: {exc}{Style.RESET_ALL}")
+
+
 def preserve_remote_result(result, source):
     """Attach original remote identity after detection ran on cached audio."""
     preserved = dict(result)
@@ -1396,7 +1427,7 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                                selected_intervals=None, cache_store=None, padding=None,
                                is_video=True, refresh_func=None, failures=None,
                                progress_callback=None, max_parallel=5,
-                               failure_records=None):
+                               failure_records=None, placement_reference="auto"):
     """Return compile-ready entries with padding normalized exactly once.
 
     Remote video/audio clips are downloaded concurrently (``max_parallel``
@@ -1404,15 +1435,19 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     is isolated into ``failures`` without blocking the rest of the batch.
     ``failure_records`` (if given) receives structured per-clip failure dicts
     (name / url / start / end / reason) so a detailed skipped-clips report can
-    be written without re-parsing log text.
+    be written without re-parsing log text. ``placement_reference`` tells the
+    fetcher which timeline the timestamps live on (``"cache"`` for Audio Cache
+    batches, ``"stream"`` for Remote Stream) so a clip that came back shifted is
+    re-aligned against the right reference.
     """
     selected_intervals = selected_intervals or {}
     before, after = (padding or (0, 0))
     before, after = float(before), float(after)
     if before < 0 or after < 0:
         raise ValueError("Clip padding cannot be negative!")
-    # 每轮 materialize 重置"交付偏短"记录，compile 结束后统一汇报
+    # 每轮 materialize 重置“交付偏短”/“落点偏移”记录，compile 结束后统一汇报
     reset_short_delivery_records()
+    reset_placement_records()
     materialized: list[dict] = []
     remote_video_total = sum(
         1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
@@ -1539,6 +1574,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                         return refresh_func(source_arg)
                 fetch_kwargs["refresh_func"] = guarded_refresh
             fetch_kwargs["progress_callback"] = fetch_progress
+            # 落点校验的参照（见 remote_media 的 placement 说明）：Audio Cache
+            # 批次检测跑在缓存音频上、compile 从线上流取，两者错位时会按缓存
+            # 对齐；Remote Stream 批次检测读的就是线上 audio-only 轨。
+            fetch_kwargs["placement_reference"] = placement_reference
             if cache_store is None:
                 fetched = fetcher(source, start, end, output, **fetch_kwargs)
             else:
@@ -1878,6 +1917,64 @@ def _summarize_remote_failures(failures, max_examples=3):
         lines.append(line)
     if "disk full (Errno 28)" in counts:
         lines.append("  Tip: free disk space or relocate the cache/temp directory before retrying.")
+    return lines
+
+
+def _summarize_placement(records, max_examples=3):
+    """Compact report for the per-clip content-placement check.
+
+    Clips come back with the right duration but the wrong content position when a
+    rendition's seek misplaces a window (Twitch fMP4) or when the cached detection
+    audio drifted from the live stream (Bilibili Audio Cache): the fetched clip
+    then starts a fraction of a second late/early, which reads as "the clip stops
+    too early". Those clips are measured against the detection timeline and
+    re-aligned while fetching; this prints what happened so a remaining problem
+    is never silent.
+    """
+    if not records:
+        return []
+    measured = [r for r in records if r.get("delta") is not None]
+    corrected = [r for r in measured if r.get("corrected")]
+    unstable = [r for r in records
+                if r.get("action") in ("unstable", "reference-unstable")]
+    remaining = [r for r in measured
+                 if r.get("mislocated") and not r.get("corrected")
+                 and r.get("action") == "unfixed"]
+    unchecked = [r for r in records if r.get("delta") is None]
+    lines = []
+    if corrected:
+        before = max(abs(float(r.get("delta_before", 0.0))) for r in corrected)
+        after = max(abs(float(r["delta"])) for r in corrected)
+        lines.append(
+            f"  {len(corrected)} clip(s) came back at the wrong content position "
+            f"(up to {before:.2f}s off the detected moment) and were re-aligned "
+            f"while fetching (remaining offset <= {after:.2f}s).")
+    if remaining:
+        worst = max(abs(float(r["delta"])) for r in remaining)
+        names = []
+        for record in remaining:
+            if record["name"] not in names:
+                names.append(record["name"])
+        examples = ", ".join(names[:max_examples])
+        if len(names) > max_examples:
+            examples += f" (+{len(names) - max_examples} more)"
+        lines.append(
+            f"  {len(remaining)} clip(s) could not be re-aligned (up to {worst:.2f}s off "
+            f"the detected moment) - e.g. {examples}. They are kept as fetched; "
+            f"re-running the batch usually fetches them from a different CDN edge.")
+    if unstable:
+        lines.append(
+            f"  {len(unstable)} clip(s) came back internally misaligned (the content "
+            f"moved by a different amount at the start and the end, or the reference "
+            f"itself was unstable); left untouched because no single offset can "
+            f"repair them.")
+    if len(unchecked) >= max(3, len(records) // 4):
+        no_reference = sum(1 for r in unchecked if r.get("reason") == "no-reference")
+        detail = (f" ({no_reference} had no reference audio to compare against)"
+                  if no_reference else "")
+        lines.append(
+            f"  {len(unchecked)} of {len(records)} clip(s) could not be "
+            f"placement-checked{detail}; they are used exactly as fetched.")
     return lines
 
 
@@ -2743,7 +2840,11 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                             filename, ws, we, temporary.name,
                             cache_store=cache_store, audio_only=True, codec='pcm_s16le',
                             refresh_func=refresh_func, logger=print,
-                            progress_callback=fetch_progress)
+                            progress_callback=fetch_progress,
+                            # 落点校验的参照与检测一致：检测跑在缓存音频上就用缓存
+                            # （reverify 才是在同一条时间轴上复核）。
+                            placement_reference=("cache" if cached_audio
+                                                 else "stream"))
                         raw = _read_wav_pcm(audio_path)
                         duration = len(raw) / sample_rate
                         expected_window = we - ws
@@ -6580,6 +6681,10 @@ class VideoProcessorApp:
                                 f"{source.platform or 'unknown'}:{source.source_id or 'unknown'}: "
                                 f"{Path(cached_audio_path).name}"
                             )
+                            # 缓存命中不代表内容与线上流一致：抽查几处，漂移就报
+                            # （Bilibili 实测缓存比流整体偏 3.25s，且会累积）。
+                            _report_cached_audio_alignment(source, cached_audio_path,
+                                                           cache_store, _probe_limiter)
                             continue
                         # 大批量解析在开跑前一次性完成：排到后面时签名 URL 可能
                         # 已过期（>30min），探测前先做与检测路径相同的过期检查，
@@ -6635,6 +6740,11 @@ class VideoProcessorApp:
                         # 新缓存写入后节流刷新 size 显示（后台线程 → 主线程投递）
                         if hasattr(self, "_ui_queue"):
                             self._ui_queue.put((self._maybe_refresh_cache_size, ()))
+                        # 刚下完也抽查一次：缓存与流若整体错位，检测出的时间戳
+                        # 就会整体偏（clips 仍会被逐片重新对齐，但用户该知道）。
+                        _report_cached_audio_alignment(
+                            source, audio_cache_paths[stable_source_id(source)],
+                            cache_store, _probe_limiter)
                     except Exception as exc:
                         message = (
                             f"Could not cache audio for {get_source_display_name(source)}: {exc}"
@@ -6934,7 +7044,9 @@ class VideoProcessorApp:
                             refresh_func=refresh_func,
                             progress_callback=self._show_remote_clip_progress,
                             max_parallel=self.remote_download_concurrency.get(),
-                            failure_records=remote_failure_records)
+                            failure_records=remote_failure_records,
+                            placement_reference=_placement_reference_mode(
+                                self.remote_mode.get()))
                         for line in _summarize_remote_failures(remote_failures):
                             print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                         _short = short_delivery_records()
@@ -6943,6 +7055,8 @@ class VideoProcessorApp:
                                   f"shorter than requested and end early (the CDN sent "
                                   f"less than the requested window)."
                                   f"{Style.RESET_ALL}")
+                        for line in _summarize_placement(placement_records()):
+                            print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                         skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
                         if skipped_report:
                             print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
@@ -7330,7 +7444,9 @@ class VideoProcessorApp:
                             refresh_func=refresh_func,
                             progress_callback=self._show_remote_clip_progress,
                             max_parallel=self.remote_download_concurrency.get(),
-                            failure_records=remote_failure_records)
+                            failure_records=remote_failure_records,
+                            placement_reference=_placement_reference_mode(
+                                self.remote_mode.get()))
                     for line in _summarize_remote_failures(remote_failures):
                         print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                     _short = short_delivery_records()
@@ -7338,6 +7454,8 @@ class VideoProcessorApp:
                         print(f"{Fore.YELLOW}{len(_short)} clip(s) were delivered "
                               f"shorter than requested and end early (the CDN sent "
                               f"less than the requested window).{Style.RESET_ALL}")
+                    for line in _summarize_placement(placement_records()):
+                        print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                     skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
                     if skipped_report:
                         print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
