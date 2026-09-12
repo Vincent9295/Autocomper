@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from typing import Literal, Tuple, Dict, Any, Optional, List
@@ -621,6 +622,423 @@ def _download_log(logger, message):
         info(message)
 
 
+# ── Full Download: parallel range transport ───────────────────────────
+# yt-dlp 对 Bilibili/YouTube 选中的格式是 protocol=https（没有 fragments），
+# `concurrent_fragment_downloads` 对这类"整段 https"格式完全无效 → 单连接；
+# 而 B 站按连接限速（本机实测同一条视频流：1 连接 0.9-1.8 MB/s，4 连接
+# 20.6-23.5 MB/s）。Audio Cache / Remote Stream 早就在用并行 Range 通路
+# （remote_prefetch），这里把同一条通路接到 Full Download 上：
+# 只负责传输，任何不适用/失败的情形都回落到 yt-dlp 自己的断点续传下载器。
+_PARALLEL_DOWNLOAD_PROTOCOLS = frozenset({"http", "https"})
+# mp4 可以安全承载的编码（其余一律 mkv，与 yt-dlp 的合并规则一致：
+# 例如 YouTube 的 AV1+Opus 合不进 mp4）。
+_MP4_VIDEO_CODECS = ("avc1", "h264", "av01", "hvc1", "hev1", "h265", "hevc", "mp4v", "mpeg4")
+_MP4_AUDIO_CODECS = ("mp4a", "aac", "mp3", "ac3", "eac3", "alac", "mp2")
+_AUTOCOMPER_TEMP_PREFIX = ".autocomper-dl-"
+
+
+def _chosen_streams(info):
+    """The format(s) yt-dlp selected for this resolve (empty when unresolvable).
+
+    ``requested_formats`` covers a video+audio selection; a single selected
+    format (audio mode, progressive sources) is merged into the info dict with a
+    top-level ``url`` instead.
+    """
+    if not isinstance(info, dict):
+        return []
+    streams = info.get("requested_formats")
+    if isinstance(streams, list) and streams:
+        return [item for item in streams if isinstance(item, dict)]
+    if info.get("url"):
+        return [info]
+    return []
+
+
+def _stream_size(fmt):
+    if not isinstance(fmt, dict):
+        return None
+    return _size_value(fmt.get("filesize")) or _size_value(fmt.get("filesize_approx"))
+
+
+def _is_plain_http_stream(fmt):
+    """True when this stream is one whole http(s) resource (range-downloadable).
+
+    Segmented formats (HLS/DASH fragments) are excluded on purpose: yt-dlp
+    already downloads those with ``concurrent_fragment_downloads``.
+    """
+    if not isinstance(fmt, dict) or fmt.get("fragments"):
+        return False
+    protocol = str(fmt.get("protocol") or "").lower()
+    if protocol and protocol not in _PARALLEL_DOWNLOAD_PROTOCOLS:
+        return False
+    return str(fmt.get("url") or "").startswith(("http://", "https://"))
+
+
+def parallel_download_plan(info, max_speed=0):
+    """Streams the parallel transfer can fetch, or None to keep using yt-dlp.
+
+    ``max_speed`` disables the plan on purpose: the speed limit is enforced by
+    yt-dlp's ``limit_rate``, and silently ignoring a user's limit would be worse
+    than downloading on one connection.
+    """
+    if max_speed and int(max_speed) > 0:
+        return None
+    streams = _chosen_streams(info)
+    if not streams or len(streams) > 2 or not all(_is_plain_http_stream(f) for f in streams):
+        return None
+    return streams
+
+
+def describe_stream_plan(streams):
+    """Human-readable rendition summary for the log."""
+    parts = []
+    for fmt in streams:
+        vcodec = str(fmt.get("vcodec") or "none")
+        acodec = str(fmt.get("acodec") or "none")
+        size = _stream_size(fmt)
+        size_text = f", {size / (1024 * 1024):.0f}MB" if size else ""
+        codec = vcodec if vcodec != "none" else acodec
+        if vcodec != "none":
+            height = fmt.get("height")
+            fps = fmt.get("fps")
+            label = f"{height}p" if height else "video"
+            if fps:
+                label += f"{round(float(fps))}"
+            parts.append(f"{label} {codec} [{fmt.get('format_id')}]{size_text}")
+        else:
+            parts.append(f"audio {codec} [{fmt.get('format_id')}]{size_text}")
+    return " + ".join(parts)
+
+
+def _best_available_height(info):
+    best = 0
+    for fmt in (info.get("formats") or []):
+        if not isinstance(fmt, dict) or str(fmt.get("vcodec") or "none") == "none":
+            continue
+        try:
+            height = int(fmt.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        best = max(best, height)
+    return best
+
+
+def log_download_choice(logger, info, max_height=None):
+    """Log the chosen rendition, and warn when Max Download Quality capped it.
+
+    The recurring "my compilation looks soft" report is usually a source-side
+    ceiling: a 720p/480p download that the compile later upscales cannot be
+    sharpened again. Saying so at download time is the only place the user can
+    still act on it.
+    """
+    try:
+        streams = _chosen_streams(info)
+        if not streams:
+            return
+        _download_log(logger, f"Source renditions: {describe_stream_plan(streams)}")
+        best = _best_available_height(info)
+        if max_height and best > max_height:
+            _download_log(logger, (
+                f"NOTE: Max Download Quality is {max_height}p but this source offers "
+                f"up to {best}p - the download (and any clip cut from it) will be "
+                f"softer than the source. Set Max Download Quality to No Limit for "
+                f"maximum detail."))
+    except Exception:
+        pass
+
+
+def _merge_container(streams):
+    """Container that can hold every chosen stream ('mp4' or 'mkv')."""
+    video = next((str(f.get("vcodec") or "none").lower() for f in streams
+                  if str(f.get("vcodec") or "none") != "none"), "none")
+    audio = next((str(f.get("acodec") or "none").lower() for f in streams
+                  if str(f.get("acodec") or "none") != "none"), "none")
+    if video.startswith(_MP4_VIDEO_CODECS) and audio.startswith(_MP4_AUDIO_CODECS):
+        return "mp4"
+    return "mkv"
+
+
+def _ffmpeg_stream_listing(path):
+    """ffmpeg's `-i` listing for a local file ('' when unreadable)."""
+    try:
+        result = run_tracked([FFMPEG_PATH, '-hide_banner', '-i', path],
+                             timeout=120, text=True)
+    except Exception:
+        return ""
+    return f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}"
+
+
+def _sweep_stale_download_temps(output_location, max_age=24 * 3600):
+    """Remove `.autocomper-dl-*` leftovers from a killed run (never fresh ones).
+
+    A hard kill (task kill, power loss) leaves the partial stream files behind,
+    and those are full-size video streams - exactly the "temp files flooded my
+    folder" complaint from the compile path. Only entries older than ``max_age``
+    are removed, so a concurrently running download can never lose its files.
+    """
+    try:
+        entries = os.listdir(output_location)
+    except OSError:
+        return
+    cutoff = time.time() - max_age
+    for name in entries:
+        if not name.startswith(_AUTOCOMPER_TEMP_PREFIX):
+            continue
+        path = os.path.join(output_location, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
+
+
+def _download_streams_with_ranges(stem, output_location, streams, logger,
+                                  concurrency=None, chunk_size=None,
+                                  bilibili_hosts=False):
+    """Fetch every chosen stream with parallel ranges, merge, return the path.
+
+    Raises on any problem at all: the caller then uses yt-dlp's own downloader,
+    so this can only ever cost time, never a download.
+    """
+    from remote_prefetch import (DEFAULT_CHUNK_SIZE, DEFAULT_CONCURRENCY,
+                                 download_stream_to_file)
+
+    workers = int(concurrency or DEFAULT_CONCURRENCY)
+    chunk = int(chunk_size or DEFAULT_CHUNK_SIZE)
+    os.makedirs(output_location, exist_ok=True)
+    _sweep_stale_download_temps(output_location)
+    token = f"{_AUTOCOMPER_TEMP_PREFIX}{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    temporaries = []
+    known_sizes = [_stream_size(fmt) for fmt in streams]
+    overall = sum(known_sizes) if all(known_sizes) else None
+    base = [0]
+
+    def progress(done, total, elapsed):
+        current = base[0] + done
+        logger_hook = getattr(logger, "hook", None)
+        if callable(logger_hook):
+            logger_hook({
+                "status": "downloading",
+                "downloaded_bytes": current,
+                "total_bytes": overall or total,
+                "elapsed": elapsed,
+                "filename": str(stem),
+            })
+
+    def stream_url(index, fmt):
+        """Signed URL to fetch, preferring a reachable CDN node on Bilibili."""
+        url = str(fmt.get("url"))
+        if not bilibili_hosts:
+            return url
+        try:
+            from remote_media import select_fastest_bilibili_url
+            return select_fastest_bilibili_url(
+                url, headers=fmt.get("http_headers"), size=known_sizes[index],
+                log_func=lambda message: _download_log(logger, message),
+                cancel_check=cancel_pending)
+        except Exception:
+            return url
+
+    try:
+        fetched = []
+        for index, fmt in enumerate(streams):
+            suffix = str(fmt.get("ext") or "bin").lstrip(".") or "bin"
+            target = os.path.join(output_location, f"{token}.{index}.{suffix}")
+            temporaries.append(target)
+            _download_log(logger, f"Parallel transfer {index + 1}/{len(streams)}"
+                                  f" ({workers} connections)...")
+            download_stream_to_file(
+                stream_url(index, fmt), target,
+                headers=fmt.get("http_headers"), size=known_sizes[index],
+                chunk_size=chunk, concurrency=workers, logger=None,
+                progress_callback=progress, cancel_check=cancel_pending)
+            fetched.append((fmt, target))
+            base[0] += os.path.getsize(target)
+
+        hook = getattr(logger, "hook", None)
+        if callable(hook):
+            hook({"status": "finished", "total_bytes": base[0] or None,
+                  "filename": str(stem)})
+
+        if len(fetched) == 1:
+            fmt, path = fetched[0]
+            ext = str(fmt.get("ext") or "mp4").lstrip(".") or "mp4"
+            final = os.path.join(output_location, f"{os.path.basename(str(stem))}.{ext}")
+            os.replace(path, final)
+            return final
+
+        video = next((path for fmt, path in fetched
+                      if str(fmt.get("vcodec") or "none") != "none"), None)
+        audio = next((path for fmt, path in fetched
+                      if str(fmt.get("acodec") or "none") != "none"), None)
+        if video is None or audio is None:
+            raise DownloadError("the selected streams have no video+audio pair")
+        container = _merge_container([fmt for fmt, _path in fetched])
+        merged = os.path.join(output_location, f"{token}.merged.{container}")
+        temporaries.append(merged)
+        _download_log(logger, f"Merging streams (copy) into {container}...")
+        command = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+                   '-i', video, '-i', audio, '-map', '0:v:0', '-map', '1:a:0',
+                   '-c', 'copy']
+        if container == "mp4":
+            command += ['-movflags', '+faststart']
+        command.append(merged)
+        merge_timeout = max(900, int(sum(os.path.getsize(p) for _f, p in fetched)
+                                     / (1024 * 1024)))
+        result = run_tracked(command, timeout=merge_timeout, text=True)
+        if result.returncode != 0:
+            raise DownloadError(f"stream copy merge failed: {result.stderr or ''}".strip())
+        listing = _ffmpeg_stream_listing(merged)
+        if 'Video:' not in listing or 'Audio:' not in listing:
+            raise DownloadError("merged file is missing a video or audio stream")
+        final = os.path.join(output_location, f"{os.path.basename(str(stem))}.{container}")
+        os.replace(merged, final)
+        return final
+    finally:
+        for path in temporaries:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+
+def _is_bilibili_info(info):
+    """True when a resolved yt-dlp info dict came from a Bilibili extractor."""
+    if not isinstance(info, dict):
+        return False
+    for key in ("extractor", "extractor_key", "webpage_url"):
+        value = str(info.get(key) or "").lower()
+        if value.startswith("bilibili") or "bilibili.com" in value:
+            return True
+    return False
+
+
+def _accelerated_download(stem, output_location, info, logger,
+                          concurrency=None, chunk_size=None, max_speed=0):
+    """Parallel Full Download when possible; None means "use yt-dlp"."""
+    streams = parallel_download_plan(info, max_speed=max_speed)
+    if not streams:
+        _download_log(logger, "Parallel transfer not applicable for this source; "
+                              "using the standard downloader")
+        return None
+    _download_log(logger, f"Parallel transfer: {describe_stream_plan(streams)}")
+    try:
+        return _download_streams_with_ranges(
+            stem, output_location, streams, logger,
+            concurrency=concurrency, chunk_size=chunk_size,
+            bilibili_hosts=_is_bilibili_info(info))
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        _download_log(logger, f"Parallel transfer failed ({exc}); retrying with "
+                              f"the standard downloader")
+        return None
+
+
+# 音频模式的目标编码 → ffmpeg 参数（yt-dlp 的 FFmpegExtractAudio 等价形式）。
+_AUDIO_ENCODERS = {
+    "mp3": ("libmp3lame", True),
+    "m4a": ("aac", True),
+    "aac": ("aac", True),
+    "opus": ("libopus", True),
+    "ogg": ("libvorbis", True),
+    "vorbis": ("libvorbis", True),
+    "flac": ("flac", False),
+    "wav": ("pcm_s16le", False),
+}
+
+
+def _audio_postprocess_target(ydl_opts):
+    for step in (ydl_opts.get('postprocessors') or []):
+        if not isinstance(step, dict):
+            continue
+        codec = str(step.get('preferredcodec') or '').strip().lower()
+        if codec:
+            return codec, str(step.get('preferredquality') or '').strip()
+    return None, None
+
+
+def _accelerated_audio_download(stem, output_location, info, logger, ydl_opts,
+                                concurrency=None, chunk_size=None, max_speed=0):
+    """Audio mode: parallel transfer + the postprocessor's codec conversion.
+
+    Falls back to the yt-dlp path whenever the target codec is not one this
+    knows how to produce, so an unsupported combination can never produce a
+    wrong file.
+    """
+    streams = parallel_download_plan(info, max_speed=max_speed)
+    if not streams or len(streams) != 1:
+        _download_log(logger, "Parallel transfer not applicable for this source; "
+                              "using the standard downloader")
+        return None
+    if str(streams[0].get('acodec') or 'none') == 'none':
+        return None
+    codec, quality = _audio_postprocess_target(ydl_opts)
+    encoder = _AUDIO_ENCODERS.get(codec) if codec else None
+    if encoder is None:
+        _download_log(logger, f"Parallel transfer skipped for target codec "
+                              f"{codec or 'unknown'}")
+        return None
+    _download_log(logger, f"Parallel transfer: {describe_stream_plan(streams)}")
+    downloaded = None
+    final = None
+    try:
+        downloaded = _download_streams_with_ranges(
+            stem, output_location, streams, logger,
+            concurrency=concurrency, chunk_size=chunk_size,
+            bilibili_hosts=_is_bilibili_info(info))
+        if os.path.splitext(downloaded)[1].lstrip('.').lower() == codec:
+            return downloaded
+        final = os.path.join(output_location,
+                             f"{os.path.basename(str(stem))}.{codec}")
+        _convert_audio(downloaded, final, encoder, quality)
+        return final
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        _download_log(logger, f"Parallel transfer failed ({exc}); retrying with "
+                              f"the standard downloader")
+        return None
+    finally:
+        # 中间文件（原始编码的下载件）在转换成功后必须清掉；转换失败时它同样
+        # 没有用处，一并删除，避免在下载目录里留下半个产物。
+        if downloaded and final is not None and os.path.exists(downloaded):
+            try:
+                os.remove(downloaded)
+            except OSError:
+                pass
+
+
+def _convert_audio(source_path, target_path, encoder, quality):
+    """Transcode one audio file (the FFmpegExtractAudio equivalent)."""
+    codec, uses_bitrate = encoder
+    temporary = os.path.join(
+        os.path.dirname(target_path) or ".",
+        f"{_AUTOCOMPER_TEMP_PREFIX}{uuid.uuid4().hex[:8]}.{codec}")
+    command = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+               '-i', source_path, '-vn', '-c:a', codec]
+    if uses_bitrate:
+        bitrate = quality if quality and quality.isdigit() else '192'
+        command += ['-b:a', f'{bitrate}k']
+    command.append(temporary)
+    try:
+        result = run_tracked(command, timeout=3600, text=True)
+        if result.returncode != 0:
+            raise DownloadError(f"audio conversion failed: {result.stderr or ''}".strip())
+        listing = _ffmpeg_stream_listing(temporary)
+        if 'Audio:' not in listing:
+            raise DownloadError("converted audio file has no audio stream")
+        os.replace(temporary, target_path)
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+
+
+
 def convert_quality_str_to_int(quality: str) -> int:
     if not quality:
         return None
@@ -746,7 +1164,7 @@ def yt_dlp_version() -> str:
         return "unknown"
 
 
-def download_video(url: str, filename: str, output_location: str, max_quality: str, max_speed: int, logger, n_retries: int = 3, browser_cookies: str | None = None) -> Tuple[bool, str]:
+def download_video(url: str, filename: str, output_location: str, max_quality: str, max_speed: int, logger, n_retries: int = 3, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None) -> Tuple[bool, str]:
     logger.reset_total_progress(100)
     os.makedirs(output_location, exist_ok=True)
 
@@ -784,14 +1202,27 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                 sys.stderr = devnull
 
                 try:
-                    with YoutubeDL(ydl_opts) as ydl:
-                        video_info = ydl.extract_info(url, download=False)
+                    # format 必须在解析前设好：选中结果（requested_formats）是并行
+                    # 传输规划的依据，否则要多做一次完整解析。
+                    ydl_opts['format'] = format_str
+                    try:
+                        with YoutubeDL(ydl_opts) as ydl:
+                            video_info = ydl.extract_info(url, download=False)
+                    except Exception:
+                        # 提前设定 format 后，"选不出任何格式"（例如纯音频源配上
+                        # 720p 上限）会在解析阶段就抛错，而旧行为是解析成功、再由
+                        # has_video 判定跳过。退回无格式解析以保持旧行为。
+                        ydl_opts.pop('format', None)
+                        with YoutubeDL(ydl_opts) as ydl:
+                            video_info = ydl.extract_info(url, download=False)
+                        ydl_opts['format'] = format_str
                     try:
                         estimated = estimate_download_size(video_info)
                     except Exception:
                         estimated = None
                     check_download_space(output_location, estimated)
-                    ydl_opts['format'] = format_str
+                    if attempts == 0:
+                        log_download_choice(logger, video_info, max_height)
                     parallel = _supports_parallel_fragments(video_info)
                     if parallel and attempts == 0:
                         ydl_opts['concurrent_fragment_downloads'] = 4
@@ -809,6 +1240,18 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                     )
                     if not has_video:
                         return True, None
+                    # 并行 Range 传输（Bilibili/YouTube 的整段 https 格式）：yt-dlp
+                    # 对这类格式只能单连接，而 B 站按连接限速。失败即回落 yt-dlp。
+                    if max_speed and int(max_speed) > 0:
+                        _download_log(logger, 'Speed limit is set; using the standard '
+                                              'resumable downloader')
+                    else:
+                        accelerated = _accelerated_download(
+                            filename, output_location, video_info, logger,
+                            concurrency=concurrency, chunk_size=chunk_size,
+                            max_speed=max_speed)
+                        if accelerated:
+                            return True, accelerated
                     with YoutubeDL(ydl_opts) as ydl:
                         info_dict = ydl.extract_info(url, download=True)
 
@@ -817,6 +1260,9 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                     output_file = os.path.join(output_location, f"{os.path.basename(filename)}.{file_ext}")
                     shutil.move(source_file, output_file)
                     return True, output_file
+                except InterruptedError:
+                    # 用户在并行传输中按了 Stop：当成取消向上抛，不要走重试。
+                    raise
                 except Exception as e:
                     last_error = e
                     attempts += 1
@@ -828,7 +1274,7 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
     return False, str(last_error) if last_error else "download failed"
 
 
-def download_audio(url: str, filename: str, output_location: str, max_speed: int, logger, n_retries: int = 10, browser_cookies: str | None = None) -> Tuple[bool, str]:
+def download_audio(url: str, filename: str, output_location: str, max_speed: int, logger, n_retries: int = 10, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None) -> Tuple[bool, str]:
     logger.reset_total_progress(100)
 
     os.makedirs(output_location, exist_ok=True)
@@ -871,6 +1317,8 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                         except Exception:
                             estimated = None
                         check_download_space(output_location, estimated)
+                        if attempts == 0:
+                            log_download_choice(logger, metadata, None)
                         if _supports_parallel_fragments(metadata) and attempts == 0:
                             ydl_opts['concurrent_fragment_downloads'] = 4
                             _download_log(logger, 'Download resume enabled; parallel fragments enabled')
@@ -878,6 +1326,16 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                             _download_log(logger, 'Parallel download failed; retrying sequentially')
                         else:
                             _download_log(logger, 'Download resume enabled; sequential transfer')
+                        if max_speed and int(max_speed) > 0:
+                            _download_log(logger, 'Speed limit is set; using the standard '
+                                                  'resumable downloader')
+                        else:
+                            accelerated = _accelerated_audio_download(
+                                filename, output_location, metadata, logger, ydl_opts,
+                                concurrency=concurrency, chunk_size=chunk_size,
+                                max_speed=max_speed)
+                            if accelerated:
+                                return True, accelerated
                         info_dict = ydl.extract_info(url, download=True)
                         file_ext = ydl.params['postprocessors'][0].get(
                             'preferredcodec', info_dict.get('ext', 'mp3'))
@@ -885,6 +1343,9 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                         output_file = os.path.join(output_location, f"{os.path.basename(filename)}.{file_ext}")
                         shutil.move(source_file, output_file)
                         return True, output_file
+                except InterruptedError:
+                    # 同 download_video：并行传输中的 Stop 是取消，不是失败。
+                    raise
                 except Exception as e:
                     last_error = e
                     attempts += 1

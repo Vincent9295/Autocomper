@@ -150,7 +150,8 @@ REMOTE_CONCURRENCY_DEFAULT = 5
 REMOTE_CONCURRENCY_MIN = 1
 REMOTE_CONCURRENCY_MAX = 16
 REMOTE_AUDIO_CHUNK_TOOLTIP_TEXT = (
-    "Audio Cache download chunk size, in MiB.\n"
+    "Audio Cache download chunk size, in MiB. Also used by Full Download's\n"
+    "parallel transfer (Bilibili/YouTube download one connection otherwise).\n"
     "Smaller chunks recover faster when a single request hangs; larger chunks\n"
     "make fewer requests. This setting depends heavily on your CDN and network:\n"
     "if your connection is unstable, a large chunk can hang forever and stall the\n"
@@ -158,11 +159,13 @@ REMOTE_AUDIO_CHUNK_TOOLTIP_TEXT = (
     "automatically (bytes=0-0) so they still use the parallel prefetch path."
 )
 REMOTE_AUDIO_CONCURRENCY_TOOLTIP_TEXT = (
-    "How many chunks to download in parallel for one Audio Cache file, and how\n"
-    "many workers YouTube Remote Stream prefetch uses. More workers may finish\n"
-    "faster on a good connection, but on an unstable or rate-limited CDN more\n"
-    "concurrent requests can trip protection and cause 403s or stalls. Lower to\n"
-    "1-2 if a batch hangs partway. Default: 8 (max 32)."
+    "How many chunks to download in parallel for one Audio Cache file, how many\n"
+    "workers YouTube Remote Stream prefetch uses, and how many connections Full\n"
+    "Download opens per stream (Bilibili throttles a single connection hard:\n"
+    "measured ~1 MB/s on one connection vs ~20 MB/s with four). More workers may\n"
+    "finish faster on a good connection, but on an unstable or rate-limited CDN\n"
+    "more concurrent requests can trip protection and cause 403s or stalls.\n"
+    "Lower to 1-2 if a batch hangs partway. Default: 8 (max 32)."
 )
 REMOTE_AUDIO_CHUNK_DEFAULT = 8
 REMOTE_AUDIO_CHUNK_MIN = 1
@@ -6493,7 +6496,9 @@ class VideoProcessorApp:
             if media_type == 'video':
                 success, result = download_video(
                     media_url, stem, download_path, self.max_quality.get(), self.max_download_speed.get(), self.final_bar,
-                    browser_cookies=browser_cookies)
+                    browser_cookies=browser_cookies,
+                    concurrency=self.remote_audio_concurrency.get(),
+                    chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024)
                 if success:
                     if result:
                         self.uploaded_videos[i].set_path(result)
@@ -6512,7 +6517,9 @@ class VideoProcessorApp:
             elif media_type == 'audio':
                 success, result = download_audio(
                     media_url, stem, download_path, self.max_download_speed.get(), self.final_bar,
-                    browser_cookies=browser_cookies)
+                    browser_cookies=browser_cookies,
+                    concurrency=self.remote_audio_concurrency.get(),
+                    chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024)
                 if success and result:
                     self.uploaded_videos[i].set_path(result)
                     self.uploaded_videos[i].set_is_url(False)

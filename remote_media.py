@@ -2097,11 +2097,24 @@ def correct_clip_placement(source, path, nominal_start, duration, *, cache_store
                         refresh_func=refresh_func, audio_only=audio_only, codec=codec):
         pre_duration = _segment_duration(candidate) or (pre_end - pre_start)
         inside = measure_clip_placement(candidate, pre_start, pre_duration, reference.read)
-        if inside is not None and inside["stable"] and inside["head"] is not None:
+        # 窗口开头的静音会让 head 探针过不了 level 门限（head=None → stable=False），
+        # 但窗口本身可能已经完全对齐：Typicatly 那 19 段就是卡在这里——pre-roll
+        # 窗口每个可测点都在 −0.021s，按名义偏移裁出来就是对的，却因为 head 不可测
+        # 放弃了整个修法 2。所以"head 不可测、其余探针一致对齐"时按窗口原点处理
+        # （head 视为 0.0），照常本地裁；裁完仍要重测通过，猜错不会被留下。
+        usable_head = None if inside is None else inside["head"]
+        if (usable_head is None and inside is not None and inside["tail"] is not None
+                and abs(float(inside["delta"])) <= _PLACEMENT_TOLERANCE):
+            if logger is not None:
+                logger("Pre-roll window's head probe is silent but the rest of the "
+                       "window is aligned; cutting it at the nominal offset")
+            usable_head = 0.0
+        if (inside is not None and usable_head is not None
+                and (inside["stable"] or usable_head == 0.0)):
             # 窗口内"意图起点"的位置：窗口自身的落点偏移是 head，窗口里偏移 o 的
             # 内容对应的媒体时间 = pre_start + o + head，令它等于意图起点即可。
             # （实测 Twitch：pre_start=15495.40、head=-0.02 → 偏移 6.02s。）
-            offset = (float(nominal_start) - pre_start) - float(inside["head"])
+            offset = (float(nominal_start) - pre_start) - float(usable_head)
             if offset >= 0.0 and offset + duration <= pre_duration + _PLACEMENT_TOLERANCE:
                 cut = path.with_name(f"{path.stem}.cut{path.suffix}")
                 cut.unlink(missing_ok=True)
@@ -3160,6 +3173,83 @@ def _expand_bilibili_audio_candidates(candidates: list[dict[str, Any]]) -> list[
     filtered = [item for item in expanded
                 if not _is_slow_bilibili_cdn_host(item.get("cdn_host"))]
     return filtered if filtered else expanded
+
+
+_BILIBILI_CDN_SUFFIXES = (".bilivideo.com", ".bilivideo.cn", ".akamaized.net",
+                          ".szbdyd.com")
+# Full Download 的主机选择策略：只有原节点实测"明显慢"、且流足够大（探测量相对
+# 整段下载可以忽略）时才去测镜像，最多 3 个候选；任何异常都保留原 URL。
+_FAST_HOST_SKIP_SPEED = 3.0
+_FAST_HOST_MIN_STREAM = 32 * 1024 * 1024
+_FAST_HOST_MAX_CANDIDATES = 3
+
+
+def is_bilibili_cdn_host(host: str) -> bool:
+    """True for a Bilibili media CDN host (mirror substitution is safe there)."""
+    lowered = str(host or "").lower().split(":")[0]
+    return bool(lowered) and any(lowered.endswith(suffix)
+                                 for suffix in _BILIBILI_CDN_SUFFIXES)
+
+
+def select_fastest_bilibili_url(url, headers=None, size=None, log_func=None,
+                                measure_func=None, cancel_check=None):
+    """Return the fastest reachable mirror for one Bilibili stream URL.
+
+    All known mirrors serve the same signed path+query, so only the host changes
+    (exactly what the Audio Cache candidate pool does for audio). The assigned
+    node is kept unless it measures clearly slow, so the common case costs one
+    bounded read and no extra requests.
+    """
+    original = str(url or "")
+    parsed = urlsplit(original)
+    if not is_bilibili_cdn_host(parsed.netloc):
+        return original
+    variants = _bilibili_cdn_variants(original)
+    alternatives = [item for item in variants
+                    if urlsplit(item).netloc != parsed.netloc
+                    and not _is_slow_bilibili_cdn_host(urlsplit(item).netloc)]
+    if not alternatives:
+        return original
+    if size is not None:
+        try:
+            if int(size) < _FAST_HOST_MIN_STREAM:
+                return original
+        except (TypeError, ValueError):
+            pass
+    if measure_func is None:
+        from remote_prefetch import measure_stream_throughput as measure_func  # noqa: N813
+    probe_bytes = 4 * 1024 * 1024
+    if size:
+        try:
+            probe_bytes = max(1024 * 1024, min(probe_bytes, int(size) // 64))
+        except (TypeError, ValueError):
+            pass
+    if callable(cancel_check) and cancel_check():
+        return original
+    try:
+        measured = measure_func(original, dict(headers or {}), probe_bytes=probe_bytes)
+    except Exception:
+        return original
+    if measured is not None and measured >= _FAST_HOST_SKIP_SPEED:
+        return original
+    best_url = original
+    best_speed = measured if measured is not None else -1.0
+    for candidate in alternatives[:_FAST_HOST_MAX_CANDIDATES]:
+        if callable(cancel_check) and cancel_check():
+            break
+        try:
+            speed = measure_func(candidate, dict(headers or {}),
+                                 probe_bytes=probe_bytes)
+        except Exception:
+            speed = None
+        if speed is not None and speed > best_speed:
+            best_speed = speed
+            best_url = candidate
+    if best_url != original and log_func is not None:
+        old_speed = f"{measured:.2f} MB/s" if measured is not None else "unmeasurable"
+        log_func(f"Bilibili CDN: {urlsplit(best_url).netloc} ({best_speed:.2f} MB/s) "
+                 f"chosen over {parsed.netloc} ({old_speed})")
+    return best_url
 
 
 def _candidate_sort_key(candidate: Mapping[str, Any], audio: bool) -> tuple[Any, ...]:

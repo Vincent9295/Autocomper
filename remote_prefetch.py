@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import re
+import threading
 import time
 from typing import Mapping
 from urllib.parse import urljoin
@@ -120,6 +121,52 @@ def _probe_real_size(url, headers, timeout=15, request_func=None):
     if not isinstance(response_headers, Mapping):
         return None
     content_range = str(response_headers.get("content-range") or response_headers.get("Content-Range") or "")
+    m = re.match(r"bytes \d+-\d+/(\d+)", content_range)
+    if not m:
+        return None
+    try:
+        total = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
+def _probe_stream_size(url, headers, timeout=15, request_func=None):
+    """Authoritative stream size from a one-byte range request.
+
+    Same idea as ``_probe_real_size`` but it never buffers a body: Full Download
+    moves gigabyte video streams, and a server that ignores ``Range`` and answers
+    200 with the whole file would otherwise be read into memory before the status
+    check. Only a compliant 206 with a single byte is accepted, so this doubles
+    as the "does this stream support range transfer at all" gate.
+    """
+    if request_func is not None:
+        try:
+            result = request_func(url, 0, 0, dict(headers or {}), timeout)
+        except Exception:
+            return None
+        if not isinstance(result, tuple) or len(result) < 2:
+            return None
+        data, status = result[0], result[1]
+        response_headers = result[2] if len(result) == 3 and result[2] else {}
+        try:
+            if int(status) != 206 or len(bytes(data or b"")) != 1:
+                return None
+        except (TypeError, ValueError):
+            return None
+        content_range = str(response_headers.get("content-range")
+                            or response_headers.get("Content-Range") or "")
+    else:
+        request = Request(url, headers={**dict(headers or {}), "Range": "bytes=0-0"})
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                content_range = str(response.headers.get("Content-Range") or "")
+                response.read(1)
+        except Exception:
+            return None
+        if status != 206:
+            return None
     m = re.match(r"bytes \d+-\d+/(\d+)", content_range)
     if not m:
         return None
@@ -311,6 +358,204 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
         for future in futures:
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+def download_stream_to_file(url, destination, headers=None, size=None,
+                            chunk_size=DEFAULT_CHUNK_SIZE,
+                            concurrency=DEFAULT_CONCURRENCY, request_func=None,
+                            logger=None, progress_callback=None, max_attempts=None,
+                            retry_delays=DEFAULT_RETRY_DELAYS, sleep_func=time.sleep,
+                            cancel_check=None):
+    """Write one http(s) stream to ``destination`` with parallel Range requests.
+
+    Full Download used to be plain yt-dlp: for Bilibili/YouTube the chosen
+    formats are ``protocol=https`` with no fragments, so yt-dlp transfers them on
+    ONE connection and Bilibili's per-connection throttle caps it around
+    1 MB/s (measured 0.9-1.8 MB/s single vs 20-23 MB/s with four range requests
+    on the same URL). This is the transfer the Audio Cache already had; the
+    function is deliberately transport-only so a caller can fall back to the
+    normal resumable downloader if anything here is unsupported.
+
+    Returns the number of bytes written. Raises ``RangePrefetchError`` when the
+    stream size cannot be established, the server does not answer 206, or one
+    range keeps failing - the caller then re-downloads with yt-dlp.
+    """
+    try:
+        chunk_size = int(chunk_size)
+        concurrency = int(concurrency)
+    except (TypeError, ValueError) as exc:
+        raise RangePrefetchError("invalid parallel download parameters") from exc
+    if chunk_size <= 0 or concurrency <= 0:
+        raise RangePrefetchError("parallel download requires positive chunk size and concurrency")
+    request = request_func or _default_request
+    header_map = dict(headers or {})
+    # 总是先探测真实大小：① 顺带确认服务端真的支持 Range（不回 206 就直接
+    # 放弃，交回 yt-dlp）；② yt-dlp 的 filesize_approx 对 Bilibili 可能偏大或
+    # 偏小，按错的 size 划分区间会卡在尾部（越界 416 / 少下尾部 box）。
+    probed = _probe_stream_size(url, header_map, request_func=request_func)
+    if probed is not None:
+        size = probed
+    try:
+        size = int(size)
+    except (TypeError, ValueError) as exc:
+        raise RangePrefetchError("unknown stream size") from exc
+    if size <= 0:
+        raise RangePrefetchError("unknown stream size")
+
+    # 与 iter_range_bytes 同样的上限保护：超大 chunk 会让单个请求退化成
+    # 全文件级请求，一旦挂起就要等满 timeout 才重试。
+    chunk_size = min(chunk_size, 64 * 1024 * 1024)
+    ranges = [(start, min(size - 1, start + chunk_size - 1))
+              for start in range(0, size, chunk_size)]
+    if max_attempts is None:
+        max_attempts = DEFAULT_RANGE_ATTEMPTS
+    max_attempts = max(1, int(max_attempts))
+    retry_delays = tuple(retry_delays or ())
+
+    _log(logger, f"Parallel transfer: {max(1, int(concurrency))} connections, "
+                 f"{chunk_size // (1024 * 1024)}MiB chunks, "
+                 f"{size / (1024 * 1024):.1f}MB total")
+    with open(destination, "wb") as handle:
+        handle.truncate(size)
+
+    progress_lock = threading.Lock()
+    written = [0]
+    started_at = time.monotonic()
+
+    def report():
+        if progress_callback is None:
+            return
+        with progress_lock:
+            done = written[0]
+        progress_callback(done, size, time.monotonic() - started_at)
+
+    def fetch(index, start, end):
+        last_error = None
+        for attempt in range(max_attempts):
+            if callable(cancel_check) and cancel_check():
+                raise InterruptedError("Full Download cancelled by user.")
+            try:
+                result = request(url, start, end, dict(header_map), DEFAULT_TIMEOUT)
+                if not isinstance(result, tuple) or len(result) not in (2, 3):
+                    raise RangePrefetchError("invalid range response")
+                data, status = result[:2]
+                response_headers = {}
+                if len(result) == 3 and result[2]:
+                    response_headers = {str(key).lower(): str(value)
+                                        for key, value in result[2].items()}
+                if int(status) != 206:
+                    raise RangePrefetchError("range server returned a non-partial response")
+                expected = end - start + 1
+                content_range = str(response_headers.get("content-range", "")).lower()
+                short_final = index == len(ranges) - 1 and len(data) < expected
+                cr_matches = content_range.startswith(
+                    f"bytes {start}-{start + len(data) - 1}/")
+                if len(data) != expected and not (short_final and cr_matches):
+                    raise RangePrefetchError("range response length mismatch")
+                if not data:
+                    raise RangePrefetchError("range response was empty")
+                with open(destination, "r+b") as handle:
+                    handle.seek(start)
+                    handle.write(data)
+                with progress_lock:
+                    written[0] += len(data)
+                report()
+                return index
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < max_attempts and retry_delays:
+                    sleep_func(retry_delays[min(attempt, len(retry_delays) - 1)])
+        raise RangePrefetchError(
+            f"range {start}-{end} failed after {max_attempts} attempts") from last_error
+
+    executor = ThreadPoolExecutor(max_workers=max(1, int(concurrency)))
+    futures = {}
+    window = max(1, int(concurrency)) * 2
+    next_index = 0
+    try:
+        while next_index < len(ranges) and len(futures) < window:
+            start, end = ranges[next_index]
+            futures[executor.submit(fetch, next_index, start, end)] = next_index
+            next_index += 1
+        while futures:
+            completed = next(as_completed(tuple(futures)))
+            futures.pop(completed)
+            completed.result()
+            while next_index < len(ranges) and len(futures) < window:
+                start, end = ranges[next_index]
+                futures[executor.submit(fetch, next_index, start, end)] = next_index
+                next_index += 1
+    except InterruptedError:
+        for future in futures:
+            future.cancel()
+        raise
+    except Exception as exc:
+        for future in futures:
+            future.cancel()
+        raise RangePrefetchError("parallel transfer failed") from exc
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    report()
+    with progress_lock:
+        total_written = written[0]
+    if total_written != size:
+        raise RangePrefetchError(
+            f"parallel transfer wrote {total_written} of {size} bytes")
+    return total_written
+
+
+def measure_stream_throughput(url, headers=None, probe_bytes=4 * 1024 * 1024,
+                             deadline=6.0, request_func=None):
+    """MB/s from one bounded, wall-clock-capped range read (None = unmeasurable).
+
+    Bilibili nodes vary far more than they should: the same VOD measured minutes
+    apart on different mirrors gave 0.4-0.6 MB/s on one and 13-20 MB/s on
+    another, so picking a host is worth one bounded probe before committing to a
+    multi-gigabyte download.
+    """
+    try:
+        probe_bytes = int(probe_bytes)
+    except (TypeError, ValueError):
+        return None
+    if probe_bytes <= 0:
+        return None
+    started = time.monotonic()
+    if request_func is not None:
+        try:
+            result = request_func(url, 0, probe_bytes - 1, dict(headers or {}), deadline)
+        except Exception:
+            return None
+        if not isinstance(result, tuple) or len(result) < 2:
+            return None
+        try:
+            if int(result[1]) != 206:
+                return None
+        except (TypeError, ValueError):
+            return None
+        received = len(bytes(result[0] or b""))
+    else:
+        request = Request(url, headers={**dict(headers or {}),
+                                        "Range": f"bytes=0-{probe_bytes - 1}"})
+        received = 0
+        try:
+            with urlopen(request, timeout=deadline) as response:
+                if int(getattr(response, "status", response.getcode())) != 206:
+                    return None
+                while received < probe_bytes and time.monotonic() - started < deadline:
+                    block = response.read(min(262144, probe_bytes - received))
+                    if not block:
+                        break
+                    received += len(block)
+        except Exception:
+            if received <= 0:
+                return None
+    elapsed = max(time.monotonic() - started, 0.001)
+    if received <= 0:
+        return None
+    return received / elapsed / (1024 * 1024)
 
 
 def _hls_attribute(line, name):
