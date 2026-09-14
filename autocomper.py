@@ -61,7 +61,8 @@ from progress import (ProgressThrottle, ProgressWidgetAdapter,
                       compose_progress_title, format_compile_progress,
                       format_fetch_progress, format_transfer_progress)
 
-from compile import _get_video_duration, compile_vid, get_video_codec
+from compile import (_get_video_duration, compile_vid, get_video_codec,
+                     _UPSCALE_SHARPEN_DEFAULT, _UPSCALE_SHARPEN_MAX)
 from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
 from sound_reader import (RemoteAudioIncompleteError, RemoteAudioStallError,
@@ -2218,10 +2219,12 @@ def _txt_suffixed_path(txt_path, suffix):
     return root + suffix + ".txt"
 
 
-# 三种固定名 timestamps 文件的语义（读取侧）：base 是纯检测结果，
+# 固定名 timestamps 文件的语义（读取侧）：base 是纯检测结果，
 # _reverified 含 reverify 追加的 [new] 片段，_selected 是上次 Review 后
 # 真正参与编译的集合。检测分支只写；load 分支以前只读 base，
 # 导致"跳过检测重跑"会丢掉 reverify 扩展（成片变短、切点生硬）。
+# _reverified_selected 是"以 _reverified 为 base 再跑一遍 Review"的产物——
+# 用户走两遍流程（先 reverify 找真打嗝片段，再 review 编译）时真正要读的就是它。
 _TIMESTAMPS_FILE_KINDS = (
     ("", "detection only",
      "raw AI detection, no re-verify extras and no Review filtering"),
@@ -2229,26 +2232,165 @@ _TIMESTAMPS_FILE_KINDS = (
      "includes the extra [new] clips re-verify found (usually longer)"),
     ("_selected", "last compiled selection",
      "detection + re-verify after your Review selection"),
+    ("_reverified_selected", "re-verify + last selection",
+     "re-verify extras AND your Review selection (the two-pass workflow file)"),
 )
 _TIMESTAMPS_PREFERENCE_VALUES = ("ask", "newest", "detection only",
-                                 "detection + re-verify", "last compiled selection")
+                                 "detection + re-verify", "last compiled selection",
+                                 "re-verify + last selection")
+_TIMESTAMPS_KIND_INFO = {suffix: (suffix, label, description)
+                         for suffix, label, description in _TIMESTAMPS_FILE_KINDS}
+
+# 同文件夹扫描的限制：只认 timestamps 家族的名字，且只在给定文件夹里找
+# （不做全盘/递归搜索——多项目共用目录时那必然串味）。
+_TIMESTAMPS_MAX_FOLDERS = 12
+_TIMESTAMPS_MAX_PER_FOLDER = 20
+_TIMESTAMPS_MAX_CANDIDATES = 40
+_TIMESTAMPS_NAME_RE = re.compile(
+    r'^(?P<stem>timestamps?|timestamp)'
+    r'(?P<reverified>_reverified)?'
+    r'(?P<selected>_selected)?$', re.IGNORECASE)
 
 
-def timestamps_load_candidates(base_txt, configured_txt="", legacy_paths=()):
+def timestamps_name_kind(stem, configured_stem=""):
+    """Classify a file name stem as a timestamps file, or None when it isn't one.
+
+    Accepts the ``timestamps`` family (singular/plural, optional
+    ``_reverified`` / ``_selected`` suffixes, in the combinations the app itself
+    writes) and the same suffixes on the configured file's stem, so a renamed or
+    custom-named file is still recognised.
+    """
+    text = str(stem or "").strip()
+    if not text:
+        return None
+    match = _TIMESTAMPS_NAME_RE.match(text)
+    configured = str(configured_stem or "").strip()
+    if match is None:
+        # A custom "Timestamp Output File" name (e.g. MyProject.txt) has its own
+        # family: MyProject_reverified.txt / MyProject_selected.txt.
+        if not configured or not text.casefold().startswith(configured.casefold()):
+            return None
+        rest = text[len(configured):]
+        suffix_match = re.fullmatch(r'(_reverified)?(_selected)?', rest, re.IGNORECASE)
+        if suffix_match is None:
+            return None
+        suffix = (rest or "").lower()
+    else:
+        suffix = f"{match.group('reverified') or ''}{match.group('selected') or ''}".lower()
+    return _TIMESTAMPS_KIND_INFO.get(suffix)
+
+
+def timestamps_search_folders(output_path, base_txt, media_paths=()):
+    """Folders to look in for existing timestamps files (same-folder scope only).
+
+    The output folder and the configured timestamps folder always qualify; every
+    folder that actually holds one of this batch's local media files qualifies
+    too, which is where a two-pass workflow keeps its
+    ``timestamps_reverified_selected.txt``. Nothing else is searched, so a shared
+    download folder cannot pull in another project's file by accident (and every
+    hit is still shown in the chooser with its folder).
+    """
+    folders = []
+
+    def add(path):
+        if not path:
+            return
+        try:
+            candidate = os.path.abspath(str(path))
+        except (OSError, ValueError):
+            return
+        if not os.path.isdir(candidate):
+            return
+        if any(os.path.normcase(candidate) == os.path.normcase(existing)
+               for existing in folders):
+            return
+        if len(folders) >= _TIMESTAMPS_MAX_FOLDERS:
+            return
+        folders.append(candidate)
+
+    if output_path:
+        add(output_path if os.path.isdir(output_path)
+            else os.path.dirname(output_path))
+    if base_txt:
+        add(os.path.dirname(base_txt))
+    for path in media_paths or ():
+        try:
+            if path and os.path.isfile(path):
+                add(os.path.dirname(path))
+        except (OSError, ValueError):
+            continue
+    return folders
+
+
+def timestamps_folder_candidates(folders, configured_txt=""):
+    """Timestamps files found in ``folders``, newest name first per folder.
+
+    Only names from the timestamps family are accepted (see
+    ``timestamps_name_kind``); a random ``.txt`` next to the media is ignored.
+    """
+    configured_stem = ""
+    if configured_txt and configured_txt != "No file selected!":
+        configured_stem = os.path.splitext(os.path.basename(str(configured_txt)))[0]
+    found = []
+    seen = set()
+    for folder in folders or ():
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        added_here = 0
+        for name in names:
+            if added_here >= _TIMESTAMPS_MAX_PER_FOLDER:
+                break
+            if len(found) >= _TIMESTAMPS_MAX_CANDIDATES:
+                break
+            if not name.lower().endswith(".txt"):
+                continue
+            stem = os.path.splitext(name)[0]
+            info = timestamps_name_kind(stem, configured_stem)
+            if info is None:
+                continue
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                key = os.path.normcase(os.path.abspath(path))
+            except (OSError, ValueError):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            suffix, label, description = info
+            found.append({
+                "path": path, "kind": suffix, "label": label,
+                "description": f"{description} (found in {os.path.basename(folder) or folder})",
+                "folder": folder,
+            })
+            added_here += 1
+    return found
+
+
+def timestamps_load_candidates(base_txt, configured_txt="", legacy_paths=(), folders=()):
     """Existing timestamps files for this session, as pickable dicts.
 
-    The three fixed-name files are listed (base / ``_reverified`` / ``_selected``),
-    plus any legacy ``timestamps.txt`` location for backward compatibility. With
-    an explicit "Timestamp Output File" in Settings the same three suffixes are
-    derived from *that* name instead: the configured path is written to, so its
-    derived files have to be readable too, and if the configured file itself is
-    missing the remaining candidates still keep skip-detection usable. Read-only:
-    the caller decides which one to load.
+    The fixed-name files are listed (base / ``_reverified`` / ``_selected`` /
+    ``_reverified_selected``), plus any legacy ``timestamps.txt`` location for
+    backward compatibility. With an explicit "Timestamp Output File" in Settings
+    the same suffixes are derived from *that* name instead: the configured path is
+    written to, so its derived files have to be readable too, and if the
+    configured file itself is missing the remaining candidates still keep
+    skip-detection usable.
+
+    ``folders`` additionally scans those folders (the output folder, the
+    configured folder and the folders that hold this batch's local media) for
+    timestamps-family ``.txt`` files, so a two-pass workflow that keeps
+    ``timestamps_reverified_selected.txt`` next to the videos no longer needs it
+    to sit at the one configured path. Read-only: the caller decides what to load.
     """
     seen = set()
     candidates = []
 
-    def add(path, kind, label, description):
+    def add(path, kind, label, description, folder=None):
         if not path:
             return
         try:
@@ -2258,8 +2400,11 @@ def timestamps_load_candidates(base_txt, configured_txt="", legacy_paths=()):
         if key in seen or not os.path.isfile(path):
             return
         seen.add(key)
-        candidates.append({"path": str(path), "kind": kind, "label": label,
-                           "description": description})
+        entry = {"path": str(path), "kind": kind, "label": label,
+                 "description": description}
+        if folder:
+            entry["folder"] = str(folder)
+        candidates.append(entry)
 
     configured = (configured_txt
                   if configured_txt and configured_txt != "No file selected!"
@@ -2274,6 +2419,9 @@ def timestamps_load_candidates(base_txt, configured_txt="", legacy_paths=()):
     for path in legacy_paths:
         add(path, "", "detection only",
             "raw AI detection, no re-verify extras and no Review filtering")
+    for candidate in timestamps_folder_candidates(folders, configured_txt):
+        add(candidate["path"], candidate["kind"], candidate["label"],
+            candidate["description"], folder=candidate.get("folder"))
     return candidates
 
 
@@ -2305,7 +2453,8 @@ def timestamps_file_summary(path):
 
 def _timestamps_kind_priority(kind):
     """Tie-break when mtimes are equal: most-processed file first."""
-    return {"_selected": 3, "_reverified": 2, "custom": 1, "": 0}.get(kind, 0)
+    return {"_reverified_selected": 4, "_selected": 3, "_reverified": 2,
+            "custom": 1, "": 0}.get(kind, 0)
 
 
 def pick_timestamps_candidate(candidates, preference="ask", summaries=None):
@@ -4234,6 +4383,20 @@ class VideoProcessorApp:
         self.res_height_label.pack(side=tk.LEFT)
         self.res_height_entry.pack(side=tk.LEFT)
 
+        # 混合分辨率：被放大的片段加 lanczos + 轻度锐化（0 = 关闭）。
+        # 放大本身补不回细节，但高频可以补一点：实测同一段 480p 源放大到 1080p
+        # 的 VMAF 从 66.9 提到 76.0、720p 段 86.6 → 96.2，而原生尺寸的片段
+        # 一个像素都不动（所以不会碰本来正常的素材）。
+        self.upscale_sharpen = tk.DoubleVar(value=_UPSCALE_SHARPEN_DEFAULT)
+        self.upscale_sharpen_frame = ttk.Frame(self.video_options_frame)
+        self.upscale_sharpen_frame.pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(self.upscale_sharpen_frame,
+                  text="Upscale sharpening:").pack(side=tk.LEFT)
+        self.upscale_sharpen_spinbox = ttk.Spinbox(
+            self.upscale_sharpen_frame, from_=0.0, to=_UPSCALE_SHARPEN_MAX,
+            increment=0.1, width=5, textvariable=self.upscale_sharpen)
+        self.upscale_sharpen_spinbox.pack(side=tk.LEFT, padx=(4, 0))
+
         self.checkbox_frame_four = ttk.Frame(self.video_options_frame)
         self.checkbox_frame_four.pack(anchor=tk.W)
         self.use_clip_padding_checkbox = ttk.Checkbutton(
@@ -4395,6 +4558,16 @@ class VideoProcessorApp:
             self.combine_checkbox, 'Combine everything into one output video.\nIf unchecked, you will instead select a directory, and output\nvideos will be saved as (original_title)_comped inside the directory.')
         res_tooltip = CustomHovertip(self.custom_resolution_checkbox,
                                      '(BUGGY) Sets the resolution of the output video(s).\nMost useful when combining videos\nof different resolutions. Only applicable if the input media is video.')
+        upscale_sharpen_tooltip = CustomHovertip(
+            self.upscale_sharpen_spinbox,
+            'Applies only to clips that have to be ENLARGED because your batch mixes\n'
+            'resolutions: they get a lanczos upscale plus a mild sharpening pass, so a\n'
+            'low-resolution clip does not look soft next to the ones that are already\n'
+            'at the output resolution. Clips at or above the output resolution are\n'
+            'never touched.\n\n'
+            '0 disables it (plain upscale, the previous behaviour).\n'
+            'Default: 0.8 (max 1.5). Higher values sharpen more, but also amplify the\n'
+            'compression blocks of low-bitrate sources.')
         norm_tooltip = CustomHovertip(
             self.normalize_audio_checkbox, 'Normalizes the audio of each clip to 0 dB. Use this if your clips have wildly different volumes.')
         output_tooltip = CustomHovertip(
@@ -4442,6 +4615,7 @@ class VideoProcessorApp:
             self.custom_resolution_checkbox,
             self.res_height_entry,
             self.res_width_entry,
+            self.upscale_sharpen_spinbox,
             self.output_location_button,
             self.normalize_audio_checkbox,
             self.toggle_button,
@@ -6052,6 +6226,12 @@ class VideoProcessorApp:
                           + (f" ({info.get('new')} [new])" if info.get("new") else "")
                           + f" · {info.get('mtime_text', '?')}")
                 ttk.Label(row, text=detail, font=(None, 9)).pack(anchor="w")
+                # 同名文件可能来自不同文件夹（影片目录 / 输出目录 / 配置目录），
+                # 不显示来源的话用户无法分辨该选哪个。
+                folder = candidate.get("folder") or os.path.dirname(candidate["path"])
+                if folder:
+                    ttk.Label(row, text=f"      in {folder}", font=(None, 9),
+                              foreground="#888888").pack(anchor="w")
                 ttk.Label(row, text=f"      {candidate['description']}",
                           font=(None, 9)).pack(anchor="w")
 
@@ -6863,7 +7043,23 @@ class VideoProcessorApp:
             else:
                 _legacy_txt.append(os.path.join(os.path.dirname(output_video_path),
                                                 "timestamps.txt"))
-            candidates = timestamps_load_candidates(base_txt, _cfg_txt, _legacy_txt)
+            # 同文件夹发现：两遍流程把 timestamps_reverified_selected.txt 放在影片
+            # 旁边（或改名成 timestamps.txt）时，以前只有"配置的绝对路径 / 输出目录
+            # 固定名"两个地方会去找，文件在影片目录里就永远读不到。现在把影片所在
+            # 目录（以及输出目录、配置目录）里的 timestamps 家族 txt 一并列出来，
+            # 只扫这些文件夹、只认这类文件名 —— 不做全盘搜索，避免串到别的项目。
+            _media_paths = []
+            for upload in getattr(self, "uploaded_videos", []) or []:
+                try:
+                    if upload.get_is_url():
+                        continue
+                    _media_paths.append(upload.get_path())
+                except Exception:
+                    continue
+            _search_folders = timestamps_search_folders(
+                output_video_path, base_txt, _media_paths)
+            candidates = timestamps_load_candidates(base_txt, _cfg_txt, _legacy_txt,
+                                                    folders=_search_folders)
             summaries = {c["path"]: timestamps_file_summary(c["path"])
                          for c in candidates}
             preference = self.timestamps_load_preference.get() or "ask"
@@ -7075,7 +7271,8 @@ class VideoProcessorApp:
                                     self.is_video, None, excluded=excluded,
                                     progress_callback=lambda sample: self._queue_transfer_progress(
                                         sample, "Compile"),
-                                    batch_size=self.merge_batch_size.get())
+                                    batch_size=self.merge_batch_size.get(),
+                    upscale_sharpen=self.upscale_sharpen.get())
                     except Exception as exc:
                         raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                     finally:
@@ -7474,7 +7671,8 @@ class VideoProcessorApp:
                                 self.is_video, None, excluded=excluded,
                                 progress_callback=lambda sample: self._queue_transfer_progress(
                                     sample, "Compile"),
-                                batch_size=self.merge_batch_size.get())
+                                batch_size=self.merge_batch_size.get(),
+                    upscale_sharpen=self.upscale_sharpen.get())
                 except Exception as exc:
                     raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                 finally:

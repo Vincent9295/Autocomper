@@ -3,6 +3,7 @@
 
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+import math
 import os
 import re
 import shutil
@@ -258,13 +259,16 @@ def _video_stream_duration(path):
     return _mp4_track_duration(path, b'vide')
 
 
-def _mixed_resolution_target(file_list):
+def _mixed_resolution_target(file_list, quiet=False):
     """混合分辨率检测（_ffmpeg_concat / _ffmpeg_concat_batched 共用）。
 
     返回目标 (w, h)；无混合或全部探测失败时返回 None。目标取出现次数最多的
     尺寸。显著低于目标的输入会被放大拼接——放大无法恢复细节，成片里这些
     片段偏软是源本身分辨率/码率不足（Bilibili 部分回放只给 360x640 低码率流），
     不是编码问题；日志明确点名，避免误判为编译退化。
+
+    ``quiet`` 供 compile_vid 使用：那里接着调用 ``log_mixed_resolution``，
+    它报得更细（每种分辨率的源/片段/分钟数 + 哪些源会被放大），重复打印会吵。
     """
     sizes = {}
     for fp in file_list:
@@ -272,25 +276,174 @@ def _mixed_resolution_target(file_list):
         if w and h:
             sizes.setdefault((w, h), []).append(os.path.basename(fp))
     if not sizes:
-        print("  No resolvable input resolutions; keeping source size.")
+        if not quiet:
+            print("  No resolvable input resolutions; keeping source size.")
         return None
     if len(sizes) == 1:
         return None
     size_text = ", ".join(f"{w}x{h}" for w, h in sorted(sizes))
-    print(f"{Fore.YELLOW}Mixed resolutions ({size_text}) -> re-encoding for sync...")
+    if not quiet:
+        print(f"{Fore.YELLOW}Mixed resolutions ({size_text}) -> re-encoding for sync...")
     # 目标取出现次数最多的尺寸；平票取面积更大的（宁可放大低清源，
     # 也不要把原生高分辨率内容降采样丢细节）。
     target = max(sizes, key=lambda k: (len(sizes[k]), k[0] * k[1]))
-    print(f"  Target resolution: {target[0]}x{target[1]}")
+    if not quiet:
+        print(f"  Target resolution: {target[0]}x{target[1]}")
     area = target[0] * target[1]
     upscaled = [name for (w, h), names in sizes.items()
                 if w * h * 2 < area for name in names]
-    if upscaled:
+    if upscaled and not quiet:
         preview = ", ".join(upscaled[:3]) + ("..." if len(upscaled) > 3 else "")
         print(f"{Fore.YELLOW}  NOTE: {len(upscaled)} clip(s) are much lower-resolution "
               f"sources and will be upscaled; their softness is a source limitation, "
               f"not an encoding issue: {preview}{Style.RESET_ALL}")
     return target
+
+
+# ── 混合分辨率：放大片段的高频补偿 ─────────────────────────────────────
+# 被放大的片段本来就没有目标分辨率的细节（源决定，谁也变不出来），但"放大之后
+# 要不要把高频补一点回来"是我们可以选的。实测（同一条真实 1080p30 素材切成
+# 1080p/720p/480p/360p 四档混编，走真实 concat 图，用原始 1080p 做参照的 VMAF）：
+#     现状 bicubic，无补偿        720p 86.6 / 480p 66.9 / 360p 69.5
+#     lanczos + unsharp(5x5,0.8)  720p 96.2 / 480p 76.0 / 360p 80.7
+#     原生 1080p 片段两者都是 97.9（一个像素都没动）
+# 所以只对"确实被放大"的输入换成 lanczos 并加一层轻度锐化；原生尺寸、以及被
+# 缩小的输入保持原样（缩小本身是锐的，锐化只会放大压缩块）。
+_UPSCALE_SHARPEN_DEFAULT = 0.8
+_UPSCALE_SHARPEN_MAX = 1.5
+_UPSCALE_MIN_FACTOR = 1.05      # 放大倍数不到这个值就不动（实测 1.07x 收益极小）
+
+
+def normalize_upscale_sharpen(value):
+    """Clamp the upscale-sharpening strength; 0 disables it entirely."""
+    try:
+        strength = float(value)
+    except (TypeError, ValueError):
+        return _UPSCALE_SHARPEN_DEFAULT
+    if not math.isfinite(strength) or strength < 0:
+        return _UPSCALE_SHARPEN_DEFAULT
+    return min(strength, _UPSCALE_SHARPEN_MAX)
+
+
+def _upscale_factor(input_file, res):
+    """How much this input is enlarged to reach ``res`` (None when unknown)."""
+    if not res or not input_file:
+        return None
+    width, height = _get_video_size(input_file)
+    if not width or not height:
+        return None
+    target_w, target_h = res
+    try:
+        return min(float(target_w) / float(width), float(target_h) / float(height))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def is_upscaled_input(input_file, res, min_factor=_UPSCALE_MIN_FACTOR):
+    """True when this input is meaningfully enlarged to reach ``res``.
+
+    Uses the same "fit" factor the scale filter applies, so a portrait clip that
+    is letterboxed (and therefore actually shrunk) is never treated as upscaled.
+    """
+    factor = _upscale_factor(input_file, res)
+    if factor is None:
+        return False
+    return factor >= float(min_factor)
+
+
+def scaled_input_filter(input_file, res, sharpen=None):
+    """Video filter chain that fits one concat input into ``res``.
+
+    Upscaled inputs get a lanczos kernel and a mild unsharp pass; everything else
+    keeps the previous behaviour. ``sharpen`` is the strength (0 disables it,
+    None means the default).
+    """
+    strength = (_UPSCALE_SHARPEN_DEFAULT if sharpen is None
+                else normalize_upscale_sharpen(sharpen))
+    target_w, target_h = res
+    upscaled = bool(strength) and is_upscaled_input(input_file, res)
+    chain = f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease'
+    if upscaled:
+        chain += ':flags=lanczos'
+    chain += f',pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2'
+    if upscaled:
+        chain += f',unsharp=5:5:{strength:g}:5:5:0.0'
+    return chain
+
+
+def resolution_report(dict_list):
+    """Per-resolution source/clip counts for the compile log.
+
+    Returns ``[(w, h), sources, clips, seconds]`` sorted by clip count, so the
+    user can see what a mixed batch is actually made of (and how much of it will
+    be upscaled) instead of only learning the distinct sizes.
+    """
+    report = {}
+    for entry in dict_list or []:
+        filename = entry.get("filename")
+        size = _get_video_size(filename) if filename else (None, None)
+        if not size[0] or not size[1]:
+            continue
+        row = report.setdefault(size, {"sources": 0, "clips": 0, "seconds": 0.0})
+        row["sources"] += 1
+        for ts in entry.get("timestamps") or []:
+            try:
+                row["clips"] += 1
+                row["seconds"] += max(0.0, float(ts["end"]) - float(ts["start"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+    return sorted(((*size, row["sources"], row["clips"], row["seconds"])
+                   for size, row in report.items()),
+                  key=lambda item: (-item[3], -(item[0] * item[1])))
+
+
+def log_mixed_resolution(dict_list, target, sharpen=None):
+    """Print what the mixed-resolution batch is made of, and who gets upscaled."""
+    if not target:
+        return
+    rows = resolution_report(dict_list)
+    if not rows:
+        return
+    strength = (_UPSCALE_SHARPEN_DEFAULT if sharpen is None
+                else normalize_upscale_sharpen(sharpen))
+    total_clips = sum(row[3] for row in rows)
+    parts = ", ".join(f"{w}x{h}: {sources} source(s), {clips} clip(s), "
+                      f"{seconds / 60:.1f} min"
+                      for w, h, sources, clips, seconds in rows)
+    print(f"{Fore.YELLOW}Mixed resolutions - {parts}")
+    up_clips = 0
+    up_seconds = 0.0
+    up_names = []
+    for w, h, _sources, clips, seconds in rows:
+        factor = min(float(target[0]) / w, float(target[1]) / h)
+        if factor >= _UPSCALE_MIN_FACTOR:
+            up_clips += clips
+            up_seconds += seconds
+            up_names.extend(os.path.basename(str(entry.get("filename")))
+                            for entry in (dict_list or [])
+                            if _get_video_size(entry.get("filename")) == (w, h))
+    if up_clips and total_clips:
+        share = up_clips * 100 // total_clips
+        summary = (f" - {up_clips} of {total_clips} clip(s) ({share}%), "
+                   f"{up_seconds / 60:.1f} min, come from smaller sources")
+    elif up_clips:
+        summary = f" - {up_clips} clip(s), {up_seconds / 60:.1f} min, come from smaller sources"
+    else:
+        summary = ""
+    print(f"  Target resolution: {target[0]}x{target[1]}{summary}")
+    if up_names:
+        preview = ", ".join(up_names[:3]) + ("..." if len(up_names) > 3 else "")
+        print(f"  Smaller sources: {preview}")
+    if not up_clips:
+        print("  Every clip is at or above the target resolution; nothing is upscaled.")
+    elif strength:
+        print(f"{Fore.YELLOW}  Enlarging cannot invent detail, so those clips get a "
+              f"lanczos upscale plus mild sharpening (strength {strength:g}) to close "
+              f"the visible gap. Set Upscale sharpening to 0 to disable."
+              f"{Style.RESET_ALL}")
+    else:
+        print("  Upscale sharpening is disabled; those clips stay as soft as a plain "
+              "upscale makes them.")
 
 
 def _get_video_duration(input_file: str):
@@ -514,9 +667,26 @@ def _align_cut_audio_to_video(path, tolerance=0.0001):
               f"{Style.RESET_ALL}")
 
 
+def cut_audio_filter(dur, normalize=False):
+    """Audio filter chain for one re-encoded clip of length ``dur``.
+
+    The clip is positioned by the output ``-ss pad`` / ``-to pad+dur`` pair, so
+    the filter chain must NOT trim its start again. An extra ``atrim={pad}:``
+    here shifted the audio by ``pad = min(_SEEK_PAD, clip start)`` (up to 10 s,
+    i.e. every clip cut from a long local file) and, whenever the clip was
+    shorter than ``pad``, removed the audio track altogether - the concat
+    pre-check then padded silence, so those clips were mute. ``apad`` to the
+    requested duration is what actually keeps A=V equal.
+    """
+    chain = 'asetpts=PTS-STARTPTS'
+    if normalize:
+        chain += ',loudnorm'
+    return f'{chain},apad=whole_dur={dur:.6f}'
+
+
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 fps=None, preserve_duration=False, progress_callback=None,
-                duration=None, batch_size=6):
+                duration=None, batch_size=6, sharpen=None):
     if not timestamps:
         return False
 
@@ -541,18 +711,15 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         s, e = timestamps[0]
         dur = e - s
         pad = min(_SEEK_PAD, s)
-        # A=V 强制相等：视频 CFR 填满到 dur（-t dur），音频 atrim+apad 到 dur
-        af = (f'atrim={pad}:{pad + dur},asetpts=PTS-STARTPTS,'
-              f'apad=whole_dur={dur:.6f}')
-        if normalize:
-            af = (f'atrim={pad}:{pad + dur},asetpts=PTS-STARTPTS,loudnorm,'
-                  f'apad=whole_dur={dur:.6f}')
+        # 定位由输出端 -ss pad / -to pad+dur 负责，滤波链只管 A=V 等长：
+        # 这里再加 atrim={pad}: 会把音频裁两次（实测丢 pad 秒，pad=10 时整轨消失）。
+        af = cut_audio_filter(dur, normalize)
 
         def build_cmd(codec):
             # -t 而不是 -shortest：-shortest 会在音频 filtergraph EOF 时立即
             # 中止调度，而 NVENC lookahead 还压着 ~15 帧（实测两流各被截短
             # 恰好 500ms——切点与输入 EOF 重合时必现）。显式 -t {dur} 让
-            # 编码器自然排水并精确封顶：视频 CFR 填满到 dur、音频 atrim
+            # 编码器自然排水并精确封顶：视频 CFR 填满到 dur、音频 apad
             # 精确到 dur → A=V=dur，无截短、无漂移。
             c = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error'] + mem_opts + [
                 '-accurate_seek',
@@ -564,9 +731,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 '-vsync', 'cfr', '-t', f'{dur:.6f}',
             ] + codec + audio_codec_tmp
             if res:
-                w, h = res
-                c.extend(['-vf', f'scale={w}:{h}:force_original_aspect_ratio=decrease,'
-                                 f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2'])
+                # 逐文件输出（非 combine）时缩放发生在这里，补偿规则与 concat 一致
+                c.extend(['-vf', scaled_input_filter(input_file, res, sharpen)])
             c.append(output_file)
             return c
 
@@ -667,7 +833,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
 
 
 def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
-                   progress_callback=None, total_duration=None, audio_out=None):
+                   progress_callback=None, total_duration=None, audio_out=None,
+                   sharpen=None):
     """Concatenate using concat FILTER (frame-level, not demuxer)."""
     if not file_list:
         return False
@@ -682,11 +849,11 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
     n = len(file_list)
     parts = []
     if res:
-        w, h = res
         for i in range(n):
-            parts.append(f'[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,'
-                         f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1:1,'
-                         f'setpts=PTS-STARTPTS[v{i}]')
+            # 被放大的输入换 lanczos + 轻度锐化（见 _UPSCALE_SHARPEN_DEFAULT 的
+            # 实测数字）；原生/被缩小的输入保持原样。
+            parts.append(f'[{i}:v]{scaled_input_filter(file_list[i], res, sharpen)},'
+                         f'setsar=1:1,setpts=PTS-STARTPTS[v{i}]')
             parts.append(f'[{i}:a]asetpts=PTS-STARTPTS[a{i}]')
     else:
         for i in range(n):
@@ -788,7 +955,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
 
 def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6,
                            fps=None, _lvl=0, progress_callback=None,
-                           temp_dir=None, total_duration=None, audio_out=None):
+                           temp_dir=None, total_duration=None, audio_out=None,
+                           sharpen=None):
     """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
     保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。
 
@@ -818,7 +986,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
     if len(file_list) <= batch_size:
         return _ffmpeg_concat(file_list, output_file, res=res, normalize=normalize, fps=fps,
                               progress_callback=progress_callback,
-                              total_duration=total_duration, audio_out=audio_out)
+                              total_duration=total_duration, audio_out=audio_out,
+                              sharpen=sharpen)
 
     # 中间文件默认与输出同盘；调用方可传入 compile 的临时目录，避免大批量
     # 合并时 _batchL* 中间件 flood 用户输出文件夹。
@@ -837,7 +1006,7 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
             ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps,
                                 progress_callback=progress_callback,
                                 total_duration=total_duration,
-                                audio_out=_FLAC_AUDIO)
+                                audio_out=_FLAC_AUDIO, sharpen=sharpen)
             if not ok:
                 raise Exception(f"Batch {bi + 1} failed")
             # 第一层 concat 偶尔会丢 ~75ms 音频（混合采样率 + filter 采样边界，
@@ -855,10 +1024,10 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                                           progress_callback=progress_callback,
                                           temp_dir=temp_dir,
                                           total_duration=total_duration,
-                                          audio_out=audio_out)
+                                          audio_out=audio_out, sharpen=sharpen)
         _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps,
                        progress_callback=progress_callback, total_duration=total_duration,
-                       audio_out=audio_out)
+                       audio_out=audio_out, sharpen=sharpen)
     finally:
         for bf in batch_files:
             try:
@@ -990,8 +1159,10 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
 
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
-                excluded=None, progress_callback=None, batch_size=6):
+                excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None):
     output_format = ".mp4" if is_video else ".mp3"
+    sharpen = (_UPSCALE_SHARPEN_DEFAULT if upscale_sharpen is None
+               else normalize_upscale_sharpen(upscale_sharpen))
 
     # 同进程二次运行会复用旧路径的 probe 结果（如 _seg0.mp4 已重写），
     # 清空缓存避免时长/尺寸用旧值。
@@ -1032,6 +1203,15 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
 
             # 固定输出帧率 30fps，防止 VFR / 25fps 导致的 A/V 偏移
             fps = 30 if is_video else None
+
+            # 混合分辨率：目标尺寸只在这里定一次（下面把 res 显式传下去，
+            # _ffmpeg_concat 里的同名回退只服务直接调用者），这样日志能报出
+            # "每种分辨率各多少源/多少片段/多少分钟、其中多少会被放大"。
+            if is_video and not res and len(dict_list) > 1:
+                res = _mixed_resolution_target([elt["filename"] for elt in dict_list],
+                                               quiet=True)
+                if res:
+                    log_mixed_resolution(dict_list, res, sharpen)
 
             # 并行预取容器元数据（填充 _PROBE_CACHE），避免 queuing 阶段串行
             # 探测大量片段文件导致 UI freeze。已带 duration 的 entry 直接跳过。
@@ -1150,6 +1330,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                                             'preserve_duration': preserve_duration,
                                             'duration': dur,
                                             'batch_size': batch_size,
+                                            'sharpen': sharpen,
                                             'progress_callback': progress_callback}
                                             if is_video else {}),
                                        normalize=normalize,
@@ -1197,7 +1378,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         tempfiles, output, res=res, normalize=normalize, fps=fps,
                         progress_callback=progress_callback,
                         temp_dir=temp_dir, total_duration=total_duration,
-                        batch_size=batch_size,
+                        batch_size=batch_size, sharpen=sharpen,
                     )
                 else:
                     concat_func(tempfiles, output, normalize=normalize,
