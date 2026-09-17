@@ -309,8 +309,24 @@ def _mixed_resolution_target(file_list, quiet=False):
 #     原生 1080p 片段两者都是 97.9（一个像素都没动）
 # 所以只对"确实被放大"的输入换成 lanczos 并加一层轻度锐化；原生尺寸、以及被
 # 缩小的输入保持原样（缩小本身是锐的，锐化只会放大压缩块）。
-_UPSCALE_SHARPEN_DEFAULT = 0.8
+#
+# 核尺寸/强度的重新标定（2026-09-18，测试者反馈"成片仍有糊掉/glitch"）：
+# VMAF 只测空间保真，测不到时间维度。用 6 段真实素材（B 站 720p 2/6 Mbps、
+# 竖屏 480p、原生 1080p）走 app 自己的两遍编码实测"帧间活动比"（1.00 = 既不
+# 增加也不减少闪烁），并同时量细节保留：
+#     链                       细节保留   帧间活动(均值/最差)   体积
+#     lanczos 无锐化            0.649      0.972 / 0.985        1.010
+#     lanczos + unsharp 5x5 0.8  0.927      1.069 / 1.132        1.000
+#     lanczos + unsharp 3x3 0.6  0.808      1.013 / 1.042        0.923
+#     unsharp 3x3 0.8（更强）     0.918      1.075 / 1.151        1.043
+# 5x5 核的 unsharp 把逐帧活动放大 9.4%，也就是压缩噪点/块边被"点亮"后逐帧
+# 抖动——这正是"糊掉/glitch 只在 B 站源上、偶尔才出现"的成因。3x3 核在同等
+# 主观锐度下把这项放大压到 4.5% 以内、最差片段 1.042（旧值 1.132）。实测还
+# 排除了两条路线：unsharp 的 luma_threshold（本版 ffmpeg 里被接受但无效果）、
+# 以及"先锐化再缩放"（同核同强度下帧间活动反而更高）。
+_UPSCALE_SHARPEN_DEFAULT = 0.6
 _UPSCALE_SHARPEN_MAX = 1.5
+_UPSCALE_SHARPEN_KERNEL = 3     # unsharp 核边长：3 比 5 的帧间抖动明显更小
 _UPSCALE_MIN_FACTOR = 1.05      # 放大倍数不到这个值就不动（实测 1.07x 收益极小）
 
 
@@ -355,8 +371,12 @@ def scaled_input_filter(input_file, res, sharpen=None):
     """Video filter chain that fits one concat input into ``res``.
 
     Upscaled inputs get a lanczos kernel and a mild unsharp pass; everything else
-    keeps the previous behaviour. ``sharpen`` is the strength (0 disables it,
-    None means the default).
+    keeps the previous behaviour. ``sharpen`` is the strength (0 disables the
+    unsharp pass, None means the default).
+
+    The unsharp kernel is deliberately small (3x3): the 5x5 kernel measured
+    ~2x the frame-to-frame amplification of the 3x3 at equal detail, which is
+    what makes compressed sources shimmer (see the calibration note above).
     """
     strength = (_UPSCALE_SHARPEN_DEFAULT if sharpen is None
                 else normalize_upscale_sharpen(sharpen))
@@ -367,7 +387,8 @@ def scaled_input_filter(input_file, res, sharpen=None):
         chain += ':flags=lanczos'
     chain += f',pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2'
     if upscaled:
-        chain += f',unsharp=5:5:{strength:g}:5:5:0.0'
+        k = _UPSCALE_SHARPEN_KERNEL
+        chain += f',unsharp={k}:{k}:{strength:g}:{k}:{k}:0.0'
     return chain
 
 

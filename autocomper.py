@@ -4565,9 +4565,12 @@ class VideoProcessorApp:
             'low-resolution clip does not look soft next to the ones that are already\n'
             'at the output resolution. Clips at or above the output resolution are\n'
             'never touched.\n\n'
-            '0 disables it (plain upscale, the previous behaviour).\n'
-            'Default: 0.8 (max 1.5). Higher values sharpen more, but also amplify the\n'
-            'compression blocks of low-bitrate sources.')
+            '0 turns the sharpening pass off (those clips keep the lanczos upscale and\n'
+            'stay a little softer).\n'
+            'Default: 0.6 (max 1.5). Higher values sharpen more, but they also amplify\n'
+            'the compression noise of low-bitrate sources, which shows up as shimmer\n'
+            'on moving detail; 0.6 was picked as the point where that stays below\n'
+            'visibility on 720p-class sources.')
         norm_tooltip = CustomHovertip(
             self.normalize_audio_checkbox, 'Normalizes the audio of each clip to 0 dB. Use this if your clips have wildly different volumes.')
         output_tooltip = CustomHovertip(
