@@ -1055,7 +1055,43 @@ def _segment_number(value: float, name: str) -> str:
 # init + 覆盖窗口的分片，先 copy remux 成本地 mp4，再按普通本地文件精确裁剪
 # （本地 -ss 不走 HLS demuxer 的 seek 路径）。窗口数学已逐像素验证：本地裁剪的
 # 帧序列与"直接从目标分片取参考帧"完全一致（0/276480 字节差异）。
+#
+# ── 同一对策也适用于 MPEG-TS：超长 VOD 的深位置 seek 会退化（2026-09-18 实测）──
+# 长 Twitch VOD 上 ffmpeg 对 **TS** playlist 的网络 seek 从某个位置起同样退化，
+# 现象与 fMP4 那类一样（打开正确分片后逐片顺序读、始终不吐帧），而且比"找不到
+# 位置"更早出现：
+#   VOD 2401406950（39.2h）：24h / 26.5h 的 clip 10s 内成功（ffmpeg 只请求
+#     0、1、目标分片及其邻居，5 个分片）；27h / 28h 则 208 / 262 次请求、读了
+#     0.3MB 却 45s 吐不出帧 → 看门狗判失败。
+#   VOD 2874334880（48h，几天前的新 VOD，同样是 TS）：26.5h 起同样失败。
+# 关键对照：**同样的分片直接按 URL 下载完全正常**（8MB / 0.3-0.5s，38h 处也一样），
+# manifest 也覆盖完整时长 → 平台没问题，是 ffmpeg 的 seek 在长 playlist 上退化。
+# 所以 TS playlist 也在"网络命令失败后"走一次本地窗口裁剪；首次仍先试网络命令，
+# 保证本来能用的位置行为不变（见 fetch_segment 里的 _hls_local_retry）。
 _HLS_SEGMENT_SUFFIXES = (".mp4", ".m4s", ".cmfv", ".cmfa", ".m4v")
+# 已经证明"网络 seek 出不了帧"的源（identity -> True）。一次失败就够：同一批
+# 批次里同一个源的后续 clip 直接走本地窗口，不必每个 clip 再白等一次单次超时
+# （实测深位置第一次网络尝试要跑满 120s）。进程内记忆，不影响别的源/别的运行。
+_hls_seek_broken: set[str] = set()
+_hls_seek_broken_lock = threading.Lock()
+
+
+def _mark_hls_seek_broken(identity) -> None:
+    with _hls_seek_broken_lock:
+        _hls_seek_broken.add(str(identity))
+
+
+def _hls_seek_is_broken(identity) -> bool:
+    with _hls_seek_broken_lock:
+        return str(identity) in _hls_seek_broken
+
+
+def reset_hls_seek_memory() -> None:
+    """Forget which sources needed the local window (tests / new batches)."""
+    with _hls_seek_broken_lock:
+        _hls_seek_broken.clear()
+
+
 _HLS_PLAN_TTL = 300.0
 _HLS_SEGMENT_TIMEOUT = 60.0
 _hls_manifest_cache: dict[str, tuple[float, tuple]] = {}
@@ -1113,13 +1149,17 @@ def hls_is_fragmented_mp4(entries) -> bool:
     return False
 
 
-def plan_hls_window(entries, start, end):
+def plan_hls_window(entries, start, end, fmp4_only=True):
     """Segments needed for [start, end] (plus seek/read margins), or None.
 
-    Returns ``None`` for TS playlists (ffmpeg seeks those fine over the network)
-    and for windows that cannot be located.
+    ``fmp4_only`` (default) keeps the historical behaviour: ``None`` for TS
+    playlists, because ffmpeg seeks those over the network perfectly well. That
+    assumption is false past a certain position on very long Twitch VODs, so the
+    retry ladder asks for the plan again with ``fmp4_only=False`` to cut from a
+    local window instead of letting ffmpeg seek the network stream (see the
+    measurement note above ``_HLS_LOCAL_FALLBACK_...``).
     """
-    if not hls_is_fragmented_mp4(entries):
+    if fmp4_only and not hls_is_fragmented_mp4(entries):
         return None
     seek_start = max(0.0, float(start) - _REMOTE_SEEK_PAD)
     window_end = float(end) + _REMOTE_READ_MARGIN
@@ -1146,12 +1186,12 @@ def plan_hls_window(entries, start, end):
     }
 
 
-def hls_window_plan(playlist_url, headers, start, end):
-    """fMP4 window plan for a stream URL, or None when not applicable.
+def hls_window_plan(playlist_url, headers, start, end, fmp4_only=True):
+    """Window plan for a stream URL, or None when not applicable.
 
-    Any failure here (playlist unreadable, TS playlist, window not found) just
-    means "use the normal network command" — this must never turn a working
-    source into a failing one.
+    Any failure here (playlist unreadable, window not found) just means "use the
+    normal network command" — this must never turn a working source into a
+    failing one.
     """
     if not _is_hls_manifest(playlist_url):
         return None
@@ -1159,7 +1199,7 @@ def hls_window_plan(playlist_url, headers, start, end):
         entries, _total = hls_playlist_entries(playlist_url, headers)
     except Exception:
         return None
-    plan = plan_hls_window(entries, start, end)
+    plan = plan_hls_window(entries, start, end, fmp4_only=fmp4_only)
     if plan is not None:
         plan["playlist_url"] = str(playlist_url)
         plan["headers"] = {str(k): str(v) for k, v in (headers or {}).items()}
@@ -2383,6 +2423,7 @@ def fetch_segment(
     max_total_duration: float = 0,
     verify_placement: bool = True,
     placement_reference: str = "auto",
+    local_window_retry: bool = True,
 ) -> Path:
     """Fetch a requested remote interval, optionally reusing covering cache.
 
@@ -2502,6 +2543,13 @@ def fetch_segment(
     # 有数据（stall 不触发）不会被误杀；连续失败累计超过该秒数则放弃，
     # 避免 materialize 卡在单个坏片段上无限 refresh 探测。
     _fail_budget_started: float | None = None
+    # 第一次网络命令失败后置位：长 playlist 上 ffmpeg 的网络 seek 会退化
+    # （见文件头的实测记录），此时连 TS playlist 也改用本地分片窗口裁剪。
+    # 首轮仍先走网络命令，保证本来能用的位置行为完全不变。
+    hls_local_retry = False
+    # 异常处理里要用它判断"这个源是不是走 HLS 窗口路径"，而 run_func（测试注入）
+    # 分支下不会赋值——先初始化，否则第一次失败就 UnboundLocalError。
+    window_url = ""
     while attempt < allowed_attempts:
         if (max_total_duration and max_total_duration > 0
                 and time.monotonic() - _fetch_started > max_total_duration):
@@ -2534,6 +2582,16 @@ def fetch_segment(
                     window_has_audio = False
                 if window_url:
                     plan = hls_window_plan(window_url, window_headers, fetch_start, fetch_end)
+                    if plan is None:
+                        # 这个源之前已经证明网络 seek 出不了帧（同一批次里别的
+                        # clip 失败过）→ 直接组本地窗口，不再白等一次超时。
+                        if hls_local_retry or _hls_seek_is_broken(identity):
+                            plan = hls_window_plan(window_url, window_headers,
+                                                   fetch_start, fetch_end,
+                                                   fmp4_only=False)
+                            if plan is not None and logger is not None:
+                                logger("Remote seek stalled; cutting this clip from a "
+                                       "locally assembled segment window instead")
                     if plan is not None:
                         # 分片读取用固定的 60s/次读（单个分片几 MB，够宽松）；窗口
                         # remux 是整个窗口的本地活，用本 clip 的自适应 timeout
@@ -2682,10 +2740,22 @@ def fetch_segment(
                     f"Could not fetch remote segment {start}-{end}: "
                     f"{_sanitize_ffmpeg_detail(exc)}"
                 )
-            # 持续失败预算：连续失败累计超 90s 仍无成功 → 放弃该片段。
-            # 防止单个坏片段（VOD 区间流不可用）无限 refresh 探测，拖住
-            # 整个 materialize（Addendum 17 移除总时长预算后无兜底）。
-            if _fail_budget_started is None:
+            # 网络命令失败一次后，下一次尝试改用本地分片窗口（长 playlist 上
+            # ffmpeg 的 seek 退化时这是唯一能出帧的路径），并把持续失败预算重新
+            # 计时：组窗口是几百 MB 的下载 + 一次 remux，本身可能几十秒，让 90s
+            # 预算把它掐死就退回"每个坏 clip 都失败"的原地状态。
+            #
+            # 顺序很重要：这一步必须先于预算检查。深位置的第一次网络尝试通常会
+            # 直接跑满单次超时（实测 120s），若先检查预算，第一次失败就已经超过
+            # 90s，预算立刻抛错，`hls_local_retry` 永远没机会置位（实测踩过）。
+            if not hls_local_retry:
+                hls_local_retry = True
+                _fail_budget_started = time.monotonic()
+                # 记住这个源：长 playlist 上 ffmpeg 的网络 seek 一退化成"逐片
+                # 顺序读、不吐帧"，后续 clip 也会一样，直接把它们送到本地窗口。
+                if window_url:
+                    _mark_hls_seek_broken(identity)
+            elif _fail_budget_started is None:
                 _fail_budget_started = time.monotonic()
             elif time.monotonic() - _fail_budget_started > 90:
                 raise SegmentFetchError(

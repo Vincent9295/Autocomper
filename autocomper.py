@@ -1570,6 +1570,12 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             # 否则会误杀正常 clip 导致"第一次跳过很多"；真卡死的连接由
             # fetch_segment 的 per-attempt stall_timeout 放弃（无数据即弃）。
             # 区间流不可用的 clip 由 retries + refresh 快速失败后跳过。
+            # retries=1（= 两次尝试）是必需的，不是保险：超长 VOD 的深位置在
+            # ffmpeg 的网络 seek 上会退化（实测 39h/48h VOD 从 26.5h 起，见
+            # remote_media 文件头的记录），第一次失败后 fetch_segment 才会改用
+            # "按分片索引下载 + 本地裁剪"的窗口路径——只有一次尝试就永远走不到
+            # 那条能出帧的路。正常 clip 第一次就成功，不受影响。
+            fetch_kwargs["retries"] = 1
             if not is_video:
                 fetch_kwargs["audio_only"] = True
             if refresh_func is not None:
