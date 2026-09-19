@@ -1178,6 +1178,114 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
 
 # ═══ Public API ═══════════════════════════════════════════════════════
 
+# ── 片段完整性比对：输出片段 vs 它自己的源片段 ─────────────────────────────
+# 背景（2026-09-19）：测试者的一次成片在 15:22-15:25 出现约 0.67s 的画面冻结，
+# 而那一处的源片段完全正常（帧数正确、帧间时间戳均匀 0.0333s、源有正常运动）。
+# 逐帧比对确认输出把源的第 38 帧重复了 20 次。重跑同一批之后该问题消失，说明它是
+# 概率性、由某次片段处理产生的，而且**只在成片里可见**——源片段和单片段路径都干净。
+#
+# 实测排除的判据（不要再走这三条路）：
+#   * ffmpeg 的 dup_frames / drop_frames 在编码输出里**不报告**，拿不到"哪一段重复"；
+#   * `freezedetect` 的噪声阈值在 720p 上无法使用：n=0.05 会把正常运动（1.97s、
+#     3.50s）判成冻结，n<=0.01 则连**整段冻结的片段**都一个都不报；
+#   * `mpdecimate` 的 drop= 计数在本版 ffmpeg 里同样不输出。
+# 所以这里自己解码算：低分辨率逐帧差分的**最长"近乎相同帧"连续长度**。
+# 判据必须是差分的（输出比源更冻才算故障）——只报"冻结段"会把源里本来就静止的
+# 片段全部误报（实测源里有整段 145 帧、131 帧静止的片段）。
+#
+# 判为故障的片段用**本地源文件重切一次**（不碰网络），再测一次；仍不合格就保留
+# 并按"未解决"如实计数，让它出现在编译日志里，而不是静默进成片。
+_INTEGRITY_W, _INTEGRITY_H = 320, 180
+_INTEGRITY_FPS = 30.0
+_INTEGRITY_FRAME_DIFF = 1.0        # 低于此值（0-255 灰度）视为"这一帧没动"
+_INTEGRITY_MIN_RUN = 8             # 连续 8 帧(0.27s)没动才算可疑，值得再量源
+# 判故障的门槛刻意比"可疑"高：实测一个 15 帧 vs 源 9 帧的正常重编码
+# （比值 1.67）是编码噪声，重切也不会有改善，报出来只会误导人。
+# 测试者真实的故障是 20 帧 vs 源 2 帧（比值 10），所以抬高门槛不丢召回。
+_INTEGRITY_FLAG_RATIO = 2.5        # 输出最长静止段 / 源最长静止段
+_INTEGRITY_FLAG_MARGIN = 10        # 且绝对差要超过 10 帧
+_INTEGRITY_SOURCE_SLACK_S = 1.0    # 源窗口前后各留的余量
+
+
+def longest_still_run(video_file, start=None, seconds=None, timeout=300):
+    """最长"连续近乎相同帧"的长度（帧数）；无法测量时返回 None。
+
+    低分辨率（320x180）解码取灰度，逐帧算平均绝对差。这比逐帧时间戳可靠：
+    时间戳在冻结时仍然均匀（实测确认），帧间差分才反映"画面真的没动"。
+    """
+    command = [FFMPEG_PATH, '-hide_banner', '-v', 'error']
+    if start is not None:
+        command += ['-ss', f'{max(0.0, float(start)):.6f}']
+    if seconds is not None:
+        command += ['-t', f'{max(0.1, float(seconds)):.6f}']
+    command += ['-i', str(video_file), '-an', '-vf',
+                f'fps={_INTEGRITY_FPS:g},scale={_INTEGRITY_W}:{_INTEGRITY_H}:'
+                f'flags=neighbor,format=gray',
+                '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+    try:
+        # 必须 text=False：_run_ffmpeg 走 text=True，会把 rawvideo 按 UTF-8 解码，
+        # 像素被替换字符破坏（实测把整段冻结算成 run=1）——那会变成"静默漏报"，
+        # 比不检查更糟，所以这里直接调 run_tracked 拿 bytes。
+        result = run_tracked(command, timeout=timeout, text=False)
+    except Exception:
+        return None
+    if getattr(result, 'returncode', 0) != 0:
+        return None
+    raw = getattr(result, 'stdout', None)
+    if not raw:
+        return None
+    if not isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.encode('latin-1', 'ignore')     # 兜底：text=True 的调用方
+        except Exception:
+            return None
+    raw = bytes(raw)
+    if raw.count(0xff) > len(raw) // 4:
+        return None            # 明显被文本解码破坏过，宁可不报也不误判
+    frame_bytes = _INTEGRITY_W * _INTEGRITY_H
+    count = len(raw) // frame_bytes
+    if count < 2:
+        return None
+    frames = np.frombuffer(raw[:count * frame_bytes], dtype=np.uint8).reshape(
+        count, _INTEGRITY_H, _INTEGRITY_W).astype(np.int16)
+    longest = run = 1
+    for index in range(1, count):
+        delta = float(np.abs(frames[index] - frames[index - 1]).mean())
+        if delta < _INTEGRITY_FRAME_DIFF:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 1
+    return longest
+
+
+def clip_integrity_problem(output_file, source_file, timestamps):
+    """这个输出片段是否比它的源片段更"静止"？
+
+    返回 (是否故障, 输出最长静止段, 源最长静止段)。测量不了时返回
+    (False, None, None)——宁可漏报也不误报：误报会重切一个本来正常的片段。
+    """
+    if not timestamps:
+        return False, None, None
+    clip_start = max(0.0, min(start for start, _ in timestamps))
+    clip_end = max(end for _, end in timestamps)
+    span = max(clip_end - clip_start, 0.1)
+    out_run = longest_still_run(output_file, 0.0, span)
+    if out_run is None:
+        return False, None, None
+    if out_run < _INTEGRITY_MIN_RUN:
+        return False, out_run, None          # 输出本来就在动，不必再量源
+    src_run = longest_still_run(
+        source_file,
+        max(0.0, clip_start - _INTEGRITY_SOURCE_SLACK_S),
+        span + 2 * _INTEGRITY_SOURCE_SLACK_S)
+    if src_run is None:
+        return False, out_run, None          # 量不到源就不动它
+    problem = (out_run > src_run * _INTEGRITY_FLAG_RATIO
+               and out_run - src_run > _INTEGRITY_FLAG_MARGIN)
+    return problem, out_run, src_run
+
+
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
                 excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None):
@@ -1339,6 +1447,23 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             if progress_callback is not None:
                 progress_callback(format_compile_progress(0, None, 0, "Compile: preparing"))
 
+            def cut_one(task):
+                """切一个片段。提取成函数是为了让完整性修复能用**完全相同**的
+                参数重切一次（否则修复后的片段与其它片段的编码路径不一致）。"""
+                _n, fn, _fn_stripped, ts, tmp, cr, preserve_duration, dur = task
+                return cut_func(fn, ts, tmp,
+                                **({'res': cr, 'fps': fps,
+                                    'preserve_duration': preserve_duration,
+                                    'duration': dur,
+                                    'batch_size': batch_size,
+                                    'sharpen': sharpen,
+                                    'progress_callback': progress_callback}
+                                    if is_video else {}),
+                                normalize=normalize,
+                                **({'progress_callback': progress_callback}
+                                   if not is_video else {}),
+                                **({'duration': dur} if not is_video else {}))
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), max_parallel)) as executor:
                 running = {}
                 for task in tasks:
@@ -1346,20 +1471,8 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         executor.shutdown(cancel_futures=True)
                         raise InterruptedError("Compile cancelled by user.")
                     n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur = task
-                    f = executor.submit(cut_func, fn, ts, tmp,
-                                        **({'res': cr, 'fps': fps,
-                                            'preserve_duration': preserve_duration,
-                                            'duration': dur,
-                                            'batch_size': batch_size,
-                                            'sharpen': sharpen,
-                                            'progress_callback': progress_callback}
-                                            if is_video else {}),
-                                       normalize=normalize,
-                                       **({'progress_callback': progress_callback}
-                                          if not is_video else {}),
-                                       **({'duration': dur} if not is_video else {}))
+                    f = executor.submit(cut_one, task)
                     running[f] = (n, fn_stripped)
-
                 cut_failures = []
                 cut_done = 0
                 cut_total = len(running)
@@ -1379,6 +1492,62 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     skipped = ", ".join(name for name, _ in cut_failures)
                     print(f"{Fore.YELLOW}{len(cut_failures)} clip(s) failed to write "
                           f"and were skipped: {skipped}{Style.RESET_ALL}")
+
+            # ── 片段完整性比对（输出 vs 源）────────────────────────────────
+            # 逐片段比对"输出比源更冻"的情况：源里本来就静止的片段会被差分判据放行，
+            # 只有编译自己产生的冻结才会被判为故障，然后用本地源重切一次修复。
+            # 见 clip_integrity_problem 上方的实测记录。
+            unresolved_clips = []
+            if is_video and tasks:
+                verified = re_cut = 0
+                for _index, task in enumerate(tasks):
+                    if cancel_pending():
+                        raise InterruptedError("Compile cancelled by user.")
+                    _n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur = task
+                    if not os.path.exists(tmp):
+                        continue           # 切片失败的片段已经报过了
+                    try:
+                        problem, out_run, src_run = clip_integrity_problem(tmp, fn, ts)
+                    except Exception as exc:                            # noqa: BLE001
+                        print(f"{Fore.YELLOW}  Clip integrity check skipped for "
+                              f"{fn_stripped}: {_sanitize_ffmpeg_detail(exc)}"
+                              f"{Style.RESET_ALL}")
+                        continue
+                    verified += 1
+                    if not problem:
+                        continue
+                    print(f"{Fore.YELLOW}  {fn_stripped}: the clip held one frame for "
+                          f"{out_run / _INTEGRITY_FPS:.2f}s while its source does not "
+                          f"(source holds at most {src_run / _INTEGRITY_FPS:.2f}s); "
+                          f"re-cutting it from the source{Style.RESET_ALL}")
+                    try:
+                        cut_one(task)
+                    except Exception as exc:                            # noqa: BLE001
+                        unresolved_clips.append((fn_stripped, out_run, src_run))
+                        print(f"{Fore.YELLOW}  Re-cut failed for {fn_stripped}: "
+                              f"{_sanitize_ffmpeg_detail(exc)}{Style.RESET_ALL}")
+                        continue
+                    after_problem, after_run, _ = clip_integrity_problem(tmp, fn, ts)
+                    if after_problem or (after_run or 0) >= max(
+                            out_run * 0.75, _INTEGRITY_MIN_RUN):
+                        # 重切没有改善（同一段字节的确定性结果）：如实报告，不静默
+                        unresolved_clips.append((fn_stripped, after_run, src_run))
+                        print(f"{Fore.YELLOW}  {fn_stripped} still holds a frame for "
+                              f"{(after_run or 0) / _INTEGRITY_FPS:.2f}s after "
+                              f"re-cutting{Style.RESET_ALL}")
+                    else:
+                        re_cut += 1
+                print(f"Clip integrity: {verified} verified, {re_cut} re-cut, "
+                      f"{len(unresolved_clips)} unresolved")
+                if unresolved_clips:
+                    names = ", ".join(name for name, _, _ in unresolved_clips[:5])
+                    more = "" if len(unresolved_clips) <= 5 else \
+                        f" (+{len(unresolved_clips) - 5} more)"
+                    print(f"{Fore.YELLOW}WARNING: {len(unresolved_clips)} clip(s) still "
+                          f"freeze for longer than their source after re-cutting: "
+                          f"{names}{more}. Their own source has the same problem, so "
+                          f"this is a source limitation, not an encoding one."
+                          f"{Style.RESET_ALL}")
 
             if combine_vids:
                 tempfiles = [t for t in [task[4] for task in tasks] if os.path.exists(t)]
