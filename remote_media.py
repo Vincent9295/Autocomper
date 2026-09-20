@@ -1568,11 +1568,56 @@ def _refresh_with_backoff(
     return limited(source)
 
 
+def _candidate_height(candidate: Mapping[str, Any] | None) -> int:
+    """候选视频流的像素高度；未知返回 0。"""
+    if not isinstance(candidate, Mapping):
+        return 0
+    try:
+        value = int(candidate.get("height") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def selected_video_height(source: MediaSource) -> int:
+    """当前选中的视频流的像素高度；未知返回 0。
+
+    解析出来的最高档位就是"这个片段本该交付的清晰度"。落盘后拿它和文件实际
+    分辨率比对（见 compile 的片段画质校验），就能把"某次取回被降到了低档位"
+    这种平时看不出来的故障变成日志里的一行。``max_height``（Max Download
+    Quality）已经在这一步之前作用过，所以这里是"用户允许的最高档"而不是
+    "站点提供的最高档"。
+    """
+    candidates = [c for c in (getattr(source, "video_candidates", None) or [])
+                  if isinstance(c, Mapping)]
+    if not candidates:
+        return 0
+    current = str(source.video_url or "")
+    for candidate in candidates:
+        if str(candidate.get("url") or "") == current:
+            height = _candidate_height(candidate)
+            if height:
+                return height
+            break
+    return _candidate_height(candidates[0])
+
+
 def _rotate_video_candidate(source: MediaSource) -> bool:
-    """无视频流失败后轮换到下一个视频候选（不同 CDN 边缘/格式）。
+    """无视频流失败后轮换到同画质或更高的视频候选（不同 CDN 边缘/格式）。
 
     视频输入拿不到帧而音频输入正常（音频走另一个 host）→ 产出只有音轨的
     片段。给该源一次换线机会；没有其他不同 URL 的候选时返回 False。
+
+    **只换不降**：候选列表里既有"同一档位的另一个 CDN 边缘"也有"更低清晰度
+    的档位"（B 站 720p/480p/360p 是三个独立 format_id + 独立 URL）。一次
+    偶发的 CDN 边缘故障如果顺手换到低档位，片段就以低分辨率落了盘并进了
+    缓存——成片里表现为"偶尔糊掉的片段"，而且因为编译只会把它放大到目标
+    尺寸，事后完全看不出来源是 480p（实测：同一批 233 个片段里有 12 个
+    480p/360p，而同源兄弟片段都是 720p/1080p，写入时间交错在同一分钟内）。
+    所以这里只在 height >= 当前 height 的候选里换线；一个都没有就返回
+    False，让调用方走原来的"重试同一 URL / refresh"路径——宁可让这个片段
+    显式失败并在日志里报出来，也不静默降画质。同档位的多 CDN 镜像不受影响
+    （height 相等），跨平台的换线恢复能力保持不变。
     """
     candidates = [c for c in (getattr(source, "video_candidates", None) or [])
                   if isinstance(c, dict) and str(c.get("url") or "")]
@@ -1582,9 +1627,20 @@ def _rotate_video_candidate(source: MediaSource) -> bool:
         current_index = urls.index(current)
     except ValueError:
         current_index = -1
+    current_height = _candidate_height(
+        candidates[current_index] if current_index >= 0 else None)
+    if current_height <= 0:
+        # 当前流不在候选表里 / 探测不到高度（未知尺寸的源）：退化成
+        # "只换 URL 中最好的那一档"，绝不低于候选表里的最高高度。
+        current_height = max([_candidate_height(c) for c in candidates] or [0])
     for step in range(1, len(urls) + 1):
         idx = (current_index + step) % len(urls)
         if urls[idx] == current:
+            continue
+        height = _candidate_height(candidates[idx])
+        # 两侧都未知（如单一直播流/无 height 元数据的源）按同档位处理：
+        # 此时"换一个 URL"就是换一个边缘，不存在画质差异。
+        if height and current_height and height < current_height:
             continue
         source.video_url = urls[idx]
         headers = candidates[idx].get("http_headers")
@@ -2764,11 +2820,19 @@ def fetch_segment(
                     f"may be unavailable).")
             # 无视频流（音频正常）→ 大概率是当前 video_url 的 CDN 边缘对本
             # 网络不可用：轮换到下一个视频候选换线重试（不消耗 refresh 名额；
-            # 刷新的重新解析可能选回同一个坏边缘）。
+            # 刷新的重新解析可能选回同一个坏边缘）。轮换**只换不降**（见
+            # _rotate_video_candidate）：这里换不动就什么都不做，让下面的
+            # 重试/refresh 阶梯继续跑——绝不用降清晰度来"修好"一次网络故障。
             if isinstance(exc, SegmentFetchError) and getattr(exc, "no_video_stream", False):
-                if _rotate_video_candidate(source) and logger is not None:
-                    logger("Remote segment produced no video stream; "
-                           "retrying with the next video candidate")
+                if _rotate_video_candidate(source):
+                    if logger is not None:
+                        logger("Remote segment produced no video stream; "
+                               "retrying with another candidate of the same or "
+                               "higher quality")
+                elif logger is not None:
+                    logger("Remote segment produced no video stream and no "
+                           "same-or-higher-quality candidate is left; retrying "
+                           "this clip instead of dropping to a lower quality")
             if refresh_func is not None and not refreshed:
                 refreshed = True
                 try:

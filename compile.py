@@ -1286,6 +1286,38 @@ def clip_integrity_problem(output_file, source_file, timestamps):
     return problem, out_run, src_run
 
 
+# ── 片段画质校验：落盘分辨率 vs 源本该交付的清晰度 ─────────────────────
+# 冻结帧比对（上面）只能发现"画面不动"，发现不了"这段被降清晰度取回"。
+# 远端 clip 是"下载下来的片段文件本身就是源"，所以对它做"输出 vs 源"的帧
+# 差分永远相等——降级在编译侧是完全隐形的，只会表现为这段偏软（而且还会被
+# 放大到目标尺寸，从输出分辨率也看不出来）。实测一次真实批次：233 个片段里
+# 12 个是 480p/360p，而同源兄弟片段都是 720p/1080p，写入时间交错在同一分钟
+# 内——这就是"偶尔几段糊掉"的成因。
+# 这里用"本该交付的高度"（autocomper 在 materialize 时按解析结果记进
+# expected_video_height）和文件实际高度比对把这类故障在编译日志里点名。
+# 容差 0.85：真正的降档远低于它（B 站 720p→480p 比值 0.667），而尺寸取整
+# （1088→1080 比值 0.993）绝不会被误报。
+_QUALITY_DOWNSCALE_TOLERANCE = 0.85
+
+
+def clip_quality_problem(clip_file, expected_height):
+    """落盘片段的清晰度是否低于源本该交付的档位？
+
+    返回 (是否降级, 交付高度, 应有高度)。拿不到预期高度或量不到文件尺寸时
+    返回 (False, None, None)——宁可漏报也不误报。
+    """
+    try:
+        expected = int(expected_height or 0)
+    except (TypeError, ValueError):
+        return False, None, None
+    if expected <= 0:
+        return False, None, None
+    _width, delivered = _get_video_size(clip_file)
+    if not delivered:
+        return False, None, expected
+    return delivered < expected * _QUALITY_DOWNSCALE_TOLERANCE, delivered, expected
+
+
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
                 excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None):
@@ -1439,8 +1471,11 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 preserve_duration = bool(
                     (elt.get('source_metadata') or {}).get(
                         'materialized_remote_segment'))
+                # 远端 clip 记录"本该交付的清晰度"（materialize 时按解析结果写入），
+                # 供下面的画质校验用；本地文件没有这个字段 → None → 不检查。
+                expected_height = elt.get('expected_video_height')
                 tasks.append((n, filename, filename_stripped, timestamps, temp,
-                              cut_res, preserve_duration, dur))
+                              cut_res, preserve_duration, dur, expected_height))
 
             if not tasks:
                 raise Exception("No timestamps found for any input media!")
@@ -1450,7 +1485,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             def cut_one(task):
                 """切一个片段。提取成函数是为了让完整性修复能用**完全相同**的
                 参数重切一次（否则修复后的片段与其它片段的编码路径不一致）。"""
-                _n, fn, _fn_stripped, ts, tmp, cr, preserve_duration, dur = task
+                _n, fn, _fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh = task
                 return cut_func(fn, ts, tmp,
                                 **({'res': cr, 'fps': fps,
                                     'preserve_duration': preserve_duration,
@@ -1470,7 +1505,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     if cancel_pending():
                         executor.shutdown(cancel_futures=True)
                         raise InterruptedError("Compile cancelled by user.")
-                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur = task
+                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh = task
                     f = executor.submit(cut_one, task)
                     running[f] = (n, fn_stripped)
                 cut_failures = []
@@ -1498,14 +1533,30 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             # 只有编译自己产生的冻结才会被判为故障，然后用本地源重切一次修复。
             # 见 clip_integrity_problem 上方的实测记录。
             unresolved_clips = []
+            downscaled_clips = []
             if is_video and tasks:
                 verified = re_cut = 0
                 for _index, task in enumerate(tasks):
                     if cancel_pending():
                         raise InterruptedError("Compile cancelled by user.")
-                    _n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur = task
+                    _n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur, expected_height = task
                     if not os.path.exists(tmp):
                         continue           # 切片失败的片段已经报过了
+                    # 画质校验（落盘片段 vs 源本该交付的档位）：降级取回的片段在
+                    # 输出侧完全隐形（编译只会把它放大到目标尺寸），只能在这里
+                    # 用"文件实际高度 vs 预期高度"揪出来。见 clip_quality_problem。
+                    try:
+                        low_quality, delivered_h, expected_h = clip_quality_problem(
+                            fn, expected_height)
+                    except Exception:                               # noqa: BLE001
+                        low_quality = False
+                    if low_quality:
+                        downscaled_clips.append((fn_stripped, delivered_h, expected_h))
+                        print(f"{Fore.YELLOW}  {fn_stripped}: this clip was fetched at "
+                              f"{delivered_h}p while the source offers {expected_h}p "
+                              f"(a lower quality variant was delivered); its "
+                              f"softness is a fetch problem, not an encoding "
+                              f"one{Style.RESET_ALL}")
                     try:
                         problem, out_run, src_run = clip_integrity_problem(tmp, fn, ts)
                     except Exception as exc:                            # noqa: BLE001
@@ -1548,6 +1599,17 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                           f"{names}{more}. Their own source has the same problem, so "
                           f"this is a source limitation, not an encoding one."
                           f"{Style.RESET_ALL}")
+                if downscaled_clips:
+                    names = ", ".join(
+                        f"{name} ({delivered}p of {expected}p)"
+                        for name, delivered, expected in downscaled_clips[:5])
+                    more = "" if len(downscaled_clips) <= 5 else \
+                        f" (+{len(downscaled_clips) - 5} more)"
+                    print(f"{Fore.YELLOW}WARNING: {len(downscaled_clips)} clip(s) were "
+                          f"delivered at a lower quality than the source offers: "
+                          f"{names}{more}. They will look softer than the rest; "
+                          f"delete those clips from the Remote Cache and re-run to "
+                          f"fetch them again.{Style.RESET_ALL}")
 
             if combine_vids:
                 tempfiles = [t for t in [task[4] for task in tasks] if os.path.exists(t)]

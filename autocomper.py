@@ -75,6 +75,7 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            apply_video_quality_limit,
                            resolve_cached_audio,
                            source_from_hydrated_entry,
+                           selected_video_height,
                            preflight_cookie_source,
                            ProbeCooldown,
                            MAX_PLAYLIST_ENTRIES,
@@ -1617,6 +1618,11 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             'filename': str(fetched),
             'timestamps': [{'start': 0.0, 'end': duration, 'pred': pred}],
             'source_url': source.source_url,
+            # 本该交付的清晰度（解析出来的最高档）。编译阶段拿它和落盘片段的
+            # 实际分辨率比对：片段被降到低档位时（见 remote_media 的
+            # _rotate_video_candidate），成片里只会表现为"这段偏软"，事后无法
+            # 从输出看出来，所以必须在日志里点名。
+            'expected_video_height': selected_video_height(source) or None,
             'source_metadata': {
                 'platform': source.platform,
                 'source_id': source.source_id,
