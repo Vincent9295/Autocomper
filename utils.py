@@ -20,6 +20,29 @@ _ACTIVE_PROCS = set()
 _cancel_requested = False
 _cancel_lock = threading.Lock()
 
+# 心跳成因提示（"并发过高 / 线路不稳"那几行）在整个进程里只打一次。
+# run_tracked_progress 是"每个 ffmpeg 进程调用一次"的，局部标志等于每个片段
+# 都会重打一遍；长批次里就是刷屏。新批次/测试用 reset_heartbeat_hint_memory()。
+_HEARTBEAT_HINT_PRINTED = False
+_heartbeat_hint_lock = threading.Lock()
+
+
+def reset_heartbeat_hint_memory() -> None:
+    """Allow the heartbeat hint to be printed once again (new batch / tests)."""
+    global _HEARTBEAT_HINT_PRINTED
+    with _heartbeat_hint_lock:
+        _HEARTBEAT_HINT_PRINTED = False
+
+
+def _claim_heartbeat_hint() -> bool:
+    """True the first time it is called in this process, False afterwards."""
+    global _HEARTBEAT_HINT_PRINTED
+    with _heartbeat_hint_lock:
+        if _HEARTBEAT_HINT_PRINTED:
+            return False
+        _HEARTBEAT_HINT_PRINTED = True
+        return True
+
 # yt-dlp 的 Twitch extractor key 是 TwitchVod / TwitchStream / TwitchClips /
 # TwitchVideos（**永远不是裸的 "twitch"**），本项目自己生成的播放列表描述符用的
 # 是 "twitch-vods"；因此 `platform == "twitch"` 这类精确比较会把所有 Twitch
@@ -368,6 +391,12 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
     every N seconds while a long encode runs, so "still working" is visible in
     the log instead of only in the progress card (ETA 00:00 previously looked
     identical to a hang).
+
+    ``heartbeat_hint`` is the one-off explanation printed next to the first
+    heartbeat. It is deduplicated **per process** (``_HEARTBEAT_HINT_PRINTED``)
+    because this function runs once per FFmpeg invocation: a long remote batch
+    would otherwise repeat the same four note lines for every single clip.
+    Callers that start a new batch can call ``reset_heartbeat_hint_memory()``.
     """
     command = list(cmd)
     if "-progress" not in command:
@@ -426,7 +455,6 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
     last_advance_at = time.monotonic()
     last_progress_value = None
     last_heartbeat = time.monotonic()
-    heartbeat_hint_printed = False
     try:
         while True:
             if cancel_pending():
@@ -485,9 +513,10 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
                       f"{encoded:.0f}s / {total_text} ({speed}, "
                       f"{now - last_advance_at:.0f}s since last progress change)")
                 # 只在"确实卡住"时打一行成因提示：满屏心跳对用户没意义，但
-                # 完全不说话又会让人以为程序挂了。每条任务只提示一次。
-                if heartbeat_hint and not heartbeat_hint_printed:
-                    heartbeat_hint_printed = True
+                # 完全不说话又会让人以为程序挂了。**整个进程只提示一次**——
+                # 这个函数每个片段都会被调用一次，按调用去重等于每个片段都重打
+                # （长批次刷屏，用户反馈过）。
+                if heartbeat_hint and _claim_heartbeat_hint():
                     print(f"  {heartbeat_hint}")
             if timeout is not None and time.monotonic() - started_at > timeout:
                 p.kill()

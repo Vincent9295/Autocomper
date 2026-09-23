@@ -259,6 +259,74 @@ def _video_stream_duration(path):
     return _mp4_track_duration(path, b'vide')
 
 
+# ── 输出帧率选择 ──────────────────────────────────────────────────────────
+# 以前无条件锁 30fps（"防止 VFR / 25fps 导致的 A/V 偏移"）。这个锁不能去掉：
+# 实测同长度、不同帧率的两个片段（30fps + 60fps）跑生产 concat，显式 fps=30 →
+# 242 帧 / PTS 0.03333s 均匀 / A−V −9ms；而 fps=None → 201 帧 / PTS **0.04000s
+# （塌到 25fps）**。所以正确做法是"仍然显式指定，但指定的值可以按源决定"。
+#
+# 实测真实 1080p60 素材（Twitch 7916 kbps，12.03s）：
+#   -r 30 → 363 帧（丢一半）/ 9.83 MB / 编码 7.91s / 逻辑帧运动量 3.80
+#   -r 60 → 722 帧（全保留）/ 9.58 MB（更小）/ 10.47s / 运动量 1.45
+# 同 CRF 下 60fps 反而略小：30fps 版每帧要描述的变化翻倍。代价只有编码时间（约 +30%）。
+_FPS_AUTO = "auto"
+# Auto 只会落到这两档：源是 29.97/23.976 这类 NTSC 帧率时归到 30（不复制帧），
+# 只有多数源确实在 48fps 以上才用 60。
+_FPS_LEVELS = (30, 60)
+_FPS_HIGH_THRESHOLD = 48
+
+
+def _normalize_frame_rate(rate):
+    """任意源帧率 → Auto 会用的档位（30 或 60）。
+
+    只有确实跑在高帧率（> 48）才升到 60；其余（含 23.976 / 25 / 29.97 这类）
+    都留在 30 —— 与其把 25fps 素材复制帧凑成 60，不如输出 30。
+    """
+    try:
+        value = float(rate)
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    if value > _FPS_HIGH_THRESHOLD:
+        return _FPS_LEVELS[-1]
+    return _FPS_LEVELS[0]
+
+
+def _video_frame_rate_majority(file_list):
+    """多数片段属于哪一档帧率（30 / 60）；全部探不到返回 0。
+
+    与 `_mixed_resolution_target` 同一套思路：一个 60fps 片段混在几百个 30fps
+    片段里，不该把整批拉成 60fps（那会为 1 个片段把编码量翻倍）。`_get_frame_rate`
+    复用 `_PROBE_CACHE`，而每个片段本来就会为时长探一次，所以这里没有额外进程。
+    """
+    counts = {}
+    for fp in file_list:
+        level = _normalize_frame_rate(_get_frame_rate(fp))
+        if level:
+            counts[level] = counts.get(level, 0) + 1
+    if not counts:
+        return 0
+    # 平票取较高档（宁可保留更多帧，也不要丢掉运动）
+    return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _resolve_output_fps(output_fps, file_list):
+    """把用户选择变成实际输出帧率 → (fps, 说明文本)。"""
+    if isinstance(output_fps, str) and output_fps.strip().lower() == _FPS_AUTO:
+        majority = _video_frame_rate_majority(file_list)
+        if not majority:
+            return 30, "no clip frame rate could be probed; using 30fps"
+        return majority, f"most clips are {majority}fps"
+    try:
+        value = int(output_fps)
+    except (TypeError, ValueError):
+        return 30, "30fps (default; no rate was chosen)"
+    if value in _FPS_LEVELS:
+        return value, f"{value}fps (explicit choice)"
+    return 30, f"{value} is not a supported output rate; using 30fps"
+
+
 def _mixed_resolution_target(file_list, quiet=False):
     """混合分辨率检测（_ffmpeg_concat / _ffmpeg_concat_batched 共用）。
 
@@ -1300,11 +1368,15 @@ def clip_integrity_problem(output_file, source_file, timestamps):
 _QUALITY_DOWNSCALE_TOLERANCE = 0.85
 
 
-def clip_quality_problem(clip_file, expected_height):
+def clip_quality_problem(clip_file, expected_height, is_source_best=False):
     """落盘片段的清晰度是否低于源本该交付的档位？
 
     返回 (是否降级, 交付高度, 应有高度)。拿不到预期高度或量不到文件尺寸时
     返回 (False, None, None)——宁可漏报也不误报。
+
+    ``is_source_best`` 由取回层给出（"落盘这一档就是源里能给的最高档"）：这种
+    情况下低清是源侧限制而不是降级，**不能再报成降级**，否则低清源与竖屏源会
+    每次都挂着一条误导性告警（取回层已经用一行说明登记过了）。
     """
     try:
         expected = int(expected_height or 0)
@@ -1315,12 +1387,15 @@ def clip_quality_problem(clip_file, expected_height):
     _width, delivered = _get_video_size(clip_file)
     if not delivered:
         return False, None, expected
+    if is_source_best:
+        return False, delivered, expected
     return delivered < expected * _QUALITY_DOWNSCALE_TOLERANCE, delivered, expected
 
 
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
-                excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None):
+                excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None,
+                output_fps=None):
     output_format = ".mp4" if is_video else ".mp3"
     sharpen = (_UPSCALE_SHARPEN_DEFAULT if upscale_sharpen is None
                else normalize_upscale_sharpen(upscale_sharpen))
@@ -1362,8 +1437,16 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
         with tempfile.TemporaryDirectory() as temp_dir:
             tasks = []
 
-            # 固定输出帧率 30fps，防止 VFR / 25fps 导致的 A/V 偏移
-            fps = 30 if is_video else None
+            # 输出帧率必须显式给（见 _resolve_output_fps 上方的实测记录：不给的话
+            # 混合帧率批次会塌到 25fps）。默认仍是 30fps；只有显式 "auto" 才会按
+            # 多数片段的帧率在 30/60 之间选。
+            if is_video:
+                fps, fps_reason = _resolve_output_fps(
+                    output_fps, [elt["filename"] for elt in dict_list])
+                print(f"{Fore.CYAN}Output frame rate: {fps}fps ({fps_reason})"
+                      f"{Style.RESET_ALL}")
+            else:
+                fps = None
 
             # 混合分辨率：目标尺寸只在这里定一次（下面把 res 显式传下去，
             # _ffmpeg_concat 里的同名回退只服务直接调用者），这样日志能报出
@@ -1474,8 +1557,11 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 # 远端 clip 记录"本该交付的清晰度"（materialize 时按解析结果写入），
                 # 供下面的画质校验用；本地文件没有这个字段 → None → 不检查。
                 expected_height = elt.get('expected_video_height')
+                # "落盘这一档就是源里能给的最高档" → 低清属于源侧限制，不报降级。
+                delivered_is_source_best = bool(elt.get('delivered_is_source_best'))
                 tasks.append((n, filename, filename_stripped, timestamps, temp,
-                              cut_res, preserve_duration, dur, expected_height))
+                              cut_res, preserve_duration, dur, expected_height,
+                              delivered_is_source_best))
 
             if not tasks:
                 raise Exception("No timestamps found for any input media!")
@@ -1485,7 +1571,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             def cut_one(task):
                 """切一个片段。提取成函数是为了让完整性修复能用**完全相同**的
                 参数重切一次（否则修复后的片段与其它片段的编码路径不一致）。"""
-                _n, fn, _fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh = task
+                _n, fn, _fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh, _sb = task
                 return cut_func(fn, ts, tmp,
                                 **({'res': cr, 'fps': fps,
                                     'preserve_duration': preserve_duration,
@@ -1505,7 +1591,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     if cancel_pending():
                         executor.shutdown(cancel_futures=True)
                         raise InterruptedError("Compile cancelled by user.")
-                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh = task
+                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh, _sb = task
                     f = executor.submit(cut_one, task)
                     running[f] = (n, fn_stripped)
                 cut_failures = []
@@ -1535,11 +1621,16 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             unresolved_clips = []
             downscaled_clips = []
             if is_video and tasks:
+                # 切片阶段只逐条打印 "Done writing all clips ..."，之后进入校验会有
+                # 一段没有任何输出的时间（长批次里看着像卡住）。这里明说在干什么。
+                print(f"{Fore.CYAN}Verifying clip quality and integrity "
+                      f"({len(tasks)} clips)...{Style.RESET_ALL}")
                 verified = re_cut = 0
                 for _index, task in enumerate(tasks):
                     if cancel_pending():
                         raise InterruptedError("Compile cancelled by user.")
-                    _n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur, expected_height = task
+                    (_n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur, expected_height,
+                     delivered_is_source_best) = task
                     if not os.path.exists(tmp):
                         continue           # 切片失败的片段已经报过了
                     # 画质校验（落盘片段 vs 源本该交付的档位）：降级取回的片段在
@@ -1547,7 +1638,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     # 用"文件实际高度 vs 预期高度"揪出来。见 clip_quality_problem。
                     try:
                         low_quality, delivered_h, expected_h = clip_quality_problem(
-                            fn, expected_height)
+                            fn, expected_height, delivered_is_source_best)
                     except Exception:                               # noqa: BLE001
                         low_quality = False
                     if low_quality:

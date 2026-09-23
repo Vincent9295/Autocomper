@@ -82,6 +82,10 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            classify_resolve_failure,
                            reset_short_delivery_records,
                            short_delivery_records,
+                           reset_low_quality_records,
+                           low_quality_records,
+                           quality_measurement,
+                           reset_quality_measurements,
                            reset_placement_records,
                            placement_records,
                            verify_cached_audio_alignment,
@@ -100,6 +104,7 @@ from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
                      unique_download_stem, yt_dlp_version,
+                     reset_heartbeat_hint_memory,
                      is_twitch_platform, is_youtube_platform)
 
 # timestamps .txt 里"看起来像本地媒体文件"的标题判据（视频 + 音频都算）。
@@ -120,6 +125,41 @@ DEFAULT_SETTINGS = {
 }
 
 REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
+# 输出帧率：Auto 按"多数片段的帧率"在 30/60 之间选（见 compile._resolve_output_fps）。
+OUTPUT_FPS_AUTO = "Auto (60/30 fps)"
+OUTPUT_FPS_OPTIONS = (OUTPUT_FPS_AUTO, "30 fps", "60 fps")
+OUTPUT_FPS_TOOLTIP_TEXT = (
+    "Output frame rate for the finished video.\n\n"
+    "Auto (60/30 fps): follow the material. If most clips in the batch are 60fps\n"
+    "the output is 60fps (every frame is kept); otherwise it is 30fps. This is the\n"
+    "setting to use for YouTube/Twitch batches recorded at 60fps.\n"
+    "30 fps: what earlier versions always did. Smallest encode time, and 60fps\n"
+    "sources lose half their frames (visible as slightly less smooth motion).\n"
+    "60 fps: force 60fps output. 30fps clips get their frames duplicated, which\n"
+    "looks identical but makes the encode about 30% longer.\n\n"
+    "This does NOT fix soft or glitched clips: those come from the source or from\n"
+    "the download, not from the frame rate."
+)
+
+
+def output_fps_choice(value):
+    """UI 文案 → compile_vid 的 output_fps 取值（'auto' / 30 / 60）。
+
+    下拉框是 readonly，正常情况下只会拿到 OUTPUT_FPS_OPTIONS 里的原文；但老
+    preferences.ini / preset 里可能存着手打的 "60"、"60fps"，因此这里额外做一次
+    宽松解析。无法识别的一律回落到 30（compile 侧只把 30/60/auto 当合法值，其它
+    值会打印原因并退回 30）。
+    """
+    text = str(value or "").strip().lower()
+    if text.startswith("auto"):
+        return "auto"
+    if "60" in text:
+        return 60
+    if "30" in text:
+        return 30
+    return 30
+
+
 REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge", "Cookies File…")
 PLAYLIST_PAGE_SIZE = 30
 # 单一常量源 remote_media.MAX_PLAYLIST_ENTRIES（=5000，见其注释）：
@@ -1428,6 +1468,107 @@ def _video_stream_end(source):
     return value
 
 
+# 视频流终点裁剪的共用参数与规则（materialize 和写 timestamps.txt 必须一致，否则
+# 文件里的片段数会和实际准备的片段数不一样——测试者报过 "231 lines / 115 prepared"）。
+_VIDEO_END_MARGIN = 0.25
+_VIDEO_END_MIN_CLIP = 1.0
+
+
+def _clamp_intervals_to_video(timestamps, source_video_end, padding=None):
+    """按 materialize 的规则预裁剪检测区间，返回 ``(保留, 丢弃, 被邻居剪短数)``。
+
+    **必须和 materialize_remote_entries 的循环判定逐条一致**，否则写进
+    timestamps.txt 的片段数会和实际准备数对不上（测试者实测：文件 231 行 / 只准备
+    115 个）。两条规则都来自 materialize：
+      1. 邻居钳制：``after`` 最多伸到下一个区间起点、``before`` 受上一个有效区间
+         终点约束（重叠检测区间会被裁）；
+      2. 视频终点钳制：区间被裁到 ``duration - 0.25``；裁完不足 1 秒、或起点已经
+         越界（``eff_start >= 硬终点``）的区间判为"没有对应画面"而丢弃。
+    注意顺序：终点钳制在邻居钳制**之后**，所以「99.0-100.0 越界被丢」会让前一个
+    区间多留 0.75s 的内容（它以邻居起点为上限）。这个看似无关紧要的差异正是
+    对不上的来源，所以这里逐条复刻，不做"更合理"的改写。
+    """
+    timestamps = list(timestamps or [])
+    if not source_video_end:
+        return timestamps, [], 0
+    before, after = (float(padding[0]), float(padding[1])) if padding else (0.0, 0.0)
+    hard_end = float(source_video_end) - _VIDEO_END_MARGIN
+    kept, dropped = [], []
+    neighbour_shortened = 0
+    previous_end = None
+    count = len(timestamps)
+    for index, ts in enumerate(timestamps):
+        start, end = float(ts['start']), float(ts['end'])
+        next_start = (float(timestamps[index + 1]['start'])
+                      if index + 1 < count else None)
+        eff_end = (end + after) if next_start is None else min(end + after, next_start)
+        eff_start = start - before
+        if previous_end is not None:
+            eff_start = max(eff_start, previous_end)
+        if ((before > 0 and eff_start > start - before + 1e-6)
+                or (after > 0 and eff_end < end + after - 1e-6)
+                or eff_start > start + 1e-6
+                or eff_end < end - 1e-6):
+            neighbour_shortened += 1
+        if eff_start >= hard_end:
+            dropped.append(ts)
+            continue
+        if eff_end > hard_end:
+            eff_end = hard_end
+        if eff_end - eff_start < _VIDEO_END_MIN_CLIP:
+            dropped.append(ts)
+            continue
+        previous_end = eff_end
+        kept.append(dict(ts, start=eff_start, end=eff_end))
+    return kept, dropped, neighbour_shortened
+
+
+def _drop_intervals_without_footage(dict_list, is_video, padding=None):
+    """丢弃"没有对应画面"的检测区间，并改写 dict_list（就地）。
+
+    为什么要在这里做：materialize 本来就会丢弃这些区间（音轨长于视频流时尾部检测
+    落在无画面的时间轴上）。但 timestamps.txt 是在 materialize **之前**写的，于是
+    文件里留着马上要被丢掉的片段，界面上同时出现两个总数（测试者实测："Found 231
+    clips" / 只有 115 个在准备 / 文件里 231 行，其中约 116 个是尾部重复）。
+
+    现在统一在写文件之前裁剪，并用同一套规则（_clamp_intervals_to_video），所以
+    文件、"Found N clips" 与实际准备数三者一致；materialize 随后不会再丢任何区间，
+    也不会再为它们写 failure 记录（那批记录本来就只是噪音）。
+
+    只对视频批次生效；音频批次没有"画面终点"这个概念，保持原样。
+    返回丢弃的区间数。
+    """
+    if not is_video:
+        return 0
+    dropped_total = 0
+    examples = []
+    for entry in dict_list:
+        source = entry.get('filename')
+        if not isinstance(source, MediaSource):
+            continue
+        video_end = _video_stream_end(source)
+        if not video_end:
+            continue
+        kept, dropped, _clipped = _clamp_intervals_to_video(
+            entry.get('timestamps', []), video_end, padding)
+        if not dropped:
+            continue
+        entry['timestamps'] = kept
+        dropped_total += len(dropped)
+        for ts in dropped[:2]:
+            if len(examples) < 3:
+                examples.append(
+                    f"{get_source_display_name(source)} "
+                    f"{float(ts.get('start', 0)):g}-{float(ts.get('end', 0)):g}s")
+    if not dropped_total:
+        return 0
+    suffix = f" (e.g. {', '.join(examples)})" if examples else ""
+    print(f"{Fore.YELLOW}{dropped_total} detected clip(s) were dropped because they lie "
+          f"beyond the available video stream, so there is no footage for them"
+          f"{suffix}.{Style.RESET_ALL}")
+    return dropped_total
+
+
 def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                                selected_intervals=None, cache_store=None, padding=None,
                                is_video=True, refresh_func=None, failures=None,
@@ -1450,9 +1591,14 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     before, after = float(before), float(after)
     if before < 0 or after < 0:
         raise ValueError("Clip padding cannot be negative!")
-    # 每轮 materialize 重置“交付偏短”/“落点偏移”记录，compile 结束后统一汇报
+    # 每轮 materialize 重置“交付偏短”/“落点偏移”/“源只有低清”记录，结束后统一汇报
     reset_short_delivery_records()
     reset_placement_records()
+    reset_low_quality_records()
+    reset_quality_measurements()
+    # 心跳成因提示是进程级去重的（长批次只打一次）；新批次开始时复位一次，
+    # 这样"这一轮又变慢了"仍然能重新看到那行解释。
+    reset_heartbeat_hint_memory()
     materialized: list[dict] = []
     remote_video_total = sum(
         1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
@@ -1614,15 +1760,22 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             "completed": current_completed,
             "total": state["total"],
         })
+        measurement = quality_measurement(fetched) or {}
+        delivered_video_height = measurement.get("delivered") or 0
         return {
             'filename': str(fetched),
             'timestamps': [{'start': 0.0, 'end': duration, 'pred': pred}],
             'source_url': source.source_url,
-            # 本该交付的清晰度（解析出来的最高档）。编译阶段拿它和落盘片段的
-            # 实际分辨率比对：片段被降到低档位时（见 remote_media 的
-            # _rotate_video_candidate），成片里只会表现为"这段偏软"，事后无法
-            # 从输出看出来，所以必须在日志里点名。
+            # 本该交付的清晰度（档位量级 = 短边，与平台的 1080p/720p 标注一致；
+            # 用户 Quality 上限已生效）。编译阶段拿它和落盘片段的实际档位比对：
+            # 片段被降到低档位时，成片里只会表现为"这段偏软"，事后无法从输出看出来，
+            # 所以必须在日志里点名。
             'expected_video_height': selected_video_height(source) or None,
+            # 取回时实测的落盘清晰度，以及它是不是源里能给的最高档：后者用来区分
+            # "被降档"（要报）和"源只有低清"（只说明，不报降级），避免低清源与
+            # 竖屏源被误报。取回层已经量过一次，这里直接复用，不再探文件。
+            'delivered_video_height': delivered_video_height or None,
+            'delivered_is_source_best': bool(measurement.get("is_source_best")),
             'source_metadata': {
                 'platform': source.platform,
                 'source_id': source.source_id,
@@ -1717,15 +1870,17 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             # 视频编译：把区间钳到视频流可用终点内。音频轨比视频长时，
             # 尾部检测到的事件没有对应画面——完全越界的直接跳过（省掉
             # 必然失败的 90s 重试），跨界的保留可观看前缀。
+            # 规则与 _clamp_intervals_to_video 共用，只是这里必须作用在带 padding 的
+            # eff_start/eff_end 上（padding 同样不能越过视频终点）。
             if source_video_end is not None:
-                hard_end = source_video_end - 0.25
+                hard_end = source_video_end - _VIDEO_END_MARGIN
                 dropped_beyond = False
                 if eff_start >= hard_end:
                     dropped_beyond = True
                 else:
                     if eff_end > hard_end:
                         eff_end = hard_end
-                    if eff_end - eff_start < 1.0:
+                    if eff_end - eff_start < _VIDEO_END_MIN_CLIP:
                         dropped_beyond = True
                 if dropped_beyond:
                     # 原因文案惰性构造：只有真正丢弃时才格式化时间戳
@@ -3938,6 +4093,10 @@ class VideoProcessorApp:
         # 跳过检测时优先读哪个 timestamps 文件（ask = 每次让用户选）。
         # 存在多个（base / _reverified / _selected）时才用得上。
         self.timestamps_load_preference = tk.StringVar(value="ask")
+        # 输出帧率（见 OUTPUT_FPS_OPTIONS）；老配置里没有这个键 → Auto。
+        self.output_frame_rate = tk.StringVar(value=OUTPUT_FPS_AUTO)
+        # disable_objects() 时记录控件原 state，reenable 时原样恢复（见那里）。
+        self._disabled_state_memory = {}
         self.max_quality = tk.StringVar()
         self.max_download_speed = tk.IntVar()
         
@@ -3969,6 +4128,13 @@ class VideoProcessorApp:
 
         self.output_text_path.set(
             self.preferences.get("Settings", "output_text_path"))
+
+        try:
+            _ofr = self.preferences.get("Settings", "output_frame_rate")
+        except (configparser.Error, ValueError):
+            _ofr = OUTPUT_FPS_AUTO
+        self.output_frame_rate.set(
+            _ofr if _ofr in OUTPUT_FPS_OPTIONS else OUTPUT_FPS_AUTO)
 
         # Create a list to store uploaded video file paths
         self.uploaded_videos = []
@@ -4488,6 +4654,17 @@ class VideoProcessorApp:
             variable=self.use_gpu)
         self.use_gpu_checkbox.pack()
 
+        # 输出帧率（放在 GPU 勾选下面、Process Videos 上面）：默认 Auto，按多数
+        # 片段的帧率在 30/60 之间选；见 OUTPUT_FPS_TOOLTIP_TEXT 与 compile 的
+        # _resolve_output_fps（那里记录了"为什么不能简单去掉 30fps 上限"的实测）。
+        self.output_fps_frame = ttk.Frame(right_frame)
+        self.output_fps_frame.pack(pady=(6, 0))
+        ttk.Label(self.output_fps_frame, text="Output frame rate:").pack(side=tk.LEFT)
+        self.output_fps_dropdown = ttk.Combobox(
+            self.output_fps_frame, textvariable=self.output_frame_rate,
+            values=list(OUTPUT_FPS_OPTIONS), state="readonly", width=17)
+        self.output_fps_dropdown.pack(side=tk.LEFT, padx=(6, 0))
+
         self.process_cancel_frame = ttk.Frame(right_frame)
         self.process_cancel_frame.pack()
 
@@ -4591,6 +4768,8 @@ class VideoProcessorApp:
             self.cancel_button, 'Cancel the current compilation process.')
         gpu_tooltip = CustomHovertip(
             self.use_gpu_checkbox, 'Run AI detection on your NVIDIA GPU (much faster).\nUncheck to run on CPU instead — slower, but keeps your GPU quiet and cool.\nHas no effect if you don\'t have CUDA set up.')
+        output_fps_tooltip = CustomHovertip(
+            self.output_fps_dropdown, OUTPUT_FPS_TOOLTIP_TEXT)
         timestamps_tooltip = CustomHovertip(
             self.txt_output_checkbox, 'Save the timestamps to a txt file (by default `timestamps.txt` in the output directory).\nYou can change the file name in settings.')
         padding_tooltip = CustomHovertip(
@@ -4647,6 +4826,7 @@ class VideoProcessorApp:
             self.preset_combo,
             self.save_preset_btn,
             self.use_gpu_checkbox,
+            self.output_fps_dropdown,
             self.remote_mode_dropdown,
             self.remote_browser_cookies_dropdown,
             self.remote_concurrency_spinbox,
@@ -4759,7 +4939,14 @@ class VideoProcessorApp:
         self.clear_transfer_progress("\n".join(line for line in lines if line))
 
     def disable_objects(self):
+        # 记住每个控件被禁用前的 state：readonly 的下拉框重新启用时必须回到
+        # readonly，否则会变成可以手打的普通输入框（手打进去的 "60" 不是合法选项，
+        # 会被当成 unknown 静默回落到 30fps）。
         for elt in self.disable_while_processing:
+            try:
+                self._disabled_state_memory[elt] = str(elt.cget("state"))
+            except Exception:
+                self._disabled_state_memory.pop(elt, None)
             elt["state"] = tk.DISABLED
         
         for elt in self.enable_while_processing:
@@ -4767,10 +4954,12 @@ class VideoProcessorApp:
 
     def reenable_disabled_objects(self):
         for elt in self.disable_while_processing:
-            if elt == self.model_dropdown:
-                elt["state"] = "readonly"
-            else:
-                elt["state"] = tk.NORMAL
+            previous = self._disabled_state_memory.pop(elt, None)
+            if previous is None:
+                # 没记录到（例如禁用时控件还没建好）：保持老行为，但下拉框永远
+                # 不能回到可手打状态。model_dropdown 的 readonly 是历史特例。
+                previous = "readonly" if elt == self.model_dropdown else tk.NORMAL
+            elt["state"] = previous
         
         for elt in self.enable_while_processing:
             elt["state"] = tk.DISABLED
@@ -6324,34 +6513,71 @@ class VideoProcessorApp:
         self.preferences.set(
             "Settings", "timestamps_load_preference",
             self.timestamps_load_preference.get() or "ask")
+        self.preferences.set(
+            "Settings", "output_frame_rate",
+            self.output_frame_rate.get() or OUTPUT_FPS_AUTO)
 
         with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
             self.preferences.write(configfile)
 
-    def reset_preferences_to_file(self):
-        try:
-            _kdv = self.preferences.getboolean("Settings", "keep_downloaded_vids")
-        except (configparser.Error, ValueError):
-            _kdv = False
-        self.keep_downloaded_vids.set(_kdv)
-        self.download_video_path.set(self.preferences.get(
-            "Settings", "download_path"
-        ))
-        self.max_quality.set(self.preferences.get(
-            "Settings", "max_quality"
-        ))
-        try:
-            self.max_download_speed.set(int(self.preferences.get("Settings", "max_download_speed")))
-        except (configparser.Error, ValueError, tk.TclError):
-            self.max_download_speed.set(0)
-        self.output_text_path.set(self.preferences.get(
-            "Settings", "output_text_path"
-        ))
-        try:
-            _tlp = self.preferences.get("Settings", "timestamps_load_preference")
-        except (configparser.Error, ValueError):
-            _tlp = "ask"
-        self.timestamps_load_preference.set(_tlp or "ask")
+    # Settings 弹窗实际拥有的字段：打开时用磁盘值刷新它们，取消时把用户这次的编辑
+    # 回滚。其余设置（帧率、远程模式、reverify、strict FP …）在这弹窗里根本没有控件，
+    # 以前却被一起重读，于是"打开设置就丢掉主界面未保存的选择"。
+    _SETTINGS_FIELD_SPECS = (
+        ("download_video_path", "download_path", str),
+        ("keep_downloaded_vids", "keep_downloaded_vids", bool),
+        ("max_quality", "max_quality", str),
+        ("max_download_speed", "max_download_speed", int),
+        ("output_text_path", "output_text_path", str),
+        ("timestamps_load_preference", "timestamps_load_preference", str),
+    )
+
+    def _settings_field_snapshot(self):
+        """这六个字段当前的控件值，用于取消时回滚。"""
+        return {attr: self._settings_field_value(attr)
+                for attr, _key, _kind in self._SETTINGS_FIELD_SPECS}
+
+    def _settings_field_value(self, attr):
+        var = getattr(self, attr, None)
+        if var is None:
+            return None
+        return var.get()
+
+    def _load_settings_fields_from_file(self):
+        """只把弹窗拥有的字段刷成 preferences.ini 里的值。"""
+        for attr, key, kind in self._SETTINGS_FIELD_SPECS:
+            var = getattr(self, attr, None)
+            if var is None:
+                continue
+            try:
+                if kind is bool:
+                    value = self.preferences.getboolean("Settings", key)
+                elif kind is int:
+                    value = int(self.preferences.get("Settings", key))
+                else:
+                    value = self.preferences.get("Settings", key)
+            except (configparser.Error, ValueError, TypeError):
+                continue
+            if kind is not bool and not value:
+                # 空字符串/空值保留控件当前值：以前这里会 set("")，把设置项清空
+                continue
+            try:
+                var.set(value)
+            except (tk.TclError, ValueError):
+                continue
+
+    def _restore_settings_fields(self, snapshot):
+        """取消时把弹窗字段恢复成打开弹窗那一刻的值。"""
+        for attr, value in (snapshot or {}).items():
+            if value is None:
+                continue
+            var = getattr(self, attr, None)
+            if var is None:
+                continue
+            try:
+                var.set(value)
+            except (tk.TclError, ValueError):
+                continue
 
     def open_settings_modal(self):
         modal = tk.Toplevel(self.root)
@@ -6365,12 +6591,16 @@ class VideoProcessorApp:
         # Set the modal's position relative to the parent window
         modal.geometry(f"640x480+{x}+{y}")
 
+        # 打开弹窗那一刻的字段值：取消时回滚到这里，而不是回滚到 preferences.ini
+        # （磁盘上没有本次未保存的改动，用它回滚会连主界面上的选择一起丢掉）。
+        _before_edit = self._settings_field_snapshot()
+
         def on_close_save(event=None):
             self.save_settings()
             on_close()
 
         def on_close_no_save(event=None):
-            self.reset_preferences_to_file()
+            self._restore_settings_fields(_before_edit)
             on_close()
 
         def on_close(event=None):
@@ -6379,9 +6609,8 @@ class VideoProcessorApp:
 
         modal.protocol("WM_DELETE_WINDOW", on_close_no_save)
 
-        # Set all local variables to the stored values
-        # in preferences.ini to maintain consistency
-        self.reset_preferences_to_file()
+        # 打开时只刷新这弹窗自己拥有的字段；帧率等主界面设置在别处，不在这里动。
+        self._load_settings_fields_from_file()
 
         # DOWNLOAD SETTINGS
 
@@ -6742,7 +6971,11 @@ class VideoProcessorApp:
         self.final_bar.reset_total_progress(1)
         cleanup_temp_children()
 
-        self.reset_preferences_to_file()
+        # 注意：这里不要从 preferences.ini 重读设置。preset 只写控件、不写
+        # preferences.ini，所以任何"开跑前重读一遍"都会把用户刚加载的 preset 或刚改的
+        # 输出帧率冲掉（下拉框显示 60fps、实际按 auto 出片）。下面所有设置本来就一律
+        # 从控件读，因此那种重读只有副作用。同理见 open_settings_modal()：Settings
+        # 弹窗只回滚它自己拥有的字段，不碰主界面的选择。
 
         try:
             precision = self.precision.get()
@@ -7273,6 +7506,15 @@ class VideoProcessorApp:
                                   f"shorter than requested and end early (the CDN sent "
                                   f"less than the requested window)."
                                   f"{Style.RESET_ALL}")
+                        _low = low_quality_records()
+                        if _low:
+                            _names = ", ".join(item["name"] for item in _low[:5])
+                            _more = "" if len(_low) <= 5 else f" (+{len(_low) - 5} more)"
+                            print(f"{Fore.CYAN}{len(_low)} source(s) only offer a "
+                                  f"lower quality stream than the usual 1080p/720p "
+                                  f"(their best stream is what was fetched; this is a "
+                                  f"source limitation, not a fetch downgrade): "
+                                  f"{_names}{_more}{Style.RESET_ALL}")
                         for line in _summarize_placement(placement_records()):
                             print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                         skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
@@ -7287,7 +7529,8 @@ class VideoProcessorApp:
                                     progress_callback=lambda sample: self._queue_transfer_progress(
                                         sample, "Compile"),
                                     batch_size=self.merge_batch_size.get(),
-                    upscale_sharpen=self.upscale_sharpen.get())
+                    upscale_sharpen=self.upscale_sharpen.get(),
+                    output_fps=output_fps_choice(self.output_frame_rate.get()))
                     except Exception as exc:
                         raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                     finally:
@@ -7536,6 +7779,15 @@ class VideoProcessorApp:
                         "Every remote source failed to resolve/detect (see the skipped VOD list above)."
                     )
 
+                # 写 timestamps.txt / Reverify / Review 之前统一裁剪掉"没有画面"的
+                # 区间：必须和 materialize 用同一套规则（含 padding），否则文件里的
+                # 片段数、日志里的 "Found N clips" 和实际准备数会互相对不上。
+                dropped_no_footage = _drop_intervals_without_footage(
+                    dict_list, self.is_video, padding)
+                if dropped_no_footage:
+                    vids_with_clips = sum(
+                        1 for entry in dict_list if entry.get('timestamps'))
+
                 # Set values for progress bar
                 # If saving individually, or there is only one video
                 if not combine or vids_with_clips == 1:
@@ -7673,6 +7925,15 @@ class VideoProcessorApp:
                         print(f"{Fore.YELLOW}{len(_short)} clip(s) were delivered "
                               f"shorter than requested and end early (the CDN sent "
                               f"less than the requested window).{Style.RESET_ALL}")
+                    _low = low_quality_records()
+                    if _low:
+                        _names = ", ".join(item["name"] for item in _low[:5])
+                        _more = "" if len(_low) <= 5 else f" (+{len(_low) - 5} more)"
+                        print(f"{Fore.CYAN}{len(_low)} source(s) only offer a lower "
+                              f"quality stream than the usual 1080p/720p (their best "
+                              f"stream is what was fetched; this is a source "
+                              f"limitation, not a fetch downgrade): "
+                              f"{_names}{_more}{Style.RESET_ALL}")
                     for line in _summarize_placement(placement_records()):
                         print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                     skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
@@ -7687,7 +7948,8 @@ class VideoProcessorApp:
                                 progress_callback=lambda sample: self._queue_transfer_progress(
                                     sample, "Compile"),
                                 batch_size=self.merge_batch_size.get(),
-                    upscale_sharpen=self.upscale_sharpen.get())
+                    upscale_sharpen=self.upscale_sharpen.get(),
+                    output_fps=output_fps_choice(self.output_frame_rate.get()))
                 except Exception as exc:
                     raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                 finally:

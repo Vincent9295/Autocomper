@@ -32,11 +32,12 @@ from progress import format_transfer_progress, format_hls_progress
 # "Preparing clips"（远程片段下载）阶段的看门狗参数：
 #   - progress_stall_timeout：out_time 连续这么久不前进即判定卡死并重试
 #     （正常的慢速 CDN 只要有数据前进就会重置计时器）。
-#   - heartbeat：只在"确实卡了"（进度停滞 ≥30s）时每 30s 打一条，并附一条
-#     成因提示。以前每 60s 无条件打一条，慢线路下满屏都是心跳；现在正常的
-#     （哪怕偏慢但有前进的）下载完全不刷日志。
+#   - heartbeat：只在"确实卡了"（进度停滞 ≥30s）时每 60s 打一条，并附一条
+#     成因提示（该提示整个进程只打一次，见 utils 的 reset_heartbeat_hint_memory：
+#     以前每个片段都会重打一遍，长批次里刷屏）。以前每 60s 无条件打一条，慢线路
+#     下满屏都是心跳；现在正常的（哪怕偏慢但有前进的）下载完全不刷日志。
 _SEGMENT_PROGRESS_STALL_TIMEOUT = 120.0
-_SEGMENT_HEARTBEAT_INTERVAL = 30.0
+_SEGMENT_HEARTBEAT_INTERVAL = 60.0
 _SEGMENT_HEARTBEAT_STALL_THRESHOLD = 30.0
 _SEGMENT_HEARTBEAT_HINT = (
     "Note: a clip fetch this slow is usually caused by Max Download Concurrency "
@@ -106,6 +107,75 @@ def _log_short_delivery(source, start, end, actual, expected) -> None:
     print(f"  {label} clip {float(start):g}-{float(end):g}s was delivered "
           f"{shortfall:.2f}s short ({actual:.2f}s of {expected:.2f}s); "
           f"the clip will end earlier than the padding suggests.")
+
+
+# ── 源侧只有低清：说明，不告警 ────────────────────────────────────────────
+# 取回策略是"永远抓最高档，失败重试 1-2 次后跳过，绝不改抓更低档"。所以当落盘
+# 清晰度低于预期时只有两种可能：
+#   1. 源里明明有更高档却拿到了低档（旧缓存/异常）→ 重取一次，仍不行就如实报告；
+#   2. 源的最高档本来就是 480p/360p（低码率上传、竖屏小分辨率）→ 这不是降级，
+#      不能报成"质量下降"，否则低清源会永远挂着一条误导性告警。
+# 第 2 种在这里登记一次，由 autocomper 在批次汇总里统一说明。
+_low_quality_records: list[dict[str, Any]] = []
+_low_quality_lock = threading.Lock()
+
+
+def reset_low_quality_records() -> None:
+    """Clear the per-run "source only offers a low quality" log."""
+    with _low_quality_lock:
+        _low_quality_records.clear()
+
+
+def low_quality_records() -> list[dict[str, Any]]:
+    """Clips whose source's best stream is itself below the requested quality."""
+    with _low_quality_lock:
+        return list(_low_quality_records)
+
+
+def _log_low_quality(source, start, end, delivered, best) -> None:
+    """登记"源本身只有低清档"（每个源只登记并打印一次）。"""
+    platform = getattr(source, "platform", None) or "remote"
+    source_id = getattr(source, "source_id", None) or "?"
+    label = f"{platform}:{source_id}"
+    with _low_quality_lock:
+        # 同一个源只登记 + 打印一次：一个只有 480p 的 VOD 有几十个片段，逐条打印
+        # 就是刷屏。判断放在锁内，避免并发抓取时重复打印。
+        if any(item["name"] == label for item in _low_quality_records):
+            return
+        _low_quality_records.append({
+            "name": label, "delivered": int(delivered), "best": int(best)})
+    print(f"  {label}: this source's own best stream is {best}p "
+          f"(the clip is {delivered}p) - a source limitation, not a downgrade.")
+
+
+# 取回时实测到的清晰度（按落盘路径记录，供 autocomper 写进 materialize entry，
+# 供 compile 侧区分"降级"与"源只有低清"）。避免编译阶段再探一遍文件。
+_quality_measurements: dict[str, dict[str, Any]] = {}
+_quality_measurements_lock = threading.Lock()
+
+
+def reset_quality_measurements() -> None:
+    with _quality_measurements_lock:
+        _quality_measurements.clear()
+
+
+def quality_measurement(path) -> dict[str, Any] | None:
+    key = os.path.normcase(os.path.normpath(str(path)))
+    with _quality_measurements_lock:
+        record = _quality_measurements.get(key)
+    return dict(record) if record else None
+
+
+def _record_quality_measurement(path, delivered, expected, is_source_best) -> None:
+    if not delivered:
+        return
+    key = os.path.normcase(os.path.normpath(str(path)))
+    with _quality_measurements_lock:
+        if len(_quality_measurements) >= 8192:
+            _quality_measurements.clear()
+        _quality_measurements[key] = {
+            "delivered": int(delivered), "expected": int(expected or 0),
+            "is_source_best": bool(is_source_best)}
 
 
 class RemoteMediaError(Exception):
@@ -1551,6 +1621,91 @@ def _segment_duration(path) -> float | None:
     return h * 3600 + mi * 60 + s + ms / 100.0
 
 
+# ── 下载损坏自检（比特流级）──────────────────────────────────────────────
+# 实测（2026-09-21）：同一位置、同一条命令连下两次，字节数不同
+# （3,043,583 vs 3,085,423），坏的那次 ffmpeg 自己报
+#   `Invalid NAL unit size (66913 > 25073)` / `missing picture in access unit`
+#   / `Error splitting the input into NAL units`
+# 而**退出码仍然是 0**、时长和帧数也都正常 —— 于是坏数据被当成好片段写进缓存，
+# 成片里就是那 2-3 秒的大块色块。以前抓取成功时把 stderr 丢掉了，所以"证据"被
+# 扔了，用户只能靠肉眼发现。
+#
+# 这里用一次 `-c copy -f null` 的**纯解复用校验**：它会把整个文件按包过一遍，
+# 解析每一帧的 NAL 结构并解 H.264 参数集，但**不真正解码画面**。实测 0.05s/片段
+# （一个 8 秒 1080p 片段），比完整解码（0.42s）便宜一个数量级，而对这个故障
+# 报的错完全一样（同样的 2 条消息）。完整的像素级错误留给 decode 复核。
+_SEGMENT_CORRUPTION_MARKERS = (
+    "Invalid NAL unit size",
+    "Error splitting the input into NAL units",
+    "missing picture in access unit",
+    "corrupt decoded frame",
+    "error while decoding MB",
+    "concealing errors",
+    "Invalid data found when processing input",
+    "Packet corrupt",
+    "Truncating packet",
+    "non-existing PPS",
+    "no frame!",
+)
+# 小于这个体积的文件不做解复用自检（见 segment_corruption_messages）。
+_CORRUPTION_CHECK_MIN_BYTES = 64 * 1024
+
+
+def segment_corruption_messages(path, timeout: float = 120.0) -> list[str]:
+    """片段比特流是否损坏？返回命中的错误行（空列表 = 干净）。
+
+    `-c copy -f null` 只解复用：退出码对这种损坏不可靠（实测坏文件 rc=0），
+    所以判据只能是 stderr 里有没有出现上面那些解析器/解码器错误。
+    任何异常都返回空列表——宁可漏报也不误报（误报会白白重抓一遍）。
+
+    小于 ``_CORRUPTION_CHECK_MIN_BYTES`` 的文件直接跳过：真实片段是几 MB，
+    而测试里的占位字节只有几十 KB，没必要也不该去解它们（那会让"文件根本不是
+    媒体"变成一次误判）。
+    """
+    try:
+        if Path(path).stat().st_size < _CORRUPTION_CHECK_MIN_BYTES:
+            return []
+    except OSError:
+        return []
+    command = [
+        str(FFMPEG_PATH), "-hide_banner", "-v", "error",
+        "-i", str(path), "-map", "0:v:0", "-c", "copy", "-f", "null", "-",
+    ]
+    try:
+        # 直接用 subprocess 而不是 run_tracked：这是一次"本地文件、只解复用"的
+        # 快速校验（实测 0.05s），不碰网络、也不需要登记进取消表；而且测试普遍
+        # 会 patch `run_tracked` 来伪造网络命令，这道自检不该跟着被伪造。
+        completed = subprocess.run(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:                                              # noqa: BLE001
+        return []
+    stderr = completed.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if not isinstance(stderr, str):
+        return []
+    hits = []
+    for line in stderr.splitlines():
+        stripped = line.strip()
+        if stripped and any(marker in stripped
+                            for marker in _SEGMENT_CORRUPTION_MARKERS):
+            hits.append(stripped)
+    return hits
+
+
+def _fetch_needs_corruption_check(run_func, result) -> bool:
+    """要不要为这次取回做解复用校验？
+
+    生产路径（run_func=None）恒真——实测一次只解复用的校验 0.05s，可以每片段都做。
+    测试注入的假执行写的是占位字节（不是真下载），默认跳过；需要覆盖这道自检的
+    测试给 runner 显式打上 ``_checks_enabled = True``（见 tests/test_clip_quality.py）。
+    """
+    if run_func is None:
+        return True
+    return bool(getattr(run_func, "_checks_enabled", False))
+
+
 def _refresh_with_backoff(
     refresh_func: Callable[[MediaSource], MediaSource | None],
     source: MediaSource,
@@ -1568,26 +1723,72 @@ def _refresh_with_backoff(
     return limited(source)
 
 
-def _candidate_height(candidate: Mapping[str, Any] | None) -> int:
-    """候选视频流的像素高度；未知返回 0。"""
+# ── 落盘清晰度自检：抓到的这一档是不是源里的最高档？────────────────────────
+# 策略是"永远抓最高档（或用户 Quality 上限档）；失败就重试 1-2 次，再不行跳过，
+# 绝不改抓更低档"。所以落盘清晰度低于预期时只有两种可能，必须分开处理：
+#   1. 源里明明有更高档 → 这次取回被降了档（或缓存里躺着旧的低档片段）：
+#      不写缓存、争取多一次尝试；仍不行就如实交付并由编译侧点名。
+#   2. 源的最高档本来就低（低码率上传、竖屏小分辨率）→ 不是降级，登记说明即可，
+#      绝不能报成"画质下降"，否则低清源每次都挂着误导性告警。
+# 容差与 compile 的 _QUALITY_DOWNSCALE_TOLERANCE 一致：1080→1088 取整不误报，
+# 720→480（0.667）会被抓到。
+_QUALITY_DOWNSCALE_TOLERANCE = 0.85
+# "取回成功但档位不对"时额外争取的尝试次数（0 = 关掉这层）。
+_QUALITY_RETRY_LIMIT = 1
+
+
+def _video_quality_gate(source, path, audio_only: bool = False):
+    """落盘片段的档位是否需要"重抓一次"？
+
+    返回 (是否需要重取, 交付高度, 预期高度, 是否源内最高档)。**重试预算由调用方
+    掌握**（取回循环用 `quality_retries` 限制只多试一次；缓存命中路径直接信这个
+    结果，因为它不需要预算——不复用缓存本来就是免费的）。
+    """
+    if audio_only:
+        return False, 0, 0, True
+    expected = _video_expected_height(source)
+    if expected <= 0:
+        return False, 0, 0, True
+    delivered = _display_height_of(delivered_video_size(path))
+    if delivered <= 0:
+        return False, 0, expected, True          # 量不出来就不动它
+    source_best = _video_source_best_height(source)
+    at_source_best = source_best <= 0 or delivered >= source_best
+    if delivered >= expected * _QUALITY_DOWNSCALE_TOLERANCE:
+        return False, delivered, expected, at_source_best
+    if at_source_best:
+        # 源里最高档就这个水平：不是降级，登记一次说明。
+        return False, delivered, expected, True
+    return True, delivered, expected, False
+
+
+def _candidate_display_height(candidate: Mapping[str, Any] | None) -> int:
+    """候选流的"档位高度"（短边）；未知返回 0。
+
+    平台是按短边标档位的：1920x1080 是 1080p，1080x1920 也是 1080p，720x1280
+    是 720p。用短边做刻度，横向源和竖屏源才能放在一起比较，不会把竖屏 1080x1920
+    判成"低于横向 1080"。候选里没有 width 时退回 height（此时拿到的 height 本身
+    就是平台标注的档位）。
+    """
     if not isinstance(candidate, Mapping):
         return 0
-    try:
-        value = int(candidate.get("height") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return value if value > 0 else 0
+
+    def number(name):
+        try:
+            value = int(candidate.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
+
+    height = number("height")
+    width = number("width")
+    if width and height:
+        return min(width, height)
+    return height or width
 
 
-def selected_video_height(source: MediaSource) -> int:
-    """当前选中的视频流的像素高度；未知返回 0。
-
-    解析出来的最高档位就是"这个片段本该交付的清晰度"。落盘后拿它和文件实际
-    分辨率比对（见 compile 的片段画质校验），就能把"某次取回被降到了低档位"
-    这种平时看不出来的故障变成日志里的一行。``max_height``（Max Download
-    Quality）已经在这一步之前作用过，所以这里是"用户允许的最高档"而不是
-    "站点提供的最高档"。
-    """
+def _video_expected_height(source: MediaSource) -> int:
+    """这个片段本该交付的档位高度（短边；用户 Quality 上限已生效）；未知返回 0。"""
     candidates = [c for c in (getattr(source, "video_candidates", None) or [])
                   if isinstance(c, Mapping)]
     if not candidates:
@@ -1595,11 +1796,104 @@ def selected_video_height(source: MediaSource) -> int:
     current = str(source.video_url or "")
     for candidate in candidates:
         if str(candidate.get("url") or "") == current:
-            height = _candidate_height(candidate)
+            height = _candidate_display_height(candidate)
             if height:
                 return height
             break
-    return _candidate_height(candidates[0])
+    return _candidate_display_height(candidates[0])
+
+
+def _video_source_best_height(source: MediaSource) -> int:
+    """源里最高的显示高度（不看 Quality 上限）；未知返回 0。
+
+    用来区分"被降档"和"源只有低清"：前者要重取并如实报告，后者是源侧限制。
+    """
+    heights = [_candidate_display_height(candidate)
+               for candidate in (getattr(source, "video_candidates", None) or [])]
+    return max(heights) if heights else 0
+
+
+def selected_video_height(source: MediaSource) -> int:
+    """当前选中的视频流的显示高度；未知返回 0。
+
+    解析出来的最高档位就是"这个片段本该交付的清晰度"。落盘后拿它和文件实际
+    分辨率比对（见 compile 的片段画质校验），就能把"某次取回被降到了低档位"
+    这种平时看不出来的故障变成日志里的一行。``max_height``（Max Download
+    Quality）已经在这一步之前作用过，所以这里是"用户允许的最高档"而不是
+    "站点提供的最高档"。
+    """
+    return _video_expected_height(source)
+
+
+# ── 落盘片段的实际分辨率（一次极轻量的 ffmpeg 探测）────────────────────────
+# 取回后要判断"拿到的这一档是不是源里的最高档"。**不能**用纯 Python 解析 SPS：
+# B 站/Twitch 的片段是 mp4，SPS 放在 avcC 盒里而不是 annex-B 码流里，直接在
+# mdat 里扫起始码会被伪起始码骗到（实测 40 个片段全部解析失败或给出荒谬尺寸）。
+# 所以这里用一次刻意的最小化 ffmpeg 探测：只解 2 帧、最小的分析量，输出到 null，
+# 从 `Stream ... Video: ... WxH` 拿尺寸。一次进程、无解码负担，失败返回 None。
+_VIDEO_SIZE_TIMEOUT = 20.0
+
+
+def delivered_video_size(path) -> tuple[int, int] | None:
+    """落盘片段的 (宽, 高)；探测不出来返回 None（宁可漏报也不误报）。
+
+    ``-v error`` 不会打印输入流信息，所以这里用 ``-v info`` 只抓 `Video:` 那一行，
+    并且只解码 2 帧到 null（分析量也压到最小），成本约等于一次容器探测。
+    """
+    command = [
+        str(FFMPEG_PATH), "-hide_banner", "-v", "info",
+        "-probesize", "512k", "-analyzeduration", "500000",
+        "-i", str(path), "-map", "0:v:0", "-frames:v", "2", "-f", "null", "-",
+    ]
+    try:
+        result = run_tracked(command, timeout=_VIDEO_SIZE_TIMEOUT, text=True)
+    except Exception:                                              # noqa: BLE001
+        return None
+    stderr = str(getattr(result, "stderr", None) or "")
+    video_line = ""
+    for line in stderr.splitlines():
+        if "Video:" in line and "Stream #" in line:
+            video_line = line
+            break
+    if not video_line:
+        return None
+    match = re.search(r"\b(\d{2,5})x(\d{2,5})\b", video_line)
+    if not match:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2))
+    except (TypeError, ValueError):
+        return None
+
+
+def _display_height_of(size: tuple[int, int] | None) -> int:
+    """(宽, 高) → 档位高度（短边）。
+
+    与 `_candidate_display_height` 同一把尺子：平台按短边标档，所以 1920x1080 与
+    1080x1920 都是 1080、1280x720 与 720x1280 都是 720。这样横向源与竖屏源可以
+    用同一个阈值比较，不会把竖屏 1080x1920 判成"低于横向 1080"。
+    """
+    if not size:
+        return 0
+    width, height = size
+    return int(min(width, height))
+
+
+def _candidate_height(candidate: Mapping[str, Any] | None) -> int:
+    """候选流的原始 height 字段；未知返回 0。
+
+    **轮换同档判定用这个，不用显示高度**：竖屏候选的 height 是 720/1080，
+    横向源是 1080/720/480，用同一把尺子（原始 height）比才不会把"竖屏 720"
+    错当成"低于横向 1080"。显示高度那把尺子只用于"落盘清晰度 vs 源最高档"
+    的画质判定。
+    """
+    if not isinstance(candidate, Mapping):
+        return 0
+    try:
+        value = int(candidate.get("height") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
 
 
 def _rotate_video_candidate(source: MediaSource) -> bool:
@@ -2458,6 +2752,28 @@ def estimate_segment_fetch_timeout(source, duration, explicit=None) -> float:
                max(_SEGMENT_TIMEOUT_FLOOR, expected_bytes / _SEGMENT_MIN_THROUGHPUT))
 
 
+def _cached_clip_is_below_quality(source, cached, audio_only, logger) -> bool:
+    """缓存命中的片段是否比源现在能给的档位更低？
+
+    True 表示"别复用这个缓存文件"（调用方继续走正常取回流程）。只有"源里确实
+    有更高档、而缓存是更低档"时才是 True；源本身只有低清档时返回 False，
+    由取回路径统一登记说明（这里不重复登记，避免缓存命中路径误报）。
+
+    这次判定会探一次文件的真实分辨率（一次极轻量 ffmpeg 探测）。调用方只在
+    "本来就要做落点校验"时才调用它，从而不给纯缓存命中的路径增加开销。
+    """
+    needs_refetch, delivered, expected, _is_source_best = _video_quality_gate(
+        source, cached, audio_only=audio_only)
+    if needs_refetch and logger is not None:
+        logger(f"Cached clip is {delivered}p while the source offers "
+               f"{expected}p; re-fetching it instead of reusing the cache")
+    elif delivered:
+        # 记下这次量到的档位（含"这就是源里最高档"），编译侧直接用它，
+        # 不必再探一遍文件。
+        _record_quality_measurement(cached, delivered, expected, _is_source_best)
+    return needs_refetch
+
+
 def fetch_segment(
     source: MediaSource,
     start: float,
@@ -2537,21 +2853,32 @@ def fetch_segment(
                     if logger is not None:
                         logger("Cached clip starts at a different position than "
                                "requested; re-fetching the exact window")
-                elif (verify_placement and run_func is None
-                        and not (max_total_duration and max_total_duration > 0)
-                        and _fetch_has_audio(source, audio_only)):
-                    aligned = cached_segment_is_aligned(
-                        source, cached, span[0], span[1], cache_store=cache_store,
-                        mode=placement_reference, logger=logger,
-                        scratch_dir=Path(output_file).parent)
-                    if aligned is False:
-                        if logger is not None:
-                            logger("Cached clip content is off the detected moment; "
-                                   "re-fetching it instead of reusing the cache")
-                    else:
-                        return Path(cached)
                 else:
-                    return Path(cached)
+                    # 落点校验本来就要真解码一次缓存片段，所以只在"会做落点校验"
+                    # 时顺带做画质判定（多一次极轻量探测）；纯缓存命中的路径不
+                    # 额外探文件，画质记录留给编译侧自己探。
+                    can_verify = (verify_placement and run_func is None
+                                  and not (max_total_duration and max_total_duration > 0))
+                    if not can_verify:
+                        # 不做落点校验的调用（预览、注入的 runner、有整段预算）：
+                        # 直接复用缓存，行为与以前完全一致。
+                        return Path(cached)
+                    if _cached_clip_is_below_quality(source, cached, audio_only, logger):
+                        # 缓存里躺着旧的低档片段（旧版本抓的、或当时源只有低清档）：
+                        # 不复用它，继续往下走正常取回流程。
+                        pass
+                    elif _fetch_has_audio(source, audio_only):
+                        aligned = cached_segment_is_aligned(
+                            source, cached, span[0], span[1], cache_store=cache_store,
+                            mode=placement_reference, logger=logger,
+                            scratch_dir=Path(output_file).parent)
+                        if aligned is False:
+                            if logger is not None:
+                                logger("Cached clip content is off the detected moment; "
+                                       "re-fetching it instead of reusing the cache")
+                        else:
+                            return Path(cached)
+                    # 无音轨可锚定 / 判定要重取 → 落到下面的正常取回流程
 
     destination = Path(output_file)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2595,6 +2922,8 @@ def fetch_segment(
     allowed_attempts = int(retries) + 1
     # 这一轮交付的片段是否"短但可用"（用于跳过缓存写入，见下）。
     short_delivery = False
+    # 取回成功但清晰度低于源里能给的档位时额外争取的尝试次数（见 _video_quality_gate）。
+    quality_retries = 0
     # 持续失败预算：只针对"反复失败无进展"的片段。慢速但稳定产出的下载
     # 有数据（stall 不触发）不会被误杀；连续失败累计超过该秒数则放弃，
     # 避免 materialize 卡在单个坏片段上无限 refresh 探测。
@@ -2763,6 +3092,45 @@ def fetch_segment(
                     if logger is not None:
                         logger("Clip placement check skipped: "
                                f"{_sanitize_ffmpeg_detail(exc)}")
+            # 下载损坏自检（比特流级）：这次抓到的字节是不是坏的？坏的那次
+            # ffmpeg 退出码仍是 0、时长帧数都正常，但解析器会报
+            # "Invalid NAL unit size" / "Error splitting the input into NAL units"。
+            # 这种片段一旦进缓存，成片里就是 2-3 秒的大块色块，所以这里直接当失败
+            # 处理，走既有重试/refresh 阶梯重抓一次（实测重抓即可拿到干净字节）。
+            # `-c copy -f null` 只要 0.05s/片段，可以每个片段都验。
+            corruption_hits = []
+            if _fetch_needs_corruption_check(run_func, result):
+                corruption_hits = segment_corruption_messages(temporary_path)
+            if corruption_hits:
+                if logger is not None:
+                    logger("Downloaded clip is corrupt at the bitstream level "
+                           f"({corruption_hits[0]}); re-fetching instead of using it")
+                raise SegmentFetchError(
+                    "downloaded segment is corrupt: " + corruption_hits[0])
+            # 落盘清晰度自检：永远抓最高档，所以"低于预期"要么是这次被降了档
+            # （争取多一次尝试，且不写缓存），要么是源本身只有低清档（登记说明，
+            # 不算降级、不跳过）。见 _video_quality_gate 上方的说明。
+            quality_decision = _video_quality_gate(source, temporary_path,
+                                                   audio_only=audio_only)
+            needs_refetch, delivered_h, expected_h, is_source_best = quality_decision
+            if needs_refetch and quality_retries < _QUALITY_RETRY_LIMIT:
+                quality_retries += 1
+                allowed_attempts += 1
+                if logger is not None:
+                    logger(f"Remote segment was delivered at {delivered_h}p while "
+                           f"the source offers {expected_h}p; re-fetching it at the "
+                           f"source's own quality instead of using the lower one")
+                # 不写缓存、不进失败计数：这只是"换一次再抓"，属于同一片段的
+                # 下一次尝试（预算由既有的 90s 与单次超时兜底）。
+                continue
+            # 只有"源里最高档就这个水平"才在这里登记说明（is_source_best）；
+            # "源里有更高档但我们没能拿到"是真正的降级，**不能**报成源侧限制，
+            # 留给编译侧的画质校验点名（它拿得到 expected/delivered 两个数）。
+            if delivered_h and is_source_best and delivered_h < expected_h:
+                _log_low_quality(source, start, end, delivered_h,
+                                 _video_source_best_height(source))
+            _record_quality_measurement(destination, delivered_h, expected_h,
+                                        is_source_best)
             data = temporary_path.read_bytes()
             if cache_store is not None and not short_delivery:
                 # 短交付的片段不写缓存：缓存命中是按"声称覆盖了请求区间"判断的，
