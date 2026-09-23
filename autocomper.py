@@ -82,6 +82,10 @@ from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
                            classify_resolve_failure,
                            reset_short_delivery_records,
                            short_delivery_records,
+                           reset_low_quality_records,
+                           low_quality_records,
+                           quality_measurement,
+                           reset_quality_measurements,
                            reset_placement_records,
                            placement_records,
                            verify_cached_audio_alignment,
@@ -100,6 +104,7 @@ from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
                      unique_download_stem, yt_dlp_version,
+                     reset_heartbeat_hint_memory,
                      is_twitch_platform, is_youtube_platform)
 
 # timestamps .txt 里"看起来像本地媒体文件"的标题判据（视频 + 音频都算）。
@@ -120,6 +125,33 @@ DEFAULT_SETTINGS = {
 }
 
 REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
+# 输出帧率：Auto 按"多数片段的帧率"在 30/60 之间选（见 compile._resolve_output_fps）。
+OUTPUT_FPS_AUTO = "Auto (60/30 fps)"
+OUTPUT_FPS_OPTIONS = (OUTPUT_FPS_AUTO, "30 fps", "60 fps")
+OUTPUT_FPS_TOOLTIP_TEXT = (
+    "Output frame rate for the finished video.\n\n"
+    "Auto (60/30 fps): follow the material. If most clips in the batch are 60fps\n"
+    "the output is 60fps (every frame is kept); otherwise it is 30fps. This is the\n"
+    "setting to use for YouTube/Twitch batches recorded at 60fps.\n"
+    "30 fps: what earlier versions always did. Smallest encode time, and 60fps\n"
+    "sources lose half their frames (visible as slightly less smooth motion).\n"
+    "60 fps: force 60fps output. 30fps clips get their frames duplicated, which\n"
+    "looks identical but makes the encode about 30% longer.\n\n"
+    "This does NOT fix soft or glitched clips: those come from the source or from\n"
+    "the download, not from the frame rate."
+)
+
+
+def output_fps_choice(value):
+    """UI 文案 → compile_vid 的 output_fps 取值（'auto' / 30 / 60）。"""
+    text = str(value or "")
+    if text == OUTPUT_FPS_AUTO:
+        return "auto"
+    if text == "60 fps":
+        return 60
+    return 30
+
+
 REMOTE_BROWSER_COOKIES = ("Auto", "None", "Firefox", "Chrome", "Edge", "Cookies File…")
 PLAYLIST_PAGE_SIZE = 30
 # 单一常量源 remote_media.MAX_PLAYLIST_ENTRIES（=5000，见其注释）：
@@ -1450,9 +1482,14 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     before, after = float(before), float(after)
     if before < 0 or after < 0:
         raise ValueError("Clip padding cannot be negative!")
-    # 每轮 materialize 重置“交付偏短”/“落点偏移”记录，compile 结束后统一汇报
+    # 每轮 materialize 重置“交付偏短”/“落点偏移”/“源只有低清”记录，结束后统一汇报
     reset_short_delivery_records()
     reset_placement_records()
+    reset_low_quality_records()
+    reset_quality_measurements()
+    # 心跳成因提示是进程级去重的（长批次只打一次）；新批次开始时复位一次，
+    # 这样"这一轮又变慢了"仍然能重新看到那行解释。
+    reset_heartbeat_hint_memory()
     materialized: list[dict] = []
     remote_video_total = sum(
         1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
@@ -1614,15 +1651,22 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             "completed": current_completed,
             "total": state["total"],
         })
+        measurement = quality_measurement(fetched) or {}
+        delivered_video_height = measurement.get("delivered") or 0
         return {
             'filename': str(fetched),
             'timestamps': [{'start': 0.0, 'end': duration, 'pred': pred}],
             'source_url': source.source_url,
-            # 本该交付的清晰度（解析出来的最高档）。编译阶段拿它和落盘片段的
-            # 实际分辨率比对：片段被降到低档位时（见 remote_media 的
-            # _rotate_video_candidate），成片里只会表现为"这段偏软"，事后无法
-            # 从输出看出来，所以必须在日志里点名。
+            # 本该交付的清晰度（档位量级 = 短边，与平台的 1080p/720p 标注一致；
+            # 用户 Quality 上限已生效）。编译阶段拿它和落盘片段的实际档位比对：
+            # 片段被降到低档位时，成片里只会表现为"这段偏软"，事后无法从输出看出来，
+            # 所以必须在日志里点名。
             'expected_video_height': selected_video_height(source) or None,
+            # 取回时实测的落盘清晰度，以及它是不是源里能给的最高档：后者用来区分
+            # "被降档"（要报）和"源只有低清"（只说明，不报降级），避免低清源与
+            # 竖屏源被误报。取回层已经量过一次，这里直接复用，不再探文件。
+            'delivered_video_height': delivered_video_height or None,
+            'delivered_is_source_best': bool(measurement.get("is_source_best")),
             'source_metadata': {
                 'platform': source.platform,
                 'source_id': source.source_id,
@@ -3938,6 +3982,8 @@ class VideoProcessorApp:
         # 跳过检测时优先读哪个 timestamps 文件（ask = 每次让用户选）。
         # 存在多个（base / _reverified / _selected）时才用得上。
         self.timestamps_load_preference = tk.StringVar(value="ask")
+        # 输出帧率（见 OUTPUT_FPS_OPTIONS）；老配置里没有这个键 → Auto。
+        self.output_frame_rate = tk.StringVar(value=OUTPUT_FPS_AUTO)
         self.max_quality = tk.StringVar()
         self.max_download_speed = tk.IntVar()
         
@@ -3969,6 +4015,13 @@ class VideoProcessorApp:
 
         self.output_text_path.set(
             self.preferences.get("Settings", "output_text_path"))
+
+        try:
+            _ofr = self.preferences.get("Settings", "output_frame_rate")
+        except (configparser.Error, ValueError):
+            _ofr = OUTPUT_FPS_AUTO
+        self.output_frame_rate.set(
+            _ofr if _ofr in OUTPUT_FPS_OPTIONS else OUTPUT_FPS_AUTO)
 
         # Create a list to store uploaded video file paths
         self.uploaded_videos = []
@@ -4488,6 +4541,17 @@ class VideoProcessorApp:
             variable=self.use_gpu)
         self.use_gpu_checkbox.pack()
 
+        # 输出帧率（放在 GPU 勾选下面、Process Videos 上面）：默认 Auto，按多数
+        # 片段的帧率在 30/60 之间选；见 OUTPUT_FPS_TOOLTIP_TEXT 与 compile 的
+        # _resolve_output_fps（那里记录了"为什么不能简单去掉 30fps 上限"的实测）。
+        self.output_fps_frame = ttk.Frame(right_frame)
+        self.output_fps_frame.pack(pady=(6, 0))
+        ttk.Label(self.output_fps_frame, text="Output frame rate:").pack(side=tk.LEFT)
+        self.output_fps_dropdown = ttk.Combobox(
+            self.output_fps_frame, textvariable=self.output_frame_rate,
+            values=list(OUTPUT_FPS_OPTIONS), state="readonly", width=17)
+        self.output_fps_dropdown.pack(side=tk.LEFT, padx=(6, 0))
+
         self.process_cancel_frame = ttk.Frame(right_frame)
         self.process_cancel_frame.pack()
 
@@ -4591,6 +4655,8 @@ class VideoProcessorApp:
             self.cancel_button, 'Cancel the current compilation process.')
         gpu_tooltip = CustomHovertip(
             self.use_gpu_checkbox, 'Run AI detection on your NVIDIA GPU (much faster).\nUncheck to run on CPU instead — slower, but keeps your GPU quiet and cool.\nHas no effect if you don\'t have CUDA set up.')
+        output_fps_tooltip = CustomHovertip(
+            self.output_fps_dropdown, OUTPUT_FPS_TOOLTIP_TEXT)
         timestamps_tooltip = CustomHovertip(
             self.txt_output_checkbox, 'Save the timestamps to a txt file (by default `timestamps.txt` in the output directory).\nYou can change the file name in settings.')
         padding_tooltip = CustomHovertip(
@@ -4647,6 +4713,7 @@ class VideoProcessorApp:
             self.preset_combo,
             self.save_preset_btn,
             self.use_gpu_checkbox,
+            self.output_fps_dropdown,
             self.remote_mode_dropdown,
             self.remote_browser_cookies_dropdown,
             self.remote_concurrency_spinbox,
@@ -6324,6 +6391,9 @@ class VideoProcessorApp:
         self.preferences.set(
             "Settings", "timestamps_load_preference",
             self.timestamps_load_preference.get() or "ask")
+        self.preferences.set(
+            "Settings", "output_frame_rate",
+            self.output_frame_rate.get() or OUTPUT_FPS_AUTO)
 
         with open(self.preferences_file, 'w', encoding="utf-8") as configfile:
             self.preferences.write(configfile)
@@ -6352,6 +6422,12 @@ class VideoProcessorApp:
         except (configparser.Error, ValueError):
             _tlp = "ask"
         self.timestamps_load_preference.set(_tlp or "ask")
+        try:
+            _ofr = self.preferences.get("Settings", "output_frame_rate")
+        except (configparser.Error, ValueError):
+            _ofr = OUTPUT_FPS_AUTO
+        self.output_frame_rate.set(
+            _ofr if _ofr in OUTPUT_FPS_OPTIONS else OUTPUT_FPS_AUTO)
 
     def open_settings_modal(self):
         modal = tk.Toplevel(self.root)
@@ -7273,6 +7349,15 @@ class VideoProcessorApp:
                                   f"shorter than requested and end early (the CDN sent "
                                   f"less than the requested window)."
                                   f"{Style.RESET_ALL}")
+                        _low = low_quality_records()
+                        if _low:
+                            _names = ", ".join(item["name"] for item in _low[:5])
+                            _more = "" if len(_low) <= 5 else f" (+{len(_low) - 5} more)"
+                            print(f"{Fore.CYAN}{len(_low)} source(s) only offer a "
+                                  f"lower quality stream than the usual 1080p/720p "
+                                  f"(their best stream is what was fetched; this is a "
+                                  f"source limitation, not a fetch downgrade): "
+                                  f"{_names}{_more}{Style.RESET_ALL}")
                         for line in _summarize_placement(placement_records()):
                             print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                         skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
@@ -7287,7 +7372,8 @@ class VideoProcessorApp:
                                     progress_callback=lambda sample: self._queue_transfer_progress(
                                         sample, "Compile"),
                                     batch_size=self.merge_batch_size.get(),
-                    upscale_sharpen=self.upscale_sharpen.get())
+                    upscale_sharpen=self.upscale_sharpen.get(),
+                    output_fps=output_fps_choice(self.output_frame_rate.get()))
                     except Exception as exc:
                         raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                     finally:
@@ -7673,6 +7759,15 @@ class VideoProcessorApp:
                         print(f"{Fore.YELLOW}{len(_short)} clip(s) were delivered "
                               f"shorter than requested and end early (the CDN sent "
                               f"less than the requested window).{Style.RESET_ALL}")
+                    _low = low_quality_records()
+                    if _low:
+                        _names = ", ".join(item["name"] for item in _low[:5])
+                        _more = "" if len(_low) <= 5 else f" (+{len(_low) - 5} more)"
+                        print(f"{Fore.CYAN}{len(_low)} source(s) only offer a lower "
+                              f"quality stream than the usual 1080p/720p (their best "
+                              f"stream is what was fetched; this is a source "
+                              f"limitation, not a fetch downgrade): "
+                              f"{_names}{_more}{Style.RESET_ALL}")
                     for line in _summarize_placement(placement_records()):
                         print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
                     skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
@@ -7687,7 +7782,8 @@ class VideoProcessorApp:
                                 progress_callback=lambda sample: self._queue_transfer_progress(
                                     sample, "Compile"),
                                 batch_size=self.merge_batch_size.get(),
-                    upscale_sharpen=self.upscale_sharpen.get())
+                    upscale_sharpen=self.upscale_sharpen.get(),
+                    output_fps=output_fps_choice(self.output_frame_rate.get()))
                 except Exception as exc:
                     raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
                 finally:

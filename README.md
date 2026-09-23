@@ -20,6 +20,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Save Selected** | Review dialog exports the checked clips back to a fixed `timestamps_selected.txt` (overwritten each run) for future re-use. |
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat. |
 | **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
+| **Output Frame Rate** | Choose **Auto (60/30)**, **30 fps**, or **60 fps** next to the Process Videos button. Auto follows the batch: mostly-60fps material (typical for YouTube/Twitch) is delivered at 60fps with every frame kept, anything else stays at 30fps. 30fps output (what earlier versions always did) drops half the frames of a 60fps source; 60fps output costs ~30% more encode time but does not enlarge the file. Saved in settings. |
 | **Remote VOD Processing** | Process Bilibili, YouTube, and Twitch VODs from remote audio; fetch only selected video segments. |
 | **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
 | **Compile Progress Monitoring** | Live remote clip preparation, FFmpeg encoding progress, merge progress, speed, and ETA. |
@@ -40,7 +41,7 @@ The following are improvements in this Enhanced version compared with the origin
 | **Video pipeline** | MoviePy (`libx264` CPU) | Native FFmpeg subprocess (`h264_nvenc` GPU) |
 | **Inference** | `onnxruntime` (CPU) | `onnxruntime-gpu` (CUDA) — falls back to CPU automatically; **CPU/GPU toggle** for quiet overnight runs |
 | **Audio loading** | `list()` full memory load | Streaming generator + LRU cache |
-| **Frame rate** | Inherit from source | Fixed **30 fps** output (prevents VFR desync) |
+| **Frame rate** | Inherit from source | **Auto (60/30 fps)**, or fixed **30 / 60 fps** — the output grid is always explicit (a mixed-rate batch with no explicit rate collapses to 25fps) |
 | **Audio sample rate** | Variable | Fixed **44100 Hz** output |
 | **Concat method** | Concat demuxer (timestamp bugs) | Concat **filter** (frame-level, no drift) |
 | **Mixed resolutions** | Not handled | Auto-detect → scale/pad all to mode resolution |
