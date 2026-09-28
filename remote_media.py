@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from utils import (FFMPEG_PATH, run_tracked, run_tracked_progress,
-                   is_twitch_platform)
+                   is_twitch_platform, register_proc, unregister_proc)
 from remote_prefetch import (
     SpeedMonitor,
     _probe_real_size,
@@ -146,6 +146,37 @@ def _log_low_quality(source, start, end, delivered, best) -> None:
             "name": label, "delivered": int(delivered), "best": int(best)})
     print(f"  {label}: this source's own best stream is {best}p "
           f"(the clip is {delivered}p) - a source limitation, not a downgrade.")
+
+
+# ── 灰块检查用完重试预算后"保留"的片段（可见性，不再丢片段）─────────────
+# 灰块检查是像素统计，误报会直接丢掉整个片段——实测过一版误报（低饱和游戏画面 +
+# VTuber 模型的直播，帧灰占比 0.63-0.85，命中 51/3620 个缓存片段）。现在绝对门槛
+# 抬到 0.95，并且**最后一次尝试就接受**：最坏只是白下载一次。这里把"仍然保留"的
+# 情况登记下来（每个源一次），由 autocomper 在批次汇总里说明，避免静默。
+_glitch_kept_records: list[dict[str, Any]] = []
+_glitch_kept_lock = threading.Lock()
+
+
+def reset_glitch_kept_records() -> None:
+    with _glitch_kept_lock:
+        _glitch_kept_records.clear()
+
+
+def glitch_kept_records() -> list[dict[str, Any]]:
+    with _glitch_kept_lock:
+        return list(_glitch_kept_records)
+
+
+def _log_glitch_kept(source, start, end, detail) -> None:
+    platform = getattr(source, "platform", None) or "remote"
+    source_id = getattr(source, "source_id", None) or "?"
+    label = f"{platform}:{source_id}"
+    with _glitch_kept_lock:
+        if any(item["name"] == label for item in _glitch_kept_records):
+            return
+        _glitch_kept_records.append({"name": label, "detail": str(detail)[:120]})
+    print(f"  {label}: clip {float(start):g}-{float(end):g}s was kept even though the "
+          f"grey check flagged it ({str(detail)[:80]}); re-fetching did not change it.")
 
 
 # 取回时实测到的清晰度（按落盘路径记录，供 autocomper 写进 materialize entry，
@@ -378,10 +409,17 @@ class PlaylistDescriptor:
             self._hydrated_indices.add(entry.index)
             entry.metadata["hydration_failed"] = False
             entry.metadata.pop("hydration_error", None)
+        elif error is None:
+            # 回调返回 None **且没抛异常** = "这条 flat 条目已经够完整，无需补齐"
+            # （remote 侧的两个 hydrate 闭包就是这么写的）。旧代码把它当成失败，
+            # 于是完整的条目显示 "Failed: unknown error"、日期列被清空，
+            # 而 "Retry Failed" 重试永远不会成功（再调一次还是 None）。
+            self._hydrated_indices.add(entry.index)
+            entry.metadata["hydration_failed"] = False
+            entry.metadata.pop("hydration_error", None)
         else:
             entry.metadata["hydration_failed"] = True
-            if error:
-                entry.metadata["hydration_error"] = error
+            entry.metadata["hydration_error"] = error
         return entry
 
     def failed_hydration_entries(self) -> list[PlaylistEntry]:
@@ -1706,6 +1744,154 @@ def _fetch_needs_corruption_check(run_func, result) -> bool:
     return bool(getattr(run_func, "_checks_enabled", False))
 
 
+# ── 解码级"灰块"自检（2026-09-27，第十八轮）───────────────────────────────
+# 为什么还需要第二道：`-c copy -f null` 只看**解析器**错误。测试者实测的坏片段
+# 解析完全通过（日志里 0 条 corruption 警告），但解码出来是整块平灰——缺失的宏块
+# 被 H.264 concealment 填成灰色。这类损坏只能解码成像素才看得见。
+#
+# ⚠ 只用"灰占比高"是不够的，而且绝对门槛必须取"接近满幅"：
+#   * 0.60 那一版把一个**低饱和游戏画面 + VTuber 模型**的直播片段判成损坏——实测
+#     绒米Romi 缓存 3,620 个片段里 51 个误报，帧灰占比 0.63-0.85，导出帧看是完全
+#     正常的画面。而误报会重抓一次、再命中就**丢掉整个片段**，比不检查更糟。
+#   * 真正的"缺失宏块填灰"实测接近满幅：帧灰占比 **0.997**（向阳Hihi 那例），
+#     整段灰占比中位 0.11 → 峰值 0.997，是**突变**而不是"一直偏灰"。
+# 所以门槛取 0.95：真损坏仍命中，51 个误报（最高 0.852）全部放行。代价是漏掉
+# "部分灰化"（63-85%）的损坏——那类需要独立的平坦度判据，而块级方案已被实测证伪
+# （干净片段的"冻结灰块"占比可达 0.556）。
+_GLITCH_GRAY_LOW = 100              # H.264 concealment 填的灰大致落在 100-160
+_GLITCH_GRAY_HIGH = 160
+_GLITCH_GRAY_SHARE = 0.95           # 绝对灰占比门槛（近满幅才算）
+_GLITCH_BASELINE_RATIO = 2.0        # 相对该片段自身中位灰占比的倍数
+_GLITCH_BASELINE_MARGIN = 0.20      # 且至少高出这么多（避免基线接近 0 时误判）
+_GLITCH_FREEZE_DIFF = 4.0           # 帧间平均绝对差低于此值 = "画面冻住"
+_GLITCH_MIN_CONSECUTIVE = 2         # 连续这么多可疑帧才判为损坏（挡掉单帧白屏）
+_GLITCH_CHECK_MIN_BYTES = 256 * 1024  # 小于此体积不做（占位/极短片段）
+_GLITCH_SCALE = 96                  # 解码宽度（高度自动 16:9）
+# 只分析片段开头的这个长度（秒）。代价是每 1 秒素材约 0.044 秒算力：8 秒片段 0.35s、
+# 60 秒 2.6s、4 分钟片段 5.3s。损坏实测只持续 2.2 秒，而每个片段都是**抓回来当场
+# 验过**的（合并后的长片段由这些片段拼成），所以只验开头一段是合理取舍。
+# 代价（如实记录）：极少数"只有中后段坏"的长片段会漏掉。
+_GLITCH_MAX_SECONDS = 60.0
+_GLITCH_MAX_SECONDS_AT_30FPS = 1800  # 帧数上限，等价于上面的秒数
+
+
+def count_glitch_blocks(frames, width: int, height: int) -> tuple[int, int, float]:
+    """统计"灰块帧"，返回 ``(可疑帧数, 最长连续可疑帧数, 最大灰占比)``。
+
+    ``frames`` 是连续的灰度帧字节；纯函数，便于直接喂合成数据测试。
+
+    判定一个帧可疑需要同时满足（见上方常量的实测依据）：
+      * 灰占比 ≥ ``_GLITCH_GRAY_SHARE`` 且 ≥ 该片段中位灰占比 ×
+        ``_GLITCH_BASELINE_RATIO`` + ``_GLITCH_BASELINE_MARGIN``（**相对**变化，
+        所以整段一致的低细节素材不会被判可疑）；
+      * 与前一帧的平均绝对差 < ``_GLITCH_FREEZE_DIFF``（填充块是冻住的）。
+    """
+    frame_size = int(width) * int(height)
+    if frame_size <= 0 or not frames:
+        return 0, 0, 0.0
+    total = len(frames) // frame_size
+    if total <= 0:
+        return 0, 0, 0.0
+    views = [memoryview(frames)[index * frame_size:(index + 1) * frame_size]
+             for index in range(total)]
+    shares = []
+    for block in views:
+        gray = sum(1 for value in block
+                   if _GLITCH_GRAY_LOW <= value <= _GLITCH_GRAY_HIGH)
+        shares.append(gray / frame_size)
+    ordered = sorted(shares)
+    # 基线取 25 分位而不是中位数：损坏可能占片段的一半以上（实测 168 帧里 43 帧冻结、
+    # 最长 40 帧），中位数会被拉高，把阈值推到不可达。低分位代表"这段素材平时长什么样"。
+    baseline = ordered[len(ordered) // 4] if ordered else 0.0
+    threshold = max(_GLITCH_GRAY_SHARE,
+                    baseline * _GLITCH_BASELINE_RATIO + _GLITCH_BASELINE_MARGIN)
+    suspicious = 0
+    longest = 0
+    worst = 0.0
+    run_length = 0        # 当前连续可疑（灰占比超阈值）帧数
+    run_frozen = 0        # 其中"与前一帧逐像素相同"的帧数（= 复制出来的填充帧）
+
+    def motion(first, second):
+        return sum(abs(a - b) for a, b in zip(first, second)) / frame_size
+
+    for index, block in enumerate(views):
+        share = shares[index]
+        worst = max(worst, share)
+        if share < threshold:
+            run_length = run_frozen = 0
+            continue
+        run_length += 1
+        if index > 0 and motion(block, views[index - 1]) < _GLITCH_FREEZE_DIFF:
+            run_frozen += 1
+        # 段首帧必然与前一帧不同（那是损坏开始的那一帧），冻结帧数达到门槛就把整段
+        # 记入 suspicious（段首帧也算，它是同一段损坏的一部分）。
+        if run_frozen >= _GLITCH_MIN_CONSECUTIVE:
+            suspicious = max(suspicious, run_length)
+            longest = max(longest, run_length)
+    return suspicious, longest, worst
+
+
+def segment_glitch_messages(path, timeout: float = 180.0) -> list[str]:
+    """片段能不能解出正常画面？返回说明行（空列表 = 干净）。
+
+    用一次低分辨率灰度解码统计"整块灰 + 冻住"的帧（判定见 count_glitch_blocks）。
+    任何异常都返回空列表——宁可漏报也不误报（误报会白白重抓一遍）。
+
+    代价与可取消性（2026-09-27 审计后加）：
+      * 只解片段开头 ``_GLITCH_MAX_SECONDS`` 秒（并限帧），长片段不再白烧几十秒；
+      * 进程登记进 ``register_proc``（以前绕过登记表，Stop 杀不掉它，长片段会拖过
+        关闭宽限期并弹出"上一次运行仍在关闭中"）。
+    """
+    try:
+        if Path(path).stat().st_size < _GLITCH_CHECK_MIN_BYTES:
+            return []
+    except OSError:
+        return []
+    height = int(round(_GLITCH_SCALE * 9 / 16))
+    command = [
+        str(FFMPEG_PATH), "-hide_banner", "-nostdin",
+        "-t", f"{_GLITCH_MAX_SECONDS:g}",
+        "-i", str(path), "-an",
+        "-frames:v", str(_GLITCH_MAX_SECONDS_AT_30FPS),
+        "-vf", f"scale={_GLITCH_SCALE}:{height}",
+        "-pix_fmt", "gray", "-f", "rawvideo", "-",
+    ]
+    process = None
+    try:
+        # 同 segment_corruption_messages：直接 subprocess 而不是 run_tracked
+        # （本地文件、不解网络，且测试会 patch run_tracked 伪造网络命令）；
+        # 但必须登记，否则取消时杀不掉。
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        register_proc(process)
+        try:
+            data = process.communicate(timeout=timeout)[0] or b""
+        except subprocess.TimeoutExpired:
+            return []
+    except Exception:                                              # noqa: BLE001
+        return []
+    finally:
+        if process is not None:
+            unregister_proc(process)
+            if process.poll() is None:
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:                                  # noqa: BLE001
+                    pass
+    if not isinstance(data, (bytes, bytearray)):
+        return []
+    suspicious, longest, worst = count_glitch_blocks(bytes(data),
+                                                     _GLITCH_SCALE, height)
+    if longest < _GLITCH_MIN_CONSECUTIVE:
+        return []
+    return [
+        f"{suspicious} frame(s) decode to flat gray concealment blocks "
+        f"(longest run {longest}, worst {worst:.0%} of the frame)"
+    ]
+
+
 def _refresh_with_backoff(
     refresh_func: Callable[[MediaSource], MediaSource | None],
     source: MediaSource,
@@ -1801,6 +1987,43 @@ def _video_expected_height(source: MediaSource) -> int:
                 return height
             break
     return _candidate_display_height(candidates[0])
+
+
+def _rotate_video_candidate_to_range_media(source: MediaSource) -> bool:
+    """把"只能顺序读的清单流"换成同画质或更高的直链流（DASH/range 可寻址）。
+
+    :func:`_candidate_sort_key` 已经让直链档优先，这里是兜底：老版本抓到的缓存
+    源、或源本身只给了清单档（``_stream_url`` 的回退路径）时，``video_url`` 仍可能
+    是 playlist。ffmpeg 在这种输入上做 ``-ss`` 会从第 0 片顺序读（见
+    ``_is_playlist_delivery``），一个深窗口能把单次取回跑满 60s 读超时才失败，
+    每个 clip 都白等一轮。
+
+    **只换不降**（同 :func:`_rotate_video_candidate`）：只在 height >= 当前档位的
+    候选里换，且只换到"非清单"的 URL；换不动就返回 False，让调用方按原路径重试，
+    绝不为了绕开清单而降清晰度。
+    """
+    candidates = [c for c in (getattr(source, "video_candidates", None) or [])
+                  if isinstance(c, dict) and str(c.get("url") or "")]
+    if not candidates:
+        return False
+    current = str(source.video_url or "")
+    current_height = _candidate_height(
+        next((c for c in candidates if str(c.get("url")) == current), None))
+    if current_height <= 0:
+        current_height = max([_candidate_height(c) for c in candidates] or [0])
+    for candidate in candidates:
+        url = str(candidate.get("url"))
+        if url == current or _is_playlist_delivery(url):
+            continue
+        height = _candidate_height(candidate)
+        if height and current_height and height < current_height:
+            continue
+        source.video_url = url
+        headers = candidate.get("http_headers")
+        if headers:
+            source.video_headers = dict(headers)
+        return True
+    return False
 
 
 def _video_source_best_height(source: MediaSource) -> int:
@@ -2942,6 +3165,19 @@ def fetch_segment(
                 f"Segment fetch for {start}-{end} exceeded "
                 f"{max_total_duration:g}s budget; giving up on this clip "
                 f"(the VOD stream for this interval may be unavailable).")
+        # 清单流（YouTube 的 HLS 档 / 回退路径拿到的 playlist）在 ffmpeg 里做 -ss 会
+        # 从第 0 片顺序读，深窗口必然跑满读超时、一个字节都产不出来（见
+        # _is_playlist_delivery）。取回前先换到同画质或更高的直链档，换不动就照原样
+        # 重试；只对"视频轨 + 独立音频"这种在清单上取不到帧的形状做，避免动到
+        # Bilibili 自己的分片音频路径。
+        if (not audio_only and source.video_url
+                and _is_playlist_delivery(source.video_url)
+                and (source_has_embedded_audio(source) or not source.audio_url)
+                and _rotate_video_candidate_to_range_media(source)
+                and logger is not None):
+            logger("This source was served as a sequential playlist; switching to "
+                   "the same-or-higher-quality direct stream so the clip can seek "
+                   "straight to its position")
         try:
             fetch_start = max(0.0, float(start) - float(padding_before))
             fetch_end = float(end) + float(padding_after)
@@ -3107,6 +3343,29 @@ def fetch_segment(
                            f"({corruption_hits[0]}); re-fetching instead of using it")
                 raise SegmentFetchError(
                     "downloaded segment is corrupt: " + corruption_hits[0])
+            # 解码级"灰块"自检：解析通过但画面是坏的（缺失宏块被填成平灰）也要重抓。
+            # 上一道只看解析器错误，实测坏片段可以一条都不报（见上方常量处实测）。
+            #
+            # 只在**还有重试预算**时判定为失败：这道检查依赖像素统计，误报会直接丢掉
+            # 整个片段（比不检查更糟）。实测过一版误报：低饱和游戏画面 + VTuber 模型
+            # 的直播截图，帧灰占比 0.63-0.85，被当成损坏（51/3620 个缓存片段）。
+            # 现在绝对门槛抬到 0.95（真损坏实测 0.997），再加上"最后一次尝试就接受"，
+            # 所以最坏情况只是多下载一次，不会丢片段。
+            glitch_hits = []
+            if _fetch_needs_corruption_check(run_func, result):
+                glitch_hits = segment_glitch_messages(temporary_path,
+                                                      timeout=timeout)
+            if glitch_hits:
+                if attempt + 1 < allowed_attempts:
+                    if logger is not None:
+                        logger("Downloaded clip does not decode to a clean picture "
+                               f"({glitch_hits[0]}); re-fetching instead of using it")
+                    raise SegmentFetchError(
+                        "downloaded segment decodes to gray blocks: " + glitch_hits[0])
+                if logger is not None:
+                    logger("Downloaded clip still looks gray after re-fetching "
+                           f"({glitch_hits[0]}); keeping it rather than dropping the clip")
+                _log_glitch_kept(source, start, end, glitch_hits[0])
             # 落盘清晰度自检：永远抓最高档，所以"低于预期"要么是这次被降了档
             # （争取多一次尝试，且不写缓存），要么是源本身只有低清档（登记说明，
             # 不算降级、不跳过）。见 _video_quality_gate 上方的说明。
@@ -3263,12 +3522,33 @@ def parse_url_list(text: str) -> list[str]:
     result = []
     seen = set()
     for line in text.splitlines():
-        value = line.strip()
+        # BOM 可能出现在文件开头（utf-8 解码后残留 \ufeff），不剥掉会被当成 URL 的
+        # 一部分交给 yt-dlp → "unsupported URL"，那条 URL 静默消失。
+        value = line.strip().lstrip("\ufeff").strip()
         if not value or value.startswith("#") or value in seen:
             continue
         seen.add(value)
         result.append(value)
     return result
+
+
+def read_url_list_file(path) -> list[str]:
+    """Read a URL-list .txt tolerantly and return its URLs.
+
+    UTF-8（含 BOM）优先，失败则回退系统本地编码并**替换**坏字节，而不是让整个导入
+    因为一个非 UTF-8 文件直接失败（老版本、记事本"ANSI"、UTF-16 导出的清单都存在）。
+    回退策略与 timestamps txt 的读取保持一致（autocomper._read_text_lines）。
+    """
+    import locale
+    raw = Path(path).read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        fallback = locale.getpreferredencoding(False) or "utf-8"
+        print(f"WARNING: {path} is not UTF-8; retrying as {fallback}. "
+              f"Please re-save it as UTF-8.")
+        text = raw.decode(fallback, errors="replace")
+    return parse_url_list(text)
 
 
 def _normalize_browser_cookies(browser_cookies: str | None) -> str | None:
@@ -3621,20 +3901,50 @@ def preflight_cookie_source(browser_cookies: str | None) -> str | None:
     return None
 
 
+def _codec_flag(fmt: Mapping[str, Any], key: str) -> int:
+    """这条流的某个编解码器字段：1=有，0=明确没有（"none"），-1=未知。
+
+    **必须区分"未知"和"没有"**：HLS master playlist 的变体常常没有 CODECS 属性，
+    yt-dlp 于是不给 vcodec/acodec 字段。旧代码把"字段缺失"当成"没有"（`not in (None,
+    "none")` 判 False），结果这种源的 audio/video 候选列表**双双为空**，而
+    `_stream_url(audio=True)` 又会把顶层 url 当成音频交出去——导入时显示成功，
+    取片段时才炸 "MediaSource has no video_url"（见远程导入的实测）。
+    """
+    if key not in fmt:
+        return -1
+    value = fmt.get(key)
+    if value is None:
+        return -1
+    return 0 if str(value).strip().casefold() in ("", "none") else 1
+
+
 def _stream_url(info: Mapping[str, Any], audio: bool) -> str:
     formats = info.get("requested_formats") or []
     for fmt in formats:
         if not isinstance(fmt, Mapping) or not fmt.get("url"):
             continue
-        has_audio = fmt.get("acodec") not in (None, "none")
-        has_video = fmt.get("vcodec") not in (None, "none")
-        if (audio and has_audio and not has_video) or (not audio and has_video):
+        has_video = _codec_flag(fmt, "vcodec")
+        has_audio = _codec_flag(fmt, "acodec")
+        if audio:
+            # 音频优先：明确带音频且没有视频 > 编解码器未知（可能是复用流）
+            if has_audio == 1 and has_video != 1:
+                return str(fmt["url"])
+        elif has_video == 1:
             return str(fmt["url"])
 
     direct_url = info.get("url")
-    if direct_url and (audio or info.get("vcodec") not in (None, "none")):
-        return str(direct_url)
-    return ""
+    if not direct_url:
+        return ""
+    if audio:
+        # 顶层 url 只有在"确实带音频"或"编解码器未知"（单流/复用源）时才能当音频用；
+        # 明确写着 vcodec 而没有 acodec 的是纯视频流，交出去只会让后续解析失败
+        # （HLS master 不带 CODECS 时就是这种形状：候选列表为空、顶层 url 是视频清单）。
+        direct_audio = _codec_flag(info, "acodec")
+        direct_video = _codec_flag(info, "vcodec")
+        if direct_audio == 1:
+            return str(direct_url)
+        return ""
+    return str(direct_url)
 
 
 def _bilibili_cdn_variants(url: str) -> list[str]:
@@ -3754,6 +4064,24 @@ def select_fastest_bilibili_url(url, headers=None, size=None, log_func=None,
     return best_url
 
 
+def _is_playlist_delivery(url: str) -> bool:
+    """Is this stream URL an HLS manifest rather than a range-capable media URL?
+
+    实测（2026-09-29，YouTube BV 12h 长 VOD，窗口 7272s）：yt-dlp 2026.08.19 起把
+    "Premium" HLS 档放进 ``requested_formats``，其清单条目报 tbr 5485 kbps（实际
+    流只有 786 kbps），所以按 tbr 排序时它永远排第一。但 ffmpeg 在 HLS 输入上做
+    ``-ss`` 会退化成"从 playlist 第 0 片开始顺序读"——一个 12h VOD 的 7272s 窗口
+    要先把前面 ~5.6GB 全部读完。结果每个 clip 都卡到 rw_timeout，日志里是
+    "clip fetch stalled / no usable data delivered"。同窗口改走同清晰度的 DASH
+    档（itag 137，1080p）：0 字节 90s 超时 → rc=0、2,107,394 字节、18.4s。
+
+    Bilibili 自己也是分片清单，这个判断只用于**排序偏好**与"是否换线"，
+    绝不会把源里唯一的清单档丢掉（见 _rotate_video_candidate_to_range_media）。
+    """
+    value = str(url or "")
+    return "/api/manifest/hls" in value or ".m3u8" in value
+
+
 def _candidate_sort_key(candidate: Mapping[str, Any], audio: bool) -> tuple[Any, ...]:
     def number(name: str) -> float:
         try:
@@ -3762,16 +4090,22 @@ def _candidate_sort_key(candidate: Mapping[str, Any], audio: bool) -> tuple[Any,
         except (TypeError, ValueError):
             return 0
 
+    # 立即定位（range 可寻址）优先于"顺序清单"：同清晰度下先用 DASH/直链，
+    # 清单档只在没有直链档时兜底。放在最前是因为它是**能不能取到**的问题，
+    # 而不是画质问题——见 _is_playlist_delivery 的实测记录。
+    rangeable = 0 if _is_playlist_delivery(candidate.get("url")) else 1
     if audio:
         abr = number("abr")
         tbr = number("tbr")
         return (
+            rangeable,
             max(abr, tbr),
             1 if candidate.get("_requested") else 0,
             abr + tbr,
             str(candidate.get("format_id") or ""),
         )
     return (
+        rangeable,
         1 if candidate.get("_requested") else 0,
         number("height"),
         number("tbr"),
@@ -3806,9 +4140,12 @@ def _stream_candidates(info: Mapping[str, Any], audio: bool) -> list[dict[str, A
         if format_id_key:
             seen_format_ids.add(format_id_key)
         seen_urls.add(url)
-        has_audio = fmt.get("acodec") not in (None, "none")
-        has_video = fmt.get("vcodec") not in (None, "none")
-        if not ((audio and has_audio and not has_video) or (not audio and has_video)):
+        has_audio = _codec_flag(fmt, "acodec")
+        has_video = _codec_flag(fmt, "vcodec")
+        # 保持原有语义（字段缺失 = 没有）：音频候选只收"明确带音频且没有视频"的流。
+        # 把"字段缺失"当"未知"会让纯视频流混进音频候选，反而选错流。
+        if not ((audio and has_audio == 1 and has_video != 1)
+                or (not audio and has_video == 1)):
             continue
         headers = dict(base_headers)
         format_headers = fmt.get("http_headers") or {}
@@ -3826,6 +4163,7 @@ def _stream_candidates(info: Mapping[str, Any], audio: bool) -> list[dict[str, A
             "filesize_approx": fmt.get("filesize_approx"),
             "clen": fmt.get("clen"),
             "source_format": "requested_formats" if requested else "formats",
+            "codec_unknown": has_audio == -1 or has_video == -1,
             "_requested": requested,
         })
     candidates.sort(key=lambda item: _candidate_sort_key(item, audio), reverse=True)
@@ -3842,9 +4180,9 @@ def _selected_format_headers(info: Mapping[str, Any]) -> dict[str, str]:
     for fmt in formats:
         if not isinstance(fmt, Mapping) or not fmt.get("url"):
             continue
-        has_audio = fmt.get("acodec") not in (None, "none")
-        has_video = fmt.get("vcodec") not in (None, "none")
-        if not (has_audio or has_video):
+        has_audio = _codec_flag(fmt, "acodec")
+        has_video = _codec_flag(fmt, "vcodec")
+        if has_audio == 0 and has_video == 0:
             continue
         format_headers = fmt.get("http_headers") or {}
         if isinstance(format_headers, Mapping):
@@ -4124,7 +4462,7 @@ def describe_input(
         path = Path(input_value)
         if not path.is_file():
             raise SourceExpansionError(f"Input does not exist: {input_value}")
-        return _text_descriptor(parse_url_list(path.read_text(encoding="utf-8")), input_value)
+        return _text_descriptor(read_url_list_file(path), input_value)
     try:
         info = _extract_with_cookie_policy(
             input_value, ydl_factory, browser_cookies, extract_flat=True

@@ -89,11 +89,29 @@ def _run_ffmpeg(command, timeout, progress_callback=None, duration=None, stage="
 
 
 def clip_safe_end(duration, entry=None):
-    """Return the usable end time without shortening generated remote clips."""
+    """Return the usable end time without shortening generated remote clips.
+
+    对**本地文件**还要受视频轨时长约束：直播录制的容器时长 = max(音轨, 视频轨)，
+    音轨常常比视频轨长（应用自己的记录：181/181 个源都这样）。只用容器时长的话，
+    落在"有声音没画面"尾部的检测区间会被照常切成片段——实测视频轨 10s / 音轨 20s
+    的源，切 12-18s 得到一个**完全没有视频流**的 mp4，单源编译出来就是纯音频成品，
+    多源编译则是此后每个片段的画面比声音快 4 秒，而且 rc=0、没有任何告警。
+    """
     metadata = (entry or {}).get('source_metadata') or {}
     if metadata.get('materialized_remote_segment'):
         return duration
-    return max(0, duration - 0.5)
+    limit = duration
+    filename = (entry or {}).get('filename')
+    if filename and not isinstance(filename, str):
+        filename = None                     # MediaSource：由取回层的终点裁剪负责
+    if filename:
+        try:
+            video_duration = _video_stream_duration(filename)
+        except Exception:                                    # noqa: BLE001
+            video_duration = None
+        if video_duration and video_duration > 0:
+            limit = min(limit, float(video_duration))
+    return max(0, limit - 0.5)
 
 
 _PROBE_CACHE = {}
@@ -318,10 +336,14 @@ def _resolve_output_fps(output_fps, file_list):
         if not majority:
             return 30, "no clip frame rate could be probed; using 30fps"
         return majority, f"most clips are {majority}fps"
+    if output_fps is None:
+        return 30, "30fps (default; no rate was chosen)"
     try:
         value = int(output_fps)
     except (TypeError, ValueError):
-        return 30, "30fps (default; no rate was chosen)"
+        # 有值但不是数字（旧配置/preset 里的手写文本）：要说清是"这个值不认"，
+        # 而不是"没选过"——否则用户按日志排查时会被引到错误的方向。
+        return 30, f"{output_fps!r} is not a supported output rate; using 30fps"
     if value in _FPS_LEVELS:
         return value, f"{value}fps (explicit choice)"
     return 30, f"{value} is not a supported output rate; using 30fps"
@@ -1622,9 +1644,13 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
             downscaled_clips = []
             if is_video and tasks:
                 # 切片阶段只逐条打印 "Done writing all clips ..."，之后进入校验会有
-                # 一段没有任何输出的时间（长批次里看着像卡住）。这里明说在干什么。
+                # 一段没有任何输出的时间（长批次里看着像卡住）。这里明说在干什么，
+                # 并按用户要求补一句"片段多就要等"。
                 print(f"{Fore.CYAN}Verifying clip quality and integrity "
                       f"({len(tasks)} clips)...{Style.RESET_ALL}")
+                if len(tasks) >= 50:
+                    print(f"{Fore.CYAN}This can take a while with many clips; "
+                          f"thanks for your patience.{Style.RESET_ALL}")
                 verified = re_cut = 0
                 for _index, task in enumerate(tasks):
                     if cancel_pending():

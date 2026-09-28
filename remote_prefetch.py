@@ -111,11 +111,25 @@ def _probe_real_size(url, headers, timeout=15, request_func=None):
     ~70-80% for a long time. Probing ``bytes=0-0`` gives the authoritative size
     from ``Content-Range`` in one cheap request.
     """
-    request = request_func or _default_request
-    try:
-        _data, status, response_headers = request(url, 0, 0, dict(headers), timeout)
-    except Exception:
-        return None
+    if request_func is None:
+        # 只读 1 字节：旧实现走 _default_request，它在**检查状态码之前**就
+        # response.read()，服务器忽略 Range 直接回 200 + 整个文件时整段进内存
+        # （实测 40MB 响应 → 42MB 常驻）。与 _probe_stream_size 同样的做法。
+        request = Request(url, headers={**dict(headers or {}), "Range": "bytes=0-0"})
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                response_headers = {str(key): str(value)
+                                    for key, value in response.headers.items()}
+                response.read(1)
+        except Exception:
+            return None
+    else:
+        try:
+            _data, status, response_headers = request_func(url, 0, 0,
+                                                           dict(headers), timeout)
+        except Exception:
+            return None
     if int(status) != 206:
         return None
     if not isinstance(response_headers, Mapping):
@@ -393,6 +407,8 @@ def download_stream_to_file(url, destination, headers=None, size=None,
     # 放弃，交回 yt-dlp）；② yt-dlp 的 filesize_approx 对 Bilibili 可能偏大或
     # 偏小，按错的 size 划分区间会卡在尾部（越界 416 / 少下尾部 box）。
     probed = _probe_stream_size(url, header_map, request_func=request_func)
+    size_verified = probed is not None
+    declared_size = size
     if probed is not None:
         size = probed
     try:
@@ -443,17 +459,24 @@ def download_stream_to_file(url, destination, headers=None, size=None,
                 if len(result) == 3 and result[2]:
                     response_headers = {str(key).lower(): str(value)
                                         for key, value in result[2].items()}
+                if int(status) == 416:
+                    # 请求区间已经越过实际末尾：说明 size（预估）偏大，和
+                    # iter_range_bytes 一样按"末尾已到"优雅收尾，而不是硬错误重试
+                    # 5 次（37 秒）后把整段传输丢掉、退回单连接重下。
+                    if start > 0:
+                        return index, 0, None
+                    raise RangePrefetchError("range server rejected the first range")
                 if int(status) != 206:
                     raise RangePrefetchError("range server returned a non-partial response")
                 expected = end - start + 1
                 content_range = str(response_headers.get("content-range", "")).lower()
-                short_final = index == len(ranges) - 1 and len(data) < expected
                 cr_matches = content_range.startswith(
                     f"bytes {start}-{start + len(data) - 1}/")
-                if len(data) != expected and not (short_final and cr_matches):
+                if len(data) != expected and not cr_matches:
                     raise RangePrefetchError("range response length mismatch")
                 if not data:
-                    raise RangePrefetchError("range response was empty")
+                    # 实际末尾已收完（与 iter_range_bytes 相同语义）
+                    return index, 0, None
                 with open(destination, "r+b") as handle:
                     handle.seek(start)
                     handle.write(data)
@@ -501,9 +524,26 @@ def download_stream_to_file(url, destination, headers=None, size=None,
     report()
     with progress_lock:
         total_written = written[0]
-    if total_written != size:
+    # 区间可能少写（末尾 416 / 实际末尾提前到达）：文件开头已经 truncate 到 size，
+    # 必须按实际写入量裁掉尾部，否则会留下"空洞 + 旧长度"的坏文件。
+    if total_written < size:
+        try:
+            with open(destination, "r+b") as handle:
+                handle.truncate(total_written)
+        except OSError as exc:
+            raise RangePrefetchError(
+                f"could not trim the partial transfer: {exc}") from exc
+    if total_written > size:
         raise RangePrefetchError(
             f"parallel transfer wrote {total_written} of {size} bytes")
+    if not size_verified and total_written != declared_size:
+        # 探测失败时 size 只是调用方的 filesize_approx。写不够说明是**截断**：以前
+        # 这里照样返回成功，文件被登记为"已下载"并永久复用——文件顶部注释里
+        # "bilibili filesize_approx 可能偏小（缺尾部 box）"说的就是它。宁可失败，
+        # 让上层退回 yt-dlp 重下（那才是正确字节）。
+        raise RangePrefetchError(
+            f"parallel transfer wrote {total_written} of the estimated "
+            f"{declared_size} bytes; the size could not be verified")
     return total_written
 
 

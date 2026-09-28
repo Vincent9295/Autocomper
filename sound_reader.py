@@ -42,11 +42,16 @@ def scaled_retry_attempts(duration=None, base=_BASE_RETRY_ATTEMPTS,
 
     Large VODs (many blocks/segments) hit more transient CDN failures, so a
     fixed small retry count is not enough; small files stay snappy.
+
+    非有限值（inf/NaN）按 0 处理：JSON 往返会带上 Infinity 字面量（见
+    remote_prefetch._scaled_range_attempts 里同一处坑），而 ``int(inf)`` 抛的是
+    **OverflowError**——不在下面的 except 里，会直接炸掉整次检测（一个字节都没读）。
     """
     base = max(1, int(base))
     maximum = max(base, int(maximum))
     try:
-        hours = max(0.0, float(duration) / 3600.0)
+        value = float(duration)
+        hours = max(0.0, value / 3600.0) if math.isfinite(value) else 0.0
     except (TypeError, ValueError):
         hours = 0.0
     return min(maximum, base + int(hours))
@@ -268,14 +273,29 @@ def load_audio(file: str | MediaSource, sr: int, frame_count: int,
 
 
 def _load_audio_twitch_retry(source, sr, frame_count, duration, refresh_func=None):
+    """Twitch HLS 读取 + 过期 URL 重试。
+
+    **重试只能发生在"一个字节都还没产出去"的时候。** 旧实现无条件 `yield from`：
+    中途 stall / URL 过期时，错误发生在已经产出若干块之后，重试会从字节 0 重新读，
+    把消费方已经计入的 PCM **再喂一遍**——片段重复、之后每个片段的时间轴整体后移
+    （重复块数 × block_size），而 `processed_blocks < block_count` 的完整性检查因为
+    计数只增不减，完全看不到这个问题（实测：4 秒源 stall 后变成 6 块、片段报在
+    0-4/1-5/…/5-9s）。已经产出过数据就如实抛错，交给上层按"这个源失败"处理。
+    """
     attempts = scaled_retry_attempts(duration)
     for attempt in range(attempts):
+        emitted = False
         try:
-            yield from _load_audio_direct(
+            for block in _load_audio_direct(
                 source, sr, frame_count, stall_timeout=DEFAULT_STALL_TIMEOUT
-            )
+            ):
+                emitted = True
+                yield block
             return
-        except Exception as exc:
+        except Exception:
+            if emitted:
+                # 已经交付过音频：重试会重复喂数据，宁可让上层看到失败。
+                raise
             if attempt >= attempts - 1:
                 raise
             time.sleep(retry_backoff(attempt))
@@ -368,11 +388,17 @@ def _read_audio_with_stall(process, chunk_size, stall_timeout, cmd):
     If no bytes arrive within ``stall_timeout`` seconds the process is killed
     and ``RemoteAudioStallError`` is raised so callers can refresh the (possibly
     expired) signed URL and retry instead of hanging forever.
+
+    队列**必须有界**：消费者每个 block 要跑一次 527 类模型（实测约 10× 实时），
+    而 ffmpeg 解码本地/远程音频可以快一两个数量级。无界队列会把整条流解码进内存
+    （3 小时 VOD ≈ 690 MB，10 小时 ≈ 2.3 GB）。maxsize=2 时读取线程在消费者落后时
+    自然阻塞，ffmpeg 的 stdout 管道被填满后也随之等待——看门狗语义不变（有积压时
+    ``get(timeout=...)`` 立即返回，只有真的没数据才会超时）。
     """
     import queue as _queue
     import threading as _threading
 
-    items = _queue.Queue()
+    items = _queue.Queue(maxsize=2)
 
     def reader():
         try:
@@ -383,7 +409,10 @@ def _read_audio_with_stall(process, chunk_size, stall_timeout, cmd):
                     break
                 items.put(chunk)
         except BaseException as exc:  # noqa: BLE001 - surface any read error
-            items.put(exc)
+            try:
+                items.put(exc)
+            except BaseException:  # noqa: BLE001 - consumer已经走了
+                pass
 
     thread = _threading.Thread(target=reader, name="audio-reader", daemon=True)
     thread.start()
@@ -564,7 +593,14 @@ def hash_file(file_path, algorithm='sha256', chunk_size=8192) -> str:
 
 
 def _get_audio_duration(file):
-    """用 ffmpeg（非 ffprobe）快速探测时长。"""
+    """用 ffmpeg（非 ffprobe）快速探测时长。
+
+    注意 `build_audio_command` 固定带 `-loglevel warning`，而 `Duration:` 是 info
+    级输出——所以这里必须自己拼一条**带 info 日志**的探测命令，否则正则永远匹配
+    不到，fallback 等于死代码（本地文件永远拿不到时长 → 进度只显示 1 个 block，
+    而且远程源在没有 metadata 时长时连"读少了"的截断保护都会失效）。
+    用 `-f null -` 让 ffmpeg 正常结束，避免"没有输出文件"导致的 rc=1。
+    """
     if isinstance(file, MediaSource):
         try:
             duration = float(file.duration)
@@ -573,8 +609,15 @@ def _get_audio_duration(file):
         except (TypeError, ValueError):
             pass
     try:
-        cmd = build_audio_command(file, SAMPLE_RATE, 0, output_pipe=False)
-        out = run_tracked(cmd, timeout=10, text=True)
+        input_source, headers = _source_input(file)
+        cmd = [FFMPEG_PATH, '-hide_banner', '-nostdin']
+        if headers:
+            cmd += ['-headers', _format_http_headers(headers)]
+        if _is_http_input(input_source):
+            # 与 build_audio_command 一致：签名 URL 过期时不要让探测永久挂住
+            cmd += ['-rw_timeout', '60000000']
+        cmd += ['-i', str(input_source), '-f', 'null', '-']
+        out = run_tracked(cmd, timeout=30, text=True)
         m = re.search(r'Duration: (\d+):(\d+):(\d+)\.(\d+)', out.stderr or '')
         if m:
             h, mi, s, ms = map(int, m.groups())
@@ -615,6 +658,13 @@ MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
 def _detection_cache_args(source, model, precision, block_size, threshold, focus_idx):
+    """检测缓存与 .failed.json 的键。
+
+    这里**故意**用裸 ``source.source_id``（不是 stable_source_id）：键同时决定磁盘上
+    的缓存文件名，改成 URL 兜底会让升级后所有既有检测缓存失配——12 小时 VOD 会全部
+    重新检测一遍，代价远大于"极少数没有 id 的源可能撞键"的风险。yt-dlp 对三大平台
+    一律给出 id；只有元数据不完整的 PlaylistEntry 才会为空。
+    """
     return (
         source.platform,
         source.source_id,
@@ -632,11 +682,14 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                    use_gpu=True, cache_store=None, progress_callback=None,
                    refresh_func=None, save_audio_path=None,
                    select_candidate_func=None, prefetch_concurrency=None):
-    if precision < 0:
+    # 必须是"正数"：0 会让 subsample 除零（precision=0 → ZeroDivisionError 卡在
+    # 检测中途），block_size=0 会让 frame_count/chunk_size 归零（AudioDecodeError）。
+    # GUI 的数字校验只挡非数字，用户手打 0 是可能的。
+    if precision <= 0:
         raise Exception("Precision must be a positive number!")
     if not (threshold >= 0 and threshold <= 1):
         raise Exception("Threshold must be between 0 and 1!")
-    if block_size < 0:
+    if block_size <= 0:
         raise Exception("Block size must be a positive number!")
 
     is_remote = isinstance(file, MediaSource)

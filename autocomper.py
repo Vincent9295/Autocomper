@@ -1479,14 +1479,18 @@ def _clamp_intervals_to_video(timestamps, source_video_end, padding=None):
 
     **必须和 materialize_remote_entries 的循环判定逐条一致**，否则写进
     timestamps.txt 的片段数会和实际准备数对不上（测试者实测：文件 231 行 / 只准备
-    115 个）。两条规则都来自 materialize：
+    115 个）。判定规则来自 materialize：
       1. 邻居钳制：``after`` 最多伸到下一个区间起点、``before`` 受上一个有效区间
          终点约束（重叠检测区间会被裁）；
       2. 视频终点钳制：区间被裁到 ``duration - 0.25``；裁完不足 1 秒、或起点已经
          越界（``eff_start >= 硬终点``）的区间判为"没有对应画面"而丢弃。
-    注意顺序：终点钳制在邻居钳制**之后**，所以「99.0-100.0 越界被丢」会让前一个
-    区间多留 0.75s 的内容（它以邻居起点为上限）。这个看似无关紧要的差异正是
-    对不上的来源，所以这里逐条复刻，不做"更合理"的改写。
+
+    **返回的是"检测边界"（只做视频终点钳制），不是带 padding 的有效区间。**
+    padding 由 materialize 在取段时加**一次**；如果这里把 padding 也算进返回值，
+    下游会加两次——文件的声明区间、缓存键、编译时长都会与实际交付内容不一致。
+    但 padding **要参与"丢不丢"的判定**：加了 padding 之后起点越过视频终点的片段，
+    materialize 同样会丢弃（它判的是 eff_start），这里跟上才不会出现"文件里有、
+    实际没准备"的偏差。所以 ``padding`` 只影响判定，不影响返回值。
     """
     timestamps = list(timestamps or [])
     if not source_video_end:
@@ -1494,33 +1498,38 @@ def _clamp_intervals_to_video(timestamps, source_video_end, padding=None):
     before, after = (float(padding[0]), float(padding[1])) if padding else (0.0, 0.0)
     hard_end = float(source_video_end) - _VIDEO_END_MARGIN
     kept, dropped = [], []
-    neighbour_shortened = 0
     previous_end = None
     count = len(timestamps)
     for index, ts in enumerate(timestamps):
         start, end = float(ts['start']), float(ts['end'])
+        # 先按 materialize 的顺序算出"有效区间"（含 padding 与邻居钳制）：
+        #   eff_end   = min(end + after, 下一个区间起点)
+        #   eff_start = max(start - before, 上一个**有效**终点)
+        # 丢弃判定必须用这套有效值（materialize 就是用它），否则会出现
+        # "文件里留着、实际准备时被丢"——正是 231/115 那类偏差：
+        #   * 尾部区间 99-100（硬终点 99.75）：有效终点被裁到 99.75，不足 1 秒 → 丢；
+        #   * 重叠检测 10-20 / 15-25：前者有效终点被邻居裁到 15；
+        #   * 加了 padding 才能凑够 1 秒的短检测：有效值够 1 秒 → 保留。
         next_start = (float(timestamps[index + 1]['start'])
                       if index + 1 < count else None)
         eff_end = (end + after) if next_start is None else min(end + after, next_start)
         eff_start = start - before
         if previous_end is not None:
             eff_start = max(eff_start, previous_end)
-        if ((before > 0 and eff_start > start - before + 1e-6)
-                or (after > 0 and eff_end < end + after - 1e-6)
-                or eff_start > start + 1e-6
-                or eff_end < end - 1e-6):
-            neighbour_shortened += 1
-        if eff_start >= hard_end:
-            dropped.append(ts)
-            continue
         if eff_end > hard_end:
             eff_end = hard_end
-        if eff_end - eff_start < _VIDEO_END_MIN_CLIP:
+        if eff_start >= hard_end or eff_end - eff_start < _VIDEO_END_MIN_CLIP:
             dropped.append(ts)
             continue
         previous_end = eff_end
-        kept.append(dict(ts, start=eff_start, end=eff_end))
-    return kept, dropped, neighbour_shortened
+        # 写进文件的是**检测边界**：起点不带 padding（padding 由 materialize 加一次），
+        # 终点取"邻居钳制后、且不超过视频可用终点"的值——否则文件会声称一个
+        # materialize 实际不会交付的范围（重叠检测时最明显：文件写 10-20，
+        # 实际取的是 10-15）。
+        kept.append(dict(ts, start=start,
+                         end=min(end, next_start if next_start is not None else end,
+                                 hard_end)))
+    return kept, dropped, 0
 
 
 def _drop_intervals_without_footage(dict_list, is_video, padding=None):
@@ -2237,6 +2246,7 @@ def _read_preferences_into(parser: configparser.ConfigParser, path: str) -> None
         pass
     # 注意不能用 locale.getpreferredencoding——Python 开 UTF-8 模式时它返回
     # utf-8，等于没回退。旧文件是 ANSI 代码页写的，Windows 上显式用 mbcs。
+    import locale
     import sys
     fallback_encoding = "mbcs" if sys.platform == "win32" \
         else locale.getpreferredencoding(False)
@@ -3392,6 +3402,149 @@ def _release_grab(window):
         pass
 
 
+# 应用级模态框的抓取登记：grab 属于整个应用，但 Tk 的 grab 和 Windows 的焦点
+# 恢复会互相打架。测试者实测：打开 Import External Audio 的配对窗口后按 Alt+Tab
+# 切走，就再也切不回程序（任务栏点不动、Alt+Tab 回不来）。原因是那个窗口只做了
+# `grab_set()`：它有 grab，Windows 却不把它当活动窗口，于是"点任务栏"这一下被
+# 焦点抢占保护吞掉，窗口停在"有 grab、没焦点"的死角。
+#
+# 处理办法（对所有模态框统一）：
+#   * transient + lift + focus_force，让窗口真的成为前台窗口；
+#   * 失去焦点时主动 grab_release，重新获得焦点时再加回来——这样 Alt+Tab 切换、
+#     点任务栏、多显示器都不再被 grab 挡住，同时窗口在前台时仍然是模态的。
+class _ModalGrab:
+    """Hold an application-wide grab, releasing it while the app is not focused."""
+
+    # 重新夺回 grab 的看门狗间隔（毫秒）。嵌套对话框（播放列表选择、限流询问…）
+    # 关闭时 Tk **不会**把 grab 还给外层窗口，所以外层窗口会静默变成非模态；
+    # 低频轮询是修复它最省事的办法（只有在前台且没人持有 grab 时才动手）。
+    WATCHDOG_MS = 400
+
+    def __init__(self, window):
+        self.window = window
+        self._focus_out_id = None
+        self._focus_in_id = None
+        self._destroy_id = None
+        self._map_id = None
+        self._watchdog_id = None
+        self.active = False
+
+    def install(self):
+        window = self.window
+        try:
+            window.transient(window.master)
+            # lift/focus_force 在窗口还没 mapped 时会被丢弃（实测 Windows 上
+            # focus_force 落在别的窗口），所以映射之后再补一次。
+            window.lift()
+            window.focus_force()
+            window.grab_set()
+        except tk.TclError:
+            return self
+        self.active = True
+        try:
+            self._focus_out_id = window.bind("<FocusOut>", self._on_focus_out, add="+")
+            self._focus_in_id = window.bind("<FocusIn>", self._on_focus_in, add="+")
+            self._destroy_id = window.bind("<Destroy>", self._on_destroy, add="+")
+            # 输入焦点落到窗口本身（而不是某个子控件）时的 FocusOut 才是"焦点离开
+            # 对话框"；绑定在 Toplevel 上的 <FocusOut> 也会收到子控件的事件，靠
+            # event.widget 区分（见 _on_focus_out）。
+            self._map_id = window.bind("<Map>", self._on_map, add="+")
+        except tk.TclError:
+            pass
+        self._start_watchdog()
+        return self
+
+    def _start_watchdog(self):
+        window = self.window
+        try:
+            self._watchdog_id = window.after(self.WATCHDOG_MS, self._watchdog)
+        except tk.TclError:
+            self._watchdog_id = None
+
+    def _watchdog(self):
+        """前台窗口没有 grab 时把它夺回来（嵌套对话框关闭后 Tk 不会自动还）。"""
+        window = self.window
+        try:
+            if not window.winfo_exists():
+                return
+            if window.grab_current() is None and window.focus_displayof() is window:
+                window.grab_set()
+        except tk.TclError:
+            pass
+        finally:
+            self._start_watchdog()
+
+    def _on_map(self, _event=None):
+        try:
+            self.window.lift()
+            self.window.focus_force()
+        except tk.TclError:
+            pass
+
+    def _on_focus_out(self, event=None):
+        # 只处理"焦点离开这个对话框"：绑定在 Toplevel 上的 <FocusOut> 也会被子控件
+        # 的事件触发，所以要求 event.widget 就是窗口本身。
+        # 另外这里**不能**用 focus_displayof() 判断——抓着 grab 时焦点根本移不出去，
+        # 它会一直返回自己，"释放 grab"永远不会执行，窗口就永久卡在"有 grab、没焦点"
+        # 的状态（测试者遇到的 Alt+Tab 切不回来）。焦点走了就放手，回来再抓。
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget is not self.window:
+            return
+        _release_grab(self.window)
+
+    def _on_focus_in(self, event=None):
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget is not self.window:
+            return
+        window = self.window
+        try:
+            if not window.winfo_exists():
+                return
+            if window.grab_current() is not None:
+                return
+            window.grab_set()
+        except tk.TclError:
+            pass
+
+    def _on_destroy(self, event=None):
+        # <Destroy> 会为窗口的**每个子控件**触发；不过滤 event.widget 的话，销毁一个
+        # 子控件就会把这个 holder 判死并解绑——grab 还在，却再也没有"失焦释放"的路径。
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget is not self.window:
+            return
+        self.active = False
+        if self._watchdog_id is not None:
+            try:
+                self.window.after_cancel(self._watchdog_id)
+            except tk.TclError:
+                pass
+            self._watchdog_id = None
+        self._unbind()
+
+    def _unbind(self):
+        for sequence, identifier in (("<FocusOut>", self._focus_out_id),
+                                     ("<FocusIn>", self._focus_in_id),
+                                     ("<Map>", self._map_id),
+                                     ("<Destroy>", self._destroy_id)):
+            if identifier is None:
+                continue
+            try:
+                self.window.unbind(sequence, identifier)
+            except tk.TclError:
+                pass
+        self._focus_out_id = self._focus_in_id = None
+        self._map_id = self._destroy_id = None
+
+
+def install_modal_grab(window):
+    """Make a Toplevel behave like a modal dialog that survives Alt+Tab.
+
+    统一替代裸 `window.grab_set()`：见 _ModalGrab 上的说明。返回保持 grab 状态的
+    对象（不需要保存，窗口销毁时会自行解绑）。
+    """
+    return _ModalGrab(window).install()
+
+
 class ReviewDialog:
     """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消。"""
 
@@ -3864,9 +4017,27 @@ class ReviewDialog:
                     lines.append(f"{start_str} - {end_str}, confidence: {ts.get('pred', 0):.2f}{marker}")
                 lines.append('')
             if lines:
-                with open(selected_path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(lines))
-                print(f"{Fore.GREEN}Saved selected timestamps to {selected_path}")
+                try:
+                    with open(selected_path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(lines))
+                    print(f"{Fore.GREEN}Saved selected timestamps to {selected_path}")
+                except OSError as exc:
+                    # 这里以前是裸写：盘符不可写/目录被删时异常在 Tk 回调里抛出，
+                    # 窗口不会 destroy，worker 永远卡在 wait_window（要用户手动取消）。
+                    # 写不进去只该是一条警告——选择本身仍然生效。
+                    print(f"{Fore.YELLOW}Could not save {selected_path}: {exc}"
+                          f"{Style.RESET_ALL}")
+            else:
+                # 一个都没勾：把旧的 _selected 清掉。留着它的话，"上次编译的选择"
+                # 这个偏好下一次会把用户刚删掉的片段又装回来。
+                try:
+                    if os.path.exists(selected_path):
+                        os.remove(selected_path)
+                        print(f"{Fore.YELLOW}Removed {selected_path} "
+                              f"(no clips selected){Style.RESET_ALL}")
+                except OSError as exc:
+                    print(f"{Fore.YELLOW}Could not remove {selected_path}: {exc}"
+                          f"{Style.RESET_ALL}")
 
         self.cleanup_preview_files()
         self.win.destroy()
@@ -3945,7 +4116,7 @@ class ExternalAudioPairingDialog:
         ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=6)
         self._update_import_state()
 
-        self.win.grab_set()
+        install_modal_grab(self.win)
 
     @staticmethod
     def _fmt_duration(seconds):
@@ -4942,7 +5113,13 @@ class VideoProcessorApp:
         # 记住每个控件被禁用前的 state：readonly 的下拉框重新启用时必须回到
         # readonly，否则会变成可以手打的普通输入框（手打进去的 "60" 不是合法选项，
         # 会被当成 unknown 静默回落到 30fps）。
+        #
+        # 只记**第一次**：嵌套流程（如 External Audio 导入自己禁用按钮）里后一次的
+        # "disabled" 会被当成基线记下来，运行结束后按钮就永久变灰了。
         for elt in self.disable_while_processing:
+            if elt in self._disabled_state_memory:
+                elt["state"] = tk.DISABLED
+                continue
             try:
                 self._disabled_state_memory[elt] = str(elt.cget("state"))
             except Exception:
@@ -5011,12 +5188,12 @@ class VideoProcessorApp:
     def custom_warning_dialog(self, parent, title, message):
         dialog = tk.Toplevel(parent)
         dialog.title(title)
-        dialog.grab_set()
         dialog.minsize(width=400, height=200)
         dialog.resizable(False, False)
         x = parent.winfo_x() + 15
         y = parent.winfo_y() + 15
         dialog.geometry(f"+{x}+{y}")
+        install_modal_grab(dialog)
 
         result = {"action": None, "dont_show_again": False}
 
@@ -5406,9 +5583,7 @@ class VideoProcessorApp:
         render_page()
         dialog.protocol("WM_DELETE_WINDOW", cancel)
         _release_grab(getattr(self, "entry_window", None))
-        dialog.lift()
-        dialog.focus_force()
-        dialog.grab_set()
+        install_modal_grab(dialog)
         self.root.wait_window(dialog)
         return result["sources"]
 
@@ -5450,8 +5625,7 @@ class VideoProcessorApp:
         buttons.pack(fill="x", padx=14, pady=(8, 12))
         ttk.Button(buttons, text="Save", command=confirm).pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-        dialog.grab_set()
-        dialog.focus_force()
+        install_modal_grab(dialog)
         self.root.wait_window(dialog)
         if result["value"]:
             self._persist_timestamps_preference(result["value"])
@@ -5507,26 +5681,50 @@ class VideoProcessorApp:
         print(f"{Fore.GREEN}{summary}.{Style.RESET_ALL}")
 
     def add_video_url(self):
-        self.entry_window = tk.Toplevel(self.root)
+        # 窗口对象必须固定在局部变量里：以前所有回调都操作 self.entry_window，
+        # 而 self.entry_window 会被**下一次**打开覆盖。第二次打开这个对话框时，
+        # 第一个窗口的回调会去关闭已经销毁的第二个窗口（no-op），第一个窗口就再也
+        # 关不掉、它的 wait_window 永不返回（测试者路径：Alt+Tab 切走 → 主窗口 →
+        # Add URL，两次）。同时这里加一道重入保护：已经有一个在开着就直接返回。
+        existing = getattr(self, "entry_window", None)
+        if existing is not None and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except tk.TclError:
+                pass
+            return
+
+        win = tk.Toplevel(self.root)
+        self.entry_window = win
         x = self.root.winfo_x() + 15
         y = self.root.winfo_y() + 15
-        self.entry_window.geometry(f"400x130+{x}+{y}")
-        self.entry_window.title("Enter URL")
-        self.entry_window.resizable(False, False)
-        self.entry_window.transient(self.root)
+        win.geometry(f"400x130+{x}+{y}")
+        win.title("Enter URL")
+        win.resizable(False, False)
+        win.transient(self.root)
 
         entry_label = ttk.Label(
-            self.entry_window, font=(None, 12, "bold"), text="Enter a URL and Press Enter:")
+            win, font=(None, 12, "bold"), text="Enter a URL and Press Enter:")
         entry_label.pack(pady=10)
 
         entry_label = ttk.Label(
-            self.entry_window, font=(None, 10), text="Please be patient when submitting playlists")
+            win, font=(None, 10), text="Please be patient when submitting playlists")
         entry_label.pack(pady=(5, 0))
 
-        url_entry = ttk.Entry(self.entry_window, width=50)
+        url_entry = ttk.Entry(win, width=50)
         url_entry.pack(pady=5)
 
         self.thread_active = False
+        # 取消标记：取消之后到达的解析结果必须丢掉，否则会弹出"Import failed"，
+        # 播放列表 URL 还会在取消之后又开一个 Review-Playlist 模态框。
+        cancelled = {"value": False}
+
+        def window_alive():
+            try:
+                return bool(win.winfo_exists())
+            except tk.TclError:
+                return False
 
         def check_url():
             url = url_entry.get()
@@ -5542,21 +5740,27 @@ class VideoProcessorApp:
                 # exc 在 except 块结束时被 Python 删除；延迟执行的 lambda 必须引用
                 # 块内捕获的局部副本，否则回调触发时抛 NameError、错误弹窗永不显示。
                 invalid_url_error = f"Invalid URL: {url}\nError: {exc}"
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Error", invalid_url_error
-                ))
-                self.root.after(0, lambda: url_entry.config(state=tk.NORMAL))
+                self.root.after(0, lambda: (
+                    None if cancelled["value"] or not window_alive()
+                    else messagebox.showerror("Error", invalid_url_error)))
+                self.root.after(0, lambda: (
+                    None if not window_alive()
+                    else url_entry.config(state=tk.NORMAL)))
                 self.root.after(0, lambda: setattr(self, "thread_active", False))
                 return
 
             def finish_description():
+                if cancelled["value"] or not window_alive():
+                    self.thread_active = False
+                    return
                 if isinstance(described, PlaylistDescriptor):
                     selected_entries = self._pick_playlist_sources(described)
                 else:
                     selected_entries = [described]
                 if selected_entries is None:
-                    _release_grab(self.entry_window)
-                    self.entry_window.destroy()
+                    close_add_url(force=True)
+                    return
+                if cancelled["value"] or not window_alive():
                     self.thread_active = False
                     return
                 failures = []
@@ -5577,6 +5781,9 @@ class VideoProcessorApp:
                     )
 
                     def finish_import():
+                        if cancelled["value"] or not window_alive():
+                            self.thread_active = False
+                            return
                         # 跨添加去重：同一 URL 可能出现在多个 playlist 或被重复添加，
                         # 按 stable_source_id 过滤掉已导入的源，避免 uploaded_videos 累积重复项。
                         existing_ids = {
@@ -5585,9 +5792,11 @@ class VideoProcessorApp:
                             if upload.get_source() is not None
                         }
                         fresh_sources = []
+                        duplicates = 0
                         for source in sources:
                             source_id = stable_source_id(source)
                             if source_id in existing_ids:
+                                duplicates += 1
                                 continue
                             existing_ids.add(source_id)
                             fresh_sources.append(source)
@@ -5598,6 +5807,9 @@ class VideoProcessorApp:
                         self.update_listbox_add_video(scroll_to_bottom=True)
                         count = len(fresh_sources)
                         message = f"Successfully imported {count} video" + ("." if count == 1 else "s.")
+                        if duplicates:
+                            message += (f" {duplicates} already in the list"
+                                        f" ({'was' if duplicates == 1 else 'were'} skipped).")
                         if expansion_stats.get("expanded_parts"):
                             message += f" Expanded {expansion_stats['expanded_parts']} parts."
                         if failures:
@@ -5607,11 +5819,12 @@ class VideoProcessorApp:
                             )
                         elif count:
                             messagebox.showinfo("Success", message)
+                        elif duplicates:
+                            # 全部都是重复项：列表本来就是对的，不该报"导入失败"。
+                            messagebox.showinfo("Already in the list", message)
                         else:
                             messagebox.showwarning("Import failed", "No selected entries could be resolved.")
-                        _release_grab(self.entry_window)
-                        self.entry_window.destroy()
-                        self.thread_active = False
+                        close_add_url(force=True)
 
                     self.root.after(0, finish_import)
 
@@ -5619,16 +5832,24 @@ class VideoProcessorApp:
 
             self.root.after(0, finish_description)
 
-        def close_add_url(event=None):
-            if self.thread_active:
+        def close_add_url(event=None, force=False):
+            """关闭这个对话框。force=True 用于结果已处理完/内部取消的路径。"""
+            if cancelled["value"]:
+                return
+            if not force and self.thread_active:
                 confirm = messagebox.askyesno("Confirm Cancellation",
                                               f"The current job will be cancelled, but any previously parsed URLs will be kept. Would you like to cancel?")
-                if confirm:
-                    _release_grab(self.entry_window)
-                    self.entry_window.destroy()
-            else:
-                _release_grab(self.entry_window)
-                self.entry_window.destroy()
+                if not confirm:
+                    return
+            cancelled["value"] = True
+            self.thread_active = False
+            _release_grab(win)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            if getattr(self, "entry_window", None) is win:
+                self.entry_window = None
 
         def check_url_threaded(event=None):
             self.thread_active = True
@@ -5636,14 +5857,20 @@ class VideoProcessorApp:
             thread = threading.Thread(target=check_url)
             thread.start()
 
-        self.entry_window.protocol("WM_DELETE_WINDOW", close_add_url)
+        win.protocol("WM_DELETE_WINDOW", close_add_url)
 
         url_entry.bind("<Return>", check_url_threaded)
         url_entry.bind("<Escape>", close_add_url)
         url_entry.focus_set()
 
-        self.entry_window.grab_set()
-        self.root.wait_window(self.entry_window)
+        install_modal_grab(win)
+        try:
+            url_entry.focus_set()
+        except tk.TclError:
+            pass
+        self.root.wait_window(win)
+        if getattr(self, "entry_window", None) is win:
+            self.entry_window = None
 
     def _on_listbox_resize(self, event):
         if self._listbox_resize_after is not None:
@@ -6376,8 +6603,7 @@ class VideoProcessorApp:
                 dialog.after(500, watch_cancel)
 
             dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-            dialog.grab_set()
-            dialog.focus_force()
+            install_modal_grab(dialog)
             dialog.after(500, watch_cancel)
             self.root.wait_window(dialog)
             return result["wait"]
@@ -6466,8 +6692,7 @@ class VideoProcessorApp:
                     return
                 dialog.after(500, watch_cancel)
 
-            dialog.grab_set()
-            dialog.focus_force()
+            install_modal_grab(dialog)
             dialog.after(500, watch_cancel)
             self.root.wait_window(dialog)
             return result
@@ -6596,7 +6821,14 @@ class VideoProcessorApp:
         _before_edit = self._settings_field_snapshot()
 
         def on_close_save(event=None):
-            self.save_settings()
+            # 磁盘不可写（U 盘拔了、目录被删）时以前是静默失败：Tk 回调里抛异常、
+            # 窗口不关，用户看到"保存没反应"。现在明确报错并照常关闭。
+            try:
+                self.save_settings()
+            except OSError as exc:
+                messagebox.showerror(
+                    "Settings",
+                    f"Could not save settings to {self.preferences_file}:\n{exc}")
             on_close()
 
         def on_close_no_save(event=None):
@@ -6786,9 +7018,7 @@ class VideoProcessorApp:
             self.text_output_label, "Output file to save timestamps, if applicable.\nIf not chosen, they will be saved to 'timestamps.txt' in the selected output directory."
         )
 
-        modal.transient(self.root)
-        modal.grab_set()
-        modal.focus_set()
+        install_modal_grab(modal)
         self.root.wait_window(modal)
 
     def handle_url_downloads(self):
@@ -7394,6 +7624,14 @@ class VideoProcessorApp:
                     print(f"{Fore.GREEN}Loaded {loaded} of {len(with_videos)} video(s).")
                     if loaded == 0:
                         raise Exception("No videos from timestamps matched the current list.")
+                    # 跳过检测这条路径也要做同一道"无画面区间"裁剪：否则
+                    # timestamps_reverified.txt / timestamps_selected.txt 会写上
+                    # materialize 马上要丢掉的片段，文件与实际编译内容不一致
+                    #（和检测路径同一类偏差，测试者报的 231/115 就是它）。
+                    dropped_no_footage = _drop_intervals_without_footage(
+                        dict_list, self.is_video, padding)
+                    if dropped_no_footage:
+                        loaded = sum(1 for entry in dict_list if entry.get('timestamps'))
                     _uploaded_remote = sum(
                         1 for v in self.uploaded_videos if v.get_is_url())
                     if _uploaded_remote > loaded:
