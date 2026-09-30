@@ -1831,6 +1831,160 @@ def count_glitch_blocks(frames, width: int, height: int) -> tuple[int, int, floa
     return suspicious, longest, worst
 
 
+# ── "冻结段"（画面被顶替）检测 ────────────────────────────────────────────
+# 2026-09-30 实测定性的另一类损坏，和上面的"灰块"不是一回事：B 站对同一场录播存在
+# 两次转码产物，其中一次在某处**丢了约 20 帧动画（0.67 秒）并用上一帧顶替**，而音频
+# 与整条时间轴都正常。观众看到的就是"这段糊掉/冻住"。
+#
+# 已知坏片段（缓存 6b20d3f3…，源 bilibili:BV1QH4y1N7pc 2028.6-2033.6s）与同一窗口的
+# 好副本逐帧对齐后，偏移从 0 漂到 -20 帧再回到 0——即那 20 帧内容真的缺失了，任何
+# 重编码/锐化都补不回来，只能换一份取回。
+#
+# **判据的口径**（为什么是这四个条件，见 docs/_glitch_fix_proposal.md）：
+#   * 只在**画面区**（左半幅）量：右侧弹幕面板本来就会长时间不动，而且好/坏两份的
+#     弹幕静止段完全一致——整帧口径会把两件事混在一起，这正是前六次检测失败的原因。
+#   * 静止段长度 ≥ ``_HOLD_MIN_FRAMES``（0.5 秒）只是**必要**条件，不是判据：
+#     实测 37.6% 的健康片段都有 ≥16 帧的静止段（封面/待机/安静的瞬间）。
+#   * 真正的判据是"这一段承载的是**一帧**的能量，而整段之外画面仍在动"：
+#       - 段内最大帧间差 ≤ ``_HOLD_MAX_INSIDE_DELTA``：健康片段的长静止段内部仍残留
+#         0.13-0.99 的真实运动（亚像素/颗粒），被顶替的段落只有 0.000-0.018；
+#       - 段外中位帧间差 ≥ ``_HOLD_MIN_OUTSIDE_DELTA``：排除"整条片段本来就静止"
+#         （那种片段段外也接近 0，静止是内容而不是故障）；
+#       - 段内/段外中位比 ≤ ``_HOLD_MAX_RATIO``。
+#   实测分离度：坏片段段内最大 0.0176，健康样本最低 0.1253（约 7 倍）；367 个健康
+#   片段中同时满足"段长 ≥15 且段内 ≤0.05"的有 **0** 个（单看任何一条都会误报
+#   10%-47%）。
+#
+# 语义同 ``segment_glitch_messages``：**宁可漏报也不误报**，任何异常都返回空列表。
+_HOLD_CROP = "960:1080:0:0"     # 画面区：1920x1080 的左半幅（右半幅是弹幕面板）
+_HOLD_WIDTH = 320
+_HOLD_HEIGHT = 180
+_HOLD_DELTA = 1.0               # 低于此值视为"这一帧没动"（同上方的 _GLITCH_FREEZE_DIFF 口径）
+_HOLD_MIN_FRAMES = 15           # 静止段至少这么长（0.5 秒 @30fps）才进入判定
+_HOLD_MAX_INSIDE_DELTA = 0.05   # 静止段内部**最大**帧间差（关键判据）
+_HOLD_MIN_OUTSIDE_DELTA = 0.5   # 段外中位帧间差：低于此值说明整条片段本来就静止
+_HOLD_MAX_RATIO = 0.02          # 段内/段外中位比
+_HOLD_FPS = 30.0                # 只用来把帧数换算成秒，供日志阅读（不做时间换算依据）
+_HOLD_TIMEOUT = 300.0
+
+try:                            # numpy 只用来把逐帧统计向量化；拿不到就走纯 Python 路径
+    import numpy as _HOLD_NUMPY
+except Exception:               # noqa: BLE001 - 缺 numpy 不该让取回路径失败
+    _HOLD_NUMPY = None
+
+
+def _hold_mean_delta(first, second, frame_size: int) -> float:
+    """两帧的平均绝对差（灰度 0-255）。"""
+    return sum(abs(a - b) for a, b in zip(first, second)) / frame_size
+
+
+def hold_passage(frames, width: int, height: int) -> dict[str, float] | None:
+    """找最长的"没动"静止段并量出它的形态；纯函数，便于直接喂合成数据测试。
+
+    返回 ``None`` 表示帧数不足、无法判定；否则返回 ``run / inside_max / inside_median /
+    outside_median / ratio / frames``。判据由 :func:`segment_hold_messages` 施加。
+    """
+    frame_size = int(width) * int(height)
+    if frame_size <= 0 or not frames:
+        return None
+    total = len(frames) // frame_size
+    if total < _HOLD_MIN_FRAMES:
+        return None
+    views = [memoryview(frames)[index * frame_size:(index + 1) * frame_size]
+             for index in range(total)]
+    if _HOLD_NUMPY is not None:
+        # 向量化：一次算完整条片段的帧间平均绝对差。逐字节跑 Python 循环在这个尺寸下
+        # 约 0.8s/片段，向量化后约 0.03s——2292 个片段差出半小时，值得多一条降级路径。
+        stack = _HOLD_NUMPY.frombuffer(bytes(frames[:total * frame_size]),
+                                       dtype=_HOLD_NUMPY.uint8)
+        stack = stack.reshape(total, frame_size).astype(_HOLD_NUMPY.int16)
+        deltas = _HOLD_NUMPY.abs(stack[1:] - stack[:-1]).mean(axis=1).tolist()
+    else:
+        deltas = [_hold_mean_delta(views[index], views[index - 1], frame_size)
+                  for index in range(1, total)]
+    longest = 1
+    run_start = 0
+    current = 1
+    start = 0
+    for index, value in enumerate(deltas):
+        if value < _HOLD_DELTA:
+            if current == 1:
+                start = index
+            current += 1
+            if current > longest:
+                longest = current
+                run_start = start
+        else:
+            current = 1
+    if longest < 2:
+        return {"run": float(longest), "inside_max": 0.0, "inside_median": 0.0,
+                "outside_median": 0.0, "ratio": 0.0, "frames": float(total)}
+    inside = deltas[run_start:run_start + longest - 1]
+    outside = [value for index, value in enumerate(deltas)
+               if not (run_start <= index < run_start + longest - 1)]
+    inside_median = sorted(inside)[len(inside) // 2]
+    outside_median = sorted(outside)[len(outside) // 2] if outside else 0.0
+    return {
+        "run": float(longest),
+        "inside_max": max(inside),
+        "inside_median": inside_median,
+        "outside_median": outside_median,
+        "ratio": (inside_median / outside_median) if outside_median else 0.0,
+        "frames": float(total),
+    }
+
+
+def hold_passage_messages(path, timeout: float = _HOLD_TIMEOUT,
+                          region: str | None = None) -> list[str]:
+    """这次取回的片段里有没有"动画被顶替"的冻结段？返回说明行（空列表 = 没有）。
+
+    参数 ``region`` 只给测试用（默认画面区）；任何异常都返回空列表——误报会白白重抓
+    一遍，比漏报更糟，所以这里只报告证据非常明确的情况。
+    """
+    crop = region or _HOLD_CROP
+    command = [
+        str(FFMPEG_PATH), "-hide_banner", "-nostdin", "-v", "error",
+        "-i", str(path), "-an",
+        "-vf", f"crop={crop},scale={_HOLD_WIDTH}:{_HOLD_HEIGHT}:flags=neighbor,format=gray",
+        "-f", "rawvideo", "-",
+    ]
+    try:
+        # CREATE_NO_WINDOW 是必须的：这是 GUI 进程，每跑一次 ffmpeg 都会闪出一个控制台
+        # 窗口（项目里其他所有 ffmpeg 调用点都带这个标志；漏掉就会在下载片段时"秒弹秒关"）。
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:                                        # noqa: BLE001
+        return []
+    if getattr(result, "returncode", 1) != 0:
+        return []
+    raw = getattr(result, "stdout", None)
+    if not raw or not isinstance(raw, (bytes, bytearray)):
+        return []
+    stats = hold_passage(bytes(raw), _HOLD_WIDTH, _HOLD_HEIGHT)
+    if not stats:
+        return []
+    if stats["run"] < _HOLD_MIN_FRAMES:
+        return []
+    if stats["inside_max"] > _HOLD_MAX_INSIDE_DELTA:
+        return []
+    if stats["outside_median"] < _HOLD_MIN_OUTSIDE_DELTA:
+        return []
+    if stats["ratio"] > _HOLD_MAX_RATIO:
+        return []
+    seconds = stats["run"] / _HOLD_FPS
+    return [
+        f"the picture stops moving for {stats['run']:.0f} frames (~{seconds:.2f}s) while the "
+        f"rest of the clip keeps moving (largest movement inside that passage: "
+        f"{stats['inside_max']:.3f} against {stats['outside_median']:.2f} elsewhere)"
+    ]
+
+
+def segment_hold_messages(path, timeout: float = _HOLD_TIMEOUT) -> list[str]:
+    """兼容包装：见 :func:`hold_passage_messages`。"""
+    return hold_passage_messages(path, timeout=timeout)
+
+
 def segment_glitch_messages(path, timeout: float = 180.0) -> list[str]:
     """片段能不能解出正常画面？返回说明行（空列表 = 干净）。
 
@@ -3366,6 +3520,35 @@ def fetch_segment(
                     logger("Downloaded clip still looks gray after re-fetching "
                            f"({glitch_hits[0]}); keeping it rather than dropping the clip")
                 _log_glitch_kept(source, start, end, glitch_hits[0])
+            # 画面被顶替（冻结段）自检：这是 2026-09-30 定性的另一类损坏——同一窗口的
+            # 两次取回里，坏的那份**丢了约 20 帧动画并用上一帧顶替**（音频与时间轴正常），
+            # 观众看到"糊掉/冻住"。判据与实测分离度见上方 _HOLD_* 常量。
+            #
+            # 为什么是"重取"而不是"重切"：那 20 帧内容真的不在这一份产物里，本地的任何
+            # 裁剪/重编码都补不回来；而同一 URL **永远**返回同一份字节（实测 6/6 对完全相同、
+            # 坏副本存活 ≥21h），所以必须走上面的 refresh 分支换一次重新解析——新解析拿到
+            # 的是另一个 payload（实测同窗口的干净副本正是这样取到的）。
+            #
+            # 只有**还有重试预算**时才判为失败（与灰块检查同一取舍）：误报会直接丢掉整个
+            # 片段，比不检查更糟；最后一次尝试一律接受并如实报告。
+            hold_hits = []
+            if _fetch_needs_corruption_check(run_func, result):
+                hold_hits = hold_passage_messages(temporary_path)
+            if hold_hits:
+                if attempt + 1 < allowed_attempts:
+                    if logger is not None:
+                        logger("Downloaded clip has a passage where the picture stops "
+                               f"moving while the audio continues ({hold_hits[0]}); "
+                               "re-fetching it instead of using this copy")
+                    error = SegmentFetchError(
+                        "downloaded segment holds a frozen passage: " + hold_hits[0])
+                    error.picture_hold = True
+                    raise error
+                if logger is not None:
+                    logger("Downloaded clip still holds a frozen passage after "
+                           f"re-fetching ({hold_hits[0]}); keeping it rather than "
+                           "dropping the clip")
+                _log_glitch_kept(source, start, end, hold_hits[0])
             # 落盘清晰度自检：永远抓最高档，所以"低于预期"要么是这次被降了档
             # （争取多一次尝试，且不写缓存），要么是源本身只有低清档（登记说明，
             # 不算降级、不跳过）。见 _video_quality_gate 上方的说明。

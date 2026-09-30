@@ -227,6 +227,43 @@ MERGE_BATCH_DEFAULT = 6
 # 收缩工作集（实测 151 层直到 RecursionError，默认栈深下表现为数小时 IO 空转）。
 MERGE_BATCH_MIN = 2
 MERGE_BATCH_MAX = 50
+# ── 编译阶段的三个并发旋钮（各自独立，默认 1 = 与旧版逐字节相同的行为）──
+# 实测（用户 2292 片段、约 3 小时成片）：切片 1 小时、完整性校验 1 小时、最终合并 2 小时。
+# 切片与校验的任务互相独立、内存占用小，是最值得并行的一段；合并那一段受内存限制最大。
+MERGE_PARALLEL_TOOLTIP_TEXT = (
+    "How many merge batches FFmpeg may work on at the same time (final merge step).\n"
+    "Batches inside one layer are independent, so 2-3 together shorten a long merge\n"
+    "(measured about 1.5x). Each parallel batch decodes its own inputs, so this costs\n"
+    "RAM: AutoComper checks free memory before every layer and quietly drops back to 1\n"
+    "when there is not enough. Low-spec machines should leave this at 1. Default: 1."
+)
+MERGE_PARALLEL_DEFAULT = 1
+MERGE_PARALLEL_MIN = 1
+MERGE_PARALLEL_MAX = 4
+CLIP_PARALLEL_TOOLTIP_TEXT = (
+    "How many clips may be cut at the same time (writing the clip files).\n"
+    "Each clip reads its own window of the source and writes its own temporary file,\n"
+    "so 2-3 together is a safe speed-up on most machines (measured about 1.5x with 3).\n"
+    "This is CPU work, not GPU; free memory is checked and the count drops back to 1\n"
+    "automatically when needed. Low-spec machines should leave this at 1. Default: 1.\n"
+    "NOTE: this counts clips across the whole batch, including a remote batch where\n"
+    "every clip is already its own file. When 'Merge Nearby Clips' joins adjacent\n"
+    "timestamps into one long clip there is only one cut to do, so nothing can run in\n"
+    "parallel and you will see a single worker."
+)
+CLIP_PARALLEL_DEFAULT = 1
+CLIP_PARALLEL_MIN = 1
+CLIP_PARALLEL_MAX = 4
+INTEGRITY_PARALLEL_TOOLTIP_TEXT = (
+    "How many clips the quality/integrity check may examine at the same time.\n"
+    "The check decodes each finished clip at a small size and compares it against the\n"
+    "source; the clips are independent, so 2-3 together is usually safe and shortens a\n"
+    "long verification pass (measured about 1.5x with 3). Free memory is checked and\n"
+    "the count drops back to 1 automatically when needed. Default: 1."
+)
+INTEGRITY_PARALLEL_DEFAULT = 1
+INTEGRITY_PARALLEL_MIN = 1
+INTEGRITY_PARALLEL_MAX = 4
 REMOTE_CACHE_TOOLTIP_TEXT = (
     "Remote Stream, Audio Cache, reverify, and downloaded segment files are stored here.\n"
     "Full Download does not necessarily use this cache. The cache can be cleared, but\n"
@@ -589,6 +626,14 @@ def prepare_remote_cache_store(store: CacheStore) -> CacheStore:
     """Validate the selected cache store once for a processing session."""
     store.ensure_ready()
     return store
+
+
+def _packaged_app_dir() -> Path:
+    """The folder the executable lives in (frozen) or the project folder (source)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
 
 os.environ['FFMPEG_BINARY'] = FFMPEG_PATH
 
@@ -4253,9 +4298,15 @@ class VideoProcessorApp:
         except OSError as exc:
             messagebox.showwarning(
                 "Remote Cache",
-                f"Saved remote cache location is unavailable:\n{exc}\n\nUsing the default cache location.")
+                f"Saved remote cache location is unavailable:\n{exc}\n\n"
+                f"Using the default cache location.")
             self.remote_cache_store = CacheStore()
-            self.remote_cache_store.ensure_ready()
+            try:
+                self.remote_cache_store.ensure_ready()
+            except OSError as fallback_exc:
+                print(f"{Fore.YELLOW}Default remote cache location is unavailable "
+                      f"({fallback_exc}); the window opens anyway - set a folder under "
+                      f"Remote Settings.{Style.RESET_ALL}")
         self.remote_cache_path = tk.StringVar(value=str(self.remote_cache_store.root))
         self.remote_cache_size = tk.StringVar()
 
@@ -4673,6 +4724,27 @@ class VideoProcessorApp:
             self.merge_batch_spinbox, MERGE_BATCH_TOOLTIP_TEXT
         )
 
+        # 编译并发：切片 / 完整性校验 / 合并（都用同一套"请求值、任务数、可用内存取最小"）
+        self.clip_parallel = tk.IntVar(value=CLIP_PARALLEL_DEFAULT)
+        self.integrity_parallel = tk.IntVar(value=INTEGRITY_PARALLEL_DEFAULT)
+        self.merge_parallel = tk.IntVar(value=MERGE_PARALLEL_DEFAULT)
+        for attribute, label, hint in (
+            ("clip_parallel_spinbox", "Parallel Clip Writes:", CLIP_PARALLEL_TOOLTIP_TEXT),
+            ("integrity_parallel_spinbox", "Parallel Verification:", INTEGRITY_PARALLEL_TOOLTIP_TEXT),
+            ("merge_parallel_spinbox", "Parallel Merge Tasks:", MERGE_PARALLEL_TOOLTIP_TEXT),
+        ):
+            row = ttk.Frame(self.checkbox_frame)
+            row.pack(anchor=tk.W, pady=(4, 0))
+            ttk.Label(row, text=label).pack(side=tk.LEFT)
+            variable = {"clip_parallel_spinbox": self.clip_parallel,
+                        "integrity_parallel_spinbox": self.integrity_parallel,
+                        "merge_parallel_spinbox": self.merge_parallel}[attribute]
+            spinbox = ttk.Spinbox(row, from_=1, to=4, width=5, textvariable=variable)
+            spinbox.pack(side=tk.LEFT, padx=(6, 0))
+            setattr(self, attribute, spinbox)
+            setattr(self, attribute.replace("_spinbox", "_tooltip"),
+                    CustomHovertip(spinbox, hint))
+
         # Normalize audio checkbox
         self.normalize_audio_checkbox = ttk.Checkbutton(
             self.checkbox_frame, text="Normalize Audio", variable=self.normalize_audio)
@@ -4981,6 +5053,9 @@ class VideoProcessorApp:
             self.res_height_entry,
             self.res_width_entry,
             self.upscale_sharpen_spinbox,
+            self.clip_parallel_spinbox,
+            self.integrity_parallel_spinbox,
+            self.merge_parallel_spinbox,
             self.output_location_button,
             self.normalize_audio_checkbox,
             self.toggle_button,
@@ -6348,13 +6423,36 @@ class VideoProcessorApp:
 
     def open_remote_cache(self):
         path = str(self.remote_cache_store.root)
-        try:
-            if sys.platform == "win32":
-                os.startfile(path)
-            else:
-                subprocess.Popen(cache_open_command(sys.platform, path))
-        except (OSError, AttributeError, subprocess.SubprocessError) as exc:
-            messagebox.showerror("Open Cache Folder", f"Could not open cache folder: {exc}")
+        if not os.path.isdir(path):
+            messagebox.showerror(
+                "Open Cache Folder",
+                f"The cache folder does not exist yet:\n{path}\n\n"
+                f"It is created when the cache is first used, or pick another "
+                f"folder under Remote Settings.")
+            return
+        threading.Thread(target=self._open_folder_worker, args=(path,), daemon=True).start()
+
+    def _open_folder_worker(self, path):
+        failures = []
+        for label, opener in self._folder_openers(path):
+            try:
+                opener()
+                return
+            except Exception as exc:                             # noqa: BLE001
+                failures.append(f"{label}: {exc}")
+        self._schedule_ui(
+            lambda: messagebox.showerror(
+                "Open Cache Folder",
+                f"Could not open this folder:\n{path}\n\n" + "\n".join(failures)))
+
+    @staticmethod
+    def _folder_openers(path):
+        """Folder-opening strategies, best first: normal call, then a direct launch."""
+        yield "startfile", lambda: os.startfile(path)
+        if sys.platform == "win32":
+            yield "explorer", lambda: subprocess.Popen(["explorer", os.path.normpath(path)])
+        else:
+            yield "xdg-open", lambda: subprocess.Popen(cache_open_command(sys.platform, path))
 
     def clear_remote_cache(self):
         if not messagebox.askyesno(
@@ -7768,6 +7866,9 @@ class VideoProcessorApp:
                                         sample, "Compile"),
                                     batch_size=self.merge_batch_size.get(),
                     upscale_sharpen=self.upscale_sharpen.get(),
+                    max_parallel=self.merge_parallel.get(),
+                    clip_parallel=self.clip_parallel.get(),
+                    integrity_parallel=self.integrity_parallel.get(),
                     output_fps=output_fps_choice(self.output_frame_rate.get()))
                     except Exception as exc:
                         raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
@@ -8187,6 +8288,9 @@ class VideoProcessorApp:
                                     sample, "Compile"),
                                 batch_size=self.merge_batch_size.get(),
                     upscale_sharpen=self.upscale_sharpen.get(),
+                    max_parallel=self.merge_parallel.get(),
+                    clip_parallel=self.clip_parallel.get(),
+                    integrity_parallel=self.integrity_parallel.get(),
                     output_fps=output_fps_choice(self.output_frame_rate.get()))
                 except Exception as exc:
                     raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc

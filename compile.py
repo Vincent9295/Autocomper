@@ -11,6 +11,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 import numpy as np
 
@@ -570,11 +572,40 @@ def _get_video_duration(input_file: str):
 # ═══ VIDEO cut / concat ═══════════════════════════════════════════════
 
 _VIDEO_CODEC_CACHE = None
+# NVENC 运行时失败后的"暂时退回 x264"状态。**不是永久的**：旧实现把全局的
+# _VIDEO_CODEC_CACHE 直接改成 x264，于是一次 "Batch 1/5" 失败之后，剩下的批次和
+# 后面整整两轮合并全部走 CPU（用户实测 2-3 小时的合并主要就是这么来的）。现在失败
+# 只影响当下，隔一段时间重试一次（重试前先重新探针，连续失败则指数退避）。
+_NVENC_RETRY_AFTER = 60.0           # 失败后至少等这么久再试一次 NVENC
+_NVENC_RETRY_MAX = 600.0            # 连续失败时退避的上限
+_nvenc_blocked_until = 0.0
+_nvenc_fail_streak = 0
+
+
+def _nvenc_available_now():
+    """NVENC 现在可用吗？（探针一次，不改变编码器偏好）"""
+    nvenc = ['-c:v', 'h264_nvenc', '-preset', '3', '-pix_fmt', 'yuv420p',
+             '-rc', 'vbr', '-cq', '20', '-b:v', '0',
+             '-maxrate', '12M', '-bufsize', '24M',
+             '-rc-lookahead', '20', '-sar', '1:1']
+    try:
+        r = run_tracked([FFMPEG_PATH, '-hide_banner', '-loglevel', 'error',
+                         '-f', 'lavfi', '-i', 'color=black:s=256x144:d=0.1']
+                        + nvenc + ['-f', 'null', '-'], timeout=15)
+        return getattr(r, "returncode", 1) == 0
+    except Exception:
+        return False
+
 
 def get_video_codec():
-    """NVENC 可用则用，否则回退 libx264。结果缓存。"""
+    """NVENC 可用则用，否则回退 libx264。探针结果缓存。
+
+    运行时失败由 `_fallback_to_x264` 暂时退回 CPU 并安排重试，见那里的说明。
+    """
     global _VIDEO_CODEC_CACHE
     if _VIDEO_CODEC_CACHE is not None:
+        if 'h264_nvenc' in _VIDEO_CODEC_CACHE and time.monotonic() < _nvenc_blocked_until:
+            return list(_X264_CODEC)
         return list(_VIDEO_CODEC_CACHE)
     # 必须显式质量控制：无 -b:v/-cq 时 nvenc 默认码率极低（实测 1080p 仅 ~570 kb/s），
     # 高动态画面严重糊化/块状损坏。CQ 模式 + maxrate 封顶，兼顾画质与体积。
@@ -582,21 +613,26 @@ def get_video_codec():
              '-rc', 'vbr', '-cq', '20', '-b:v', '0',
              '-maxrate', '12M', '-bufsize', '24M',
              '-rc-lookahead', '20', '-sar', '1:1']
-    x264 = list(_X264_CODEC)
     # 探针帧必须 >= 256x144：新款 GPU（如 RTX 50 系）NVENC 最小编码尺寸 > 64x64，
     # 用 64x64 探测会误报 "Frame Dimension less than the minimum supported value"。
-    try:
-        r = run_tracked([FFMPEG_PATH, '-hide_banner', '-loglevel', 'error',
-                         '-f', 'lavfi', '-i', 'color=black:s=256x144:d=0.1']
-                        + nvenc + ['-f', 'null', '-'], timeout=15)
-        _VIDEO_CODEC_CACHE = nvenc if r.returncode == 0 else x264
-    except Exception:
-        _VIDEO_CODEC_CACHE = x264
-    if _VIDEO_CODEC_CACHE is x264:
+    _VIDEO_CODEC_CACHE = nvenc if _nvenc_available_now() else list(_X264_CODEC)
+    if 'h264_nvenc' not in _VIDEO_CODEC_CACHE:
         # 正常回退：质量与 NVENC 一致（CRF18），仅速度较慢
         print(f"{Fore.YELLOW}NVENC unavailable, using libx264 (CPU). "
               f"This is fine - same output quality, just slower.{Style.RESET_ALL}")
     return list(_VIDEO_CODEC_CACHE)
+
+def nvenc_retry_state():
+    """(是否被临时停用, 连续失败次数, 还有多少秒重试) —— 供日志与测试读取。"""
+    remaining = max(0.0, _nvenc_blocked_until - time.monotonic())
+    return remaining > 0, _nvenc_fail_streak, remaining
+
+
+def reset_nvenc_retry_state():
+    """忘掉失败记录并重新允许 NVENC（每轮编译开始时调用；测试也用它隔离状态）。"""
+    global _nvenc_blocked_until, _nvenc_fail_streak
+    _nvenc_blocked_until = 0.0
+    _nvenc_fail_streak = 0
 
 
 _X264_CODEC = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
@@ -650,10 +686,23 @@ def tail_audible_end_seconds(samples, sr,
 
 
 def _fallback_to_x264():
-    """NVENC 编码中途失败时，永久回退 libx264（更新缓存）。"""
-    global _VIDEO_CODEC_CACHE
-    _VIDEO_CODEC_CACHE = _X264_CODEC
-    print(f"{Fore.YELLOW}NVENC encode failed; falling back to libx264 (CPU).{Style.RESET_ALL}")
+    """NVENC 这次失败了：当下改用 libx264，但**不永久放弃 NVENC**。
+
+    旧实现把全局的 `_VIDEO_CODEC_CACHE` 直接改成 x264，于是日志里
+    「Final merge (44 files) ... Batch 1/5 ... NVENC encode failed」之后，剩下的
+    4 个批次和后面整整两轮合并全部走 CPU（实测 2-3 小时的合并主要就是这么来的）。
+
+    现在的语义：临时停用 + 到时重试。重试前先重新探针（`_nvenc_available_now`），
+    探针成功就继续用 NVENC；连续失败则指数退避（60s → 600s 封顶），既不会每次
+    片段都白试一遍，也不会因为一次偶然的显存争用把整轮降级成 CPU。
+    """
+    global _nvenc_blocked_until, _nvenc_fail_streak
+    _nvenc_fail_streak += 1
+    wait = min(_NVENC_RETRY_MAX, _NVENC_RETRY_AFTER * (2 ** (_nvenc_fail_streak - 1)))
+    _nvenc_blocked_until = time.monotonic() + wait
+    print(f"{Fore.YELLOW}NVENC encode failed; using libx264 (CPU) for now. "
+          f"AutoComper will try NVENC again in about {wait:.0f}s - quality is the same, "
+          f"just slower.{Style.RESET_ALL}")
 
 
 def _pad_clip_audio_if_missing(path: str, probe: str) -> bool:
@@ -797,7 +846,14 @@ def cut_audio_filter(dur, normalize=False):
 
 def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 fps=None, preserve_duration=False, progress_callback=None,
-                duration=None, batch_size=6, sharpen=None):
+                duration=None, batch_size=6, sharpen=None, clip_parallel=1,
+                merge_parallel=1):
+    """切一个 source 的片段（多片段时再合并成 output_file）。
+
+    ``clip_parallel`` 控制多片段分支里**逐段切分**的并发（互相独立，见那里的说明）；
+    ``merge_parallel`` 控制那次 batched concat 的层内并发。两者都由调用方按
+    "请求值 / 任务数 / 可用内存"取最小后生效。
+    """
     if not timestamps:
         return False
 
@@ -921,19 +977,41 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
     # 共享目录下同名 _segN.mp4 会互相覆盖（产物静默串源）。
     seg_stem = os.path.splitext(os.path.basename(output_file))[0]
     try:
-        for i, (s, e) in enumerate(timestamps):
+        segments = [(i, s, e) for i, (s, e) in enumerate(timestamps)]
+        for _i, _s, _e in segments:
+            seg_files.append(os.path.join(seg_dir, f"_{seg_stem}_seg{_i}.mp4"))
+        seg_done = {"count": 0}
+        seg_lock = threading.Lock()
+
+        def cut_segment(task):
+            i, s, e = task
             seg_file = os.path.join(seg_dir, f"_{seg_stem}_seg{i}.mp4")
-            seg_files.append(seg_file)
             _ffmpeg_cut(input_file, [(s, e)], seg_file, res=None,
                         normalize=normalize, fps=fps,
                         preserve_duration=preserve_duration,
                         progress_callback=progress_callback, duration=duration)
+            with seg_lock:
+                seg_done["count"] += 1
+
+        # 逐段切分可以并发：每段读同一个源的不同窗口、写自己的 _segN 文件，互不依赖。
+        # 实测主要成本是解码（4 核 8 线程上 2-3 个并发约 1.5 倍吞吐），内存占用小。
+        cut_failures = _run_parallel(
+            segments, cut_segment, clip_parallel, _CLIP_MEMORY_PER_WORKER_MB,
+            "clip-cutting",
+            progress_note=lambda: format_compile_progress(
+                0, None, 0, f"Cutting clips: {seg_done['count']}/{len(segments)} done"),
+            progress_callback=progress_callback)
+        if cut_failures:
+            first_index, first_error = cut_failures[0]
+            raise Exception(
+                f"Cutting segment {first_index[0] + 1} of {len(segments)} failed "
+                f"({len(cut_failures)} failed): {first_error}")
         # 多段合并：产物会继续进入 compile_vid 的最终 concat，必须写 FLAC
         # 音频（AAC 中间产物会让 concat 音频时间线逐边界拉伸 ~20ms）。
         _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
                                fps=fps, progress_callback=progress_callback,
                                total_duration=duration, batch_size=batch_size,
-                               audio_out=_FLAC_AUDIO)
+                               audio_out=_FLAC_AUDIO, max_parallel=merge_parallel)
     finally:
         for sf in seg_files:
             try:
@@ -1064,16 +1142,140 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
     return True
 
 
+# 层内并行合并时每个任务预留多少可用内存（MB）。单个 concat ffmpeg 要把 batch_size 个
+# 1080p 输入解码进滤镜再编码，实测可占数百 MB；8 GB 机器上"空闲不到 1 GB 还开 3 个"
+# 就是把整轮拖进页面文件（比串行更慢）。用户实测：合并时真正可用物理内存只剩 425 MB，
+# 于是自动降回 1 个任务 —— 这正是这套保护该做的事。
+_MERGE_MEMORY_PER_WORKER_MB = 900.0
+# 逐段切分 / 完整性校验的每个并行任务预留多少内存（MB）。这两段比合并轻得多
+# （切分是单窗口解码+编码，校验是 320x180 的小解码），所以预留可以小很多；
+# 主要限制是 CPU 与磁盘并发读，实测 2-3 个并发是安全区间。
+_CLIP_MEMORY_PER_WORKER_MB = 400.0
+_INTEGRITY_MEMORY_PER_WORKER_MB = 300.0
+
+
+def _available_memory_mb():
+    """可用物理内存（MB）；量不到返回 None。"""
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullAvailPhys / (1024 * 1024)
+    except Exception:                                              # noqa: BLE001
+        pass
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / 1024
+    except Exception:                                              # noqa: BLE001
+        pass
+    return None
+
+
+def _worker_count(requested, tasks, per_worker_mb, label):
+    """请求的并发数、任务数、可用内存三者取最小。
+
+    每个并行 ffmpeg 都要解码自己的输入，所以并发数是**内存**问题而不只是 CPU 问题：
+    内存不够就自动降到 1，绝不把整轮拖进页面文件（那比串行更慢）。量不到可用内存时
+    保守取 2。
+    """
+    try:
+        workers = int(requested)
+    except (TypeError, ValueError):
+        workers = 1
+    workers = max(1, min(workers, len(tasks)))
+    if workers <= 1:
+        return 1
+    available_mb = _available_memory_mb()
+    if available_mb is None:
+        return min(workers, 2)
+    allowed = int(available_mb // per_worker_mb)
+    if allowed < workers:
+        print(f"  Memory check: {available_mb:.0f} MB available, so {max(1, allowed)} "
+              f"parallel {label} task(s) instead of {workers}.")
+    return max(1, min(workers, allowed))
+
+
+def _run_parallel(tasks, worker, requested, per_worker_mb, label, progress_note=None,
+                  progress_callback=None):
+    """把一批互相独立的任务并发跑完；返回失败列表 [(任务, 异常)]。
+
+    - 并发数由 ``_worker_count`` 决定（`requested` / 任务数 / 可用内存取最小）；
+    - 并发数 <= 1 时**完全走原来的串行路径**，行为与不开并行时逐字节一致；
+    - **本批全部收尾后才返回**（不留半跑的任务），失败聚合返回给调用方决定怎么报；
+    - 进度回调在并发下加锁（否则进度条会串）。
+    """
+    tasks = list(tasks)
+    if not tasks:
+        return []
+    workers = _worker_count(requested, tasks, per_worker_mb, label)
+    if workers <= 1:
+        failures = []
+        for task in tasks:
+            if cancel_pending():
+                raise InterruptedError("Compile cancelled by user.")
+            try:
+                worker(task)
+            except InterruptedError:
+                raise
+            except Exception as exc:                                   # noqa: BLE001
+                failures.append((task, exc))
+        return failures
+    print(f"  Running {len(tasks)} {label} task(s) with {workers} parallel worker(s).")
+    progress_lock = threading.Lock()
+
+    def wrapped(task):
+        if progress_callback is not None and progress_note is not None:
+            with progress_lock:
+                progress_callback(progress_note())
+        return worker(task)
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(wrapped, task): task for task in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            if cancel_pending():
+                for pending in futures:
+                    pending.cancel()
+                raise InterruptedError("Compile cancelled by user.")
+            try:
+                future.result()
+            except InterruptedError:
+                raise
+            except Exception as exc:                                   # noqa: BLE001
+                failures.append((futures[future], exc))
+    return failures
+
+
 def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6,
                            fps=None, _lvl=0, progress_callback=None,
                            temp_dir=None, total_duration=None, audio_out=None,
-                           sharpen=None):
+                           sharpen=None, max_parallel=1):
     """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
     保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。
 
     中间产物 _batchL* 一律写 FLAC 音频（AAC 中间件会让下一层 concat 的音频
     时间线每边界拉伸 ~20ms，逐层累积成"整体逐渐错位"）；只有产出 output_file
     的那一次编码使用 audio_out（调用方不传则为最终输出的 AAC）。
+
+    **层内并行**：同一层的批次互不依赖（各自读自己的输入、写自己的 ``_batchL{层}_{序号}``），
+    所以可以并发跑；``max_parallel`` 控制并发数（请求值、批数、可用内存三者取最小，见
+    ``_worker_count``）。层级之间仍串行 —— 下一层要等本层全部产出。实测（i5-10300H /
+    GTX 1650）：3 个并发编码的聚合吞吐约为单跑的 1.5 倍。
 
     batch_size < 2 时无法收缩工作集（单元素批次递归自身）→ 实测无限递归
     直到 RecursionError/数小时 IO 空转。入口强制钳到 ≥2。
@@ -1106,14 +1308,15 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
     batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
     batch_files = []
     try:
-        for bi, batch in enumerate(batches):
-            batch_out = os.path.join(temp_dir, f"_batchL{_lvl}_{bi}.mp4")
-            batch_files.append(batch_out)
+        layer = [(bi, batch, os.path.join(temp_dir, f"_batchL{_lvl}_{bi}.mp4"))
+                 for bi, batch in enumerate(batches)]
+        batch_files = [path for _bi, _batch, path in layer]
+        done = {"count": 0}
+        done_lock = threading.Lock()
+
+        def merge_one(task):
+            bi, batch, batch_out = task
             print(f"  Batch {bi + 1}/{len(batches)} ({len(batch)} files)...")
-            if progress_callback is not None:
-                progress_callback(format_compile_progress(
-                    0, None, 0, f"Batch {bi + 1}/{len(batches)}: starting"
-                ))
             ok = _ffmpeg_concat(batch, batch_out, res=res, normalize=normalize, fps=fps,
                                 progress_callback=progress_callback,
                                 total_duration=total_duration,
@@ -1124,6 +1327,23 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
             # 实测约 14% 的批次；300 段累积 −0.5s）。超阈值才重封一次，把这一层
             # 的 A/V 差归零，避免它继续向上层累积。
             _align_cut_audio_to_video(batch_out, tolerance=_BATCH_ALIGN_TOLERANCE)
+            with done_lock:
+                done["count"] += 1
+
+        def note():
+            with done_lock:
+                return format_compile_progress(
+                    0, None, 0, f"Batch layer {_lvl + 1}: {done['count']}/{len(batches)} done")
+
+        failures = _run_parallel(layer, merge_one, max_parallel, _MERGE_MEMORY_PER_WORKER_MB,
+                                 "merge", progress_note=note,
+                                 progress_callback=progress_callback)
+        if failures:
+            # 本层全部收尾后再报错：留下半跑的任务比直接抛出更糟。
+            first_index, first_error = failures[0]
+            raise Exception(
+                f"Batch {first_index[0] + 1} of layer {_lvl + 1} failed "
+                f"({len(failures)} of {len(batches)} batches failed): {first_error}")
         print(f"  Final merge ({len(batch_files)} files)...")
         if progress_callback is not None:
             progress_callback(format_compile_progress(0, None, 0, "Final merge: starting"))
@@ -1135,7 +1355,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                                           progress_callback=progress_callback,
                                           temp_dir=temp_dir,
                                           total_duration=total_duration,
-                                          audio_out=audio_out, sharpen=sharpen)
+                                          audio_out=audio_out, sharpen=sharpen,
+                                          max_parallel=max_parallel)
         _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps,
                        progress_callback=progress_callback, total_duration=total_duration,
                        audio_out=audio_out, sharpen=sharpen)
@@ -1417,10 +1638,22 @@ def clip_quality_problem(clip_file, expected_height, is_source_best=False):
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
                 excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None,
-                output_fps=None):
+                output_fps=None, max_parallel=1, clip_parallel=1, integrity_parallel=1):
+    """Compile every clip into the output film.
+
+    Three independent parallelism knobs, each clamped by task count and free memory at use
+    time (see ``_worker_count``), and each falling back to the original serial path when the
+    effective count is 1 so the old behaviour stays byte-identical:
+
+    ``max_parallel``        batches worked on at once inside one merge layer
+    ``clip_parallel``       clip writes cut at once within one source
+    ``integrity_parallel``  clips checked at once by the integrity pass
+    """
     output_format = ".mp4" if is_video else ".mp3"
     sharpen = (_UPSCALE_SHARPEN_DEFAULT if upscale_sharpen is None
                else normalize_upscale_sharpen(upscale_sharpen))
+    # 每轮编译开始时忘掉上一轮的 NVENC 失败记录：一次显存争用不该让后面的轮次全走 CPU。
+    reset_nvenc_retry_state()
 
     # 同进程二次运行会复用旧路径的 probe 结果（如 _seg0.mp4 已重写），
     # 清空缓存避免时长/尺寸用旧值。
@@ -1449,10 +1682,14 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
 
     if is_video:
         cut_func, concat_func = _ffmpeg_cut, _ffmpeg_concat
-        max_parallel = 1
+        # 条目之间也可以并行：每个条目读自己的输入、写自己的临时文件。用同一个
+        # "Parallel Clip Writes" 值（默认 1 = 与以前完全一致的串行路径）；实际并发数
+        # 还会被任务数与可用内存（_worker_count，400 MB/worker）再压一次。
+        # 段间并行仍由 clip_parallel 在多片段分支里负责，两者都在同一份内存守卫下。
+        source_parallel = clip_parallel
     else:
         cut_func, concat_func = _ffmpeg_cut_audio, _ffmpeg_concat_audio
-        max_parallel = 5
+        source_parallel = 5
 
     tempfiles = []
     try:
@@ -1600,6 +1837,8 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                                     'duration': dur,
                                     'batch_size': batch_size,
                                     'sharpen': sharpen,
+                                    'clip_parallel': clip_parallel,
+                                    'merge_parallel': max_parallel,
                                     'progress_callback': progress_callback}
                                     if is_video else {}),
                                 normalize=normalize,
@@ -1607,34 +1846,41 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                                    if not is_video else {}),
                                 **({'duration': dur} if not is_video else {}))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), max_parallel)) as executor:
-                running = {}
-                for task in tasks:
-                    if cancel_pending():
-                        executor.shutdown(cancel_futures=True)
-                        raise InterruptedError("Compile cancelled by user.")
-                    n, fn, fn_stripped, ts, tmp, cr, preserve_duration, dur, _eh, _sb = task
-                    f = executor.submit(cut_one, task)
-                    running[f] = (n, fn_stripped)
-                cut_failures = []
-                cut_done = 0
-                cut_total = len(running)
-                for future in concurrent.futures.as_completed(running):
-                    if cancel_pending():
-                        executor.shutdown(cancel_futures=True)
-                        raise InterruptedError("Compile cancelled by user.")
-                    n, fn_stripped = running[future]
-                    try:
-                        future.result()
-                        cut_done += 1
-                        print(f"{Fore.GREEN}[{cut_done}/{cut_total}] Done writing all clips for {fn_stripped}.")
-                    except Exception as ex:
-                        print(f"{Fore.RED}Failed writing clips for {fn_stripped}: {ex}")
-                        cut_failures.append((fn_stripped, ex))
-                if cut_failures:
-                    skipped = ", ".join(name for name, _ in cut_failures)
-                    print(f"{Fore.YELLOW}{len(cut_failures)} clip(s) failed to write "
-                          f"and were skipped: {skipped}{Style.RESET_ALL}")
+            # ── 逐条写入片段 ───────────────────────────────────────────────
+            # 每个任务读**自己的**输入、写**自己的**临时文件，彼此完全独立，所以条目之间
+            # 也可以并行。以前这里写死 source_parallel = 1（视频串行，理由是"视频解码重"），
+            # 结果是一个"每个 clip 已是独立文件"的远端批次永远只有一个 ffmpeg 在跑：
+            # 段间并行（clip_parallel 的那条多片段分支）在这种批次里没有段可用。
+            # 现在视频条目同样走 _run_parallel，于是用户设置的
+            #   * Parallel Clip Writes=1 → 走原来的串行路径，逐字节一致；
+            #   * >=2 → 多个条目同时切写，日志会打印实际 worker 数。
+            # 内存守卫（_worker_count）与取消语义都由 _run_parallel 提供。
+            cut_view = {id(_task): _task[2] for _task in tasks}
+            cut_done = {"count": 0}
+            cut_lock = threading.Lock()
+
+            def cut_entry(task):
+                cut_one(task)
+                with cut_lock:
+                    cut_done["count"] += 1
+                    print(f"{Fore.GREEN}[{cut_done['count']}/{len(tasks)}] "
+                          f"Done writing all clips for {task[2]}.{Style.RESET_ALL}")
+
+            cut_failures_raw = _run_parallel(
+                tasks, cut_entry, source_parallel, _CLIP_MEMORY_PER_WORKER_MB, "clip-write",
+                progress_note=lambda: format_compile_progress(
+                    0, None, 0,
+                    f"Writing clips: {cut_done['count']}/{len(tasks)} done"),
+                progress_callback=progress_callback)
+            cut_failures = []
+            for failed_task, error in cut_failures_raw:
+                name = cut_view.get(id(failed_task), "?")
+                print(f"{Fore.RED}Failed writing clips for {name}: {error}{Style.RESET_ALL}")
+                cut_failures.append((name, error))
+            if cut_failures:
+                skipped = ", ".join(name for name, _ in cut_failures)
+                print(f"{Fore.YELLOW}{len(cut_failures)} clip(s) failed to write "
+                      f"and were skipped: {skipped}{Style.RESET_ALL}")
 
             # ── 片段完整性比对（输出 vs 源）────────────────────────────────
             # 逐片段比对"输出比源更冻"的情况：源里本来就静止的片段会被差分判据放行，
@@ -1652,13 +1898,17 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     print(f"{Fore.CYAN}This can take a while with many clips; "
                           f"thanks for your patience.{Style.RESET_ALL}")
                 verified = re_cut = 0
-                for _index, task in enumerate(tasks):
-                    if cancel_pending():
-                        raise InterruptedError("Compile cancelled by user.")
+                integrity_lock = threading.Lock()
+                integrity_done = {"count": 0}
+
+                def check_one(task):
+                    """校验一个片段（必要时重切）。每个任务读自己的文件、写自己的临时
+                    输出，互不依赖，所以可以并发；重切走 cut_one（与切片阶段同一套参数）。"""
+                    nonlocal verified, re_cut
                     (_n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur, expected_height,
                      delivered_is_source_best) = task
                     if not os.path.exists(tmp):
-                        continue           # 切片失败的片段已经报过了
+                        return             # 切片失败的片段已经报过了
                     # 画质校验（落盘片段 vs 源本该交付的档位）：降级取回的片段在
                     # 输出侧完全隐形（编译只会把它放大到目标尺寸），只能在这里
                     # 用"文件实际高度 vs 预期高度"揪出来。见 clip_quality_problem。
@@ -1668,7 +1918,8 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     except Exception:                               # noqa: BLE001
                         low_quality = False
                     if low_quality:
-                        downscaled_clips.append((fn_stripped, delivered_h, expected_h))
+                        with integrity_lock:
+                            downscaled_clips.append((fn_stripped, delivered_h, expected_h))
                         print(f"{Fore.YELLOW}  {fn_stripped}: this clip was fetched at "
                               f"{delivered_h}p while the source offers {expected_h}p "
                               f"(a lower quality variant was delivered); its "
@@ -1680,10 +1931,12 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         print(f"{Fore.YELLOW}  Clip integrity check skipped for "
                               f"{fn_stripped}: {_sanitize_ffmpeg_detail(exc)}"
                               f"{Style.RESET_ALL}")
-                        continue
-                    verified += 1
+                        return
+                    with integrity_lock:
+                        verified += 1
+                        integrity_done["count"] += 1
                     if not problem:
-                        continue
+                        return
                     print(f"{Fore.YELLOW}  {fn_stripped}: the clip held one frame for "
                           f"{out_run / _INTEGRITY_FPS:.2f}s while its source does not "
                           f"(source holds at most {src_run / _INTEGRITY_FPS:.2f}s); "
@@ -1691,20 +1944,35 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     try:
                         cut_one(task)
                     except Exception as exc:                            # noqa: BLE001
-                        unresolved_clips.append((fn_stripped, out_run, src_run))
+                        with integrity_lock:
+                            unresolved_clips.append((fn_stripped, out_run, src_run))
                         print(f"{Fore.YELLOW}  Re-cut failed for {fn_stripped}: "
                               f"{_sanitize_ffmpeg_detail(exc)}{Style.RESET_ALL}")
-                        continue
+                        return
                     after_problem, after_run, _ = clip_integrity_problem(tmp, fn, ts)
                     if after_problem or (after_run or 0) >= max(
                             out_run * 0.75, _INTEGRITY_MIN_RUN):
                         # 重切没有改善（同一段字节的确定性结果）：如实报告，不静默
-                        unresolved_clips.append((fn_stripped, after_run, src_run))
+                        with integrity_lock:
+                            unresolved_clips.append((fn_stripped, after_run, src_run))
                         print(f"{Fore.YELLOW}  {fn_stripped} still holds a frame for "
                               f"{(after_run or 0) / _INTEGRITY_FPS:.2f}s after "
                               f"re-cutting{Style.RESET_ALL}")
                     else:
-                        re_cut += 1
+                        with integrity_lock:
+                            re_cut += 1
+
+                # 校验是"只读解码 + 必要时重切"，互相独立；并发数同样按任务数/内存取最小。
+                integrity_failures = _run_parallel(
+                    tasks, check_one, integrity_parallel, _INTEGRITY_MEMORY_PER_WORKER_MB,
+                    "clip-integrity",
+                    progress_note=lambda: format_compile_progress(
+                        0, None, 0,
+                        f"Verifying clips: {integrity_done['count']}/{len(tasks)} done"),
+                    progress_callback=progress_callback)
+                for _task, _error in integrity_failures:
+                    print(f"{Fore.YELLOW}  Clip integrity worker failed: "
+                          f"{_sanitize_ffmpeg_detail(_error)}{Style.RESET_ALL}")
                 print(f"Clip integrity: {verified} verified, {re_cut} re-cut, "
                       f"{len(unresolved_clips)} unresolved")
                 if unresolved_clips:

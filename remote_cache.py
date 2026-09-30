@@ -43,17 +43,16 @@ class CacheStore:
         self.video_root = self.root / "video"
 
     def ensure_ready(self) -> Path:
-        """Create the cache tree and verify that the selected root is writable."""
+        """Create the cache tree and reject a root that is not a usable folder."""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            for directory in (self.detection_root, self.audio_root,
-                              self.segment_root, self.video_root):
-                directory.mkdir(parents=True, exist_ok=True)
-            probe = self.root / ".write-test"
-            probe.write_bytes(b"")
-            probe.unlink()
-        except OSError as exc:
-            raise OSError(f"Remote cache root is not writable: {self.root} ({exc})") from exc
+        except FileExistsError as exc:
+            raise OSError(f"The remote cache root is not a folder: {self.root}") from exc
+        if not self.root.is_dir():
+            raise OSError(f"The remote cache root could not be created: {self.root}")
+        for directory in (self.detection_root, self.audio_root,
+                          self.segment_root, self.video_root):
+            directory.mkdir(parents=True, exist_ok=True)
         return self.root
 
     def video_download_dir(self) -> Path:
