@@ -1305,10 +1305,16 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
     # 中间文件默认与输出同盘；调用方可传入 compile 的临时目录，避免大批量
     # 合并时 _batchL* 中间件 flood 用户输出文件夹。
     temp_dir = temp_dir or os.path.dirname(output_file) or os.path.dirname(file_list[0])
+    # 中间件必须带**本次调用**的标识：一次 compile 里多个源会在同一个临时目录下并发
+    # 跑各自的合并（每源≥batch_size+1 段时走 _ffmpeg_cut 的多段分支），若只用
+    # `_batchL{层}_{序号}` 命名，两条并发的合并线会写同一个文件——产物静默串源，
+    # 且完整性校验（只比对"输出是否比源更冻结/降质"）抓不到。同 `_{seg_stem}_segN`。
+    batch_ns = re.sub(r'[^0-9A-Za-z._-]', '_',
+                      os.path.splitext(os.path.basename(output_file))[0])[:40] or "out"
     batches = [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
     batch_files = []
     try:
-        layer = [(bi, batch, os.path.join(temp_dir, f"_batchL{_lvl}_{bi}.mp4"))
+        layer = [(bi, batch, os.path.join(temp_dir, f"_{batch_ns}_batchL{_lvl}_{bi}.mp4"))
                  for bi, batch in enumerate(batches)]
         batch_files = [path for _bi, _batch, path in layer]
         done = {"count": 0}
@@ -1664,9 +1670,9 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
     _out_dir = output if os.path.isdir(output) else os.path.dirname(output)
     if _out_dir and os.path.isdir(_out_dir):
         for _stale in os.listdir(_out_dir):
-            # 新命名带 output stem（并发唯一化）：_<stem>_segN/_asegN；
+            # 新命名带 output stem（并发唯一化）：_<stem>_segN/_asegN/_batchLN_N；
             # 旧命名保留匹配，覆盖升级前崩溃的残留。
-            if re.fullmatch(r'(_batchL\d+_\d+|(?:_[^\\/]{0,120})?_seg\d+|'
+            if re.fullmatch(r'((?:_[^\\/]{0,120})?_batchL\d+_\d+|(?:_[^\\/]{0,120})?_seg\d+|'
                             r'(?:_[^\\/]{0,120})?_aseg\d+)\.(mp4|mp3|flac)', _stale):
                 try:
                     os.remove(os.path.join(_out_dir, _stale))

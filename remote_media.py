@@ -78,6 +78,14 @@ def platform_display_name(platform) -> str:
 # 交付比请求短超过这个秒数就重取一次（最后一次尝试仍短则接受并记录）。
 # 以前静默接受：clip 被对齐裁到实际交付长度，结尾比 padding 预期早、切点生硬。
 _SHORT_SEGMENT_TOLERANCE = 0.3
+# 连续失败多久就放弃一个片段（秒）。它只针对"反复失败且毫无进展"的片段：慢速但
+# 稳定产出数据的下载不会触发（stall_timeout 只管"完全没有数据"的连接）。
+#
+# 为什么从 90 提到 240：90 秒在慢 CDN 上会被**两次 40-50 秒的正常尝试**耗光，而预算
+# 耗尽会让后面所有判定（包括"短交付先让给重新解析"）都不再重试、直接接受当前这一份
+# ——这正是"偶尔一个片段画面冻住/糊掉"能进成片的路径。放宽到 240 秒后，一个片段仍最多重试
+# allowed_attempts 次（次数上限没变，由调用方的 retries 决定），只是不再被墙钟提前掐死。
+_SEGMENT_FAIL_BUDGET_SECONDS = 240.0
 _short_delivery_records: list[dict[str, Any]] = []
 _short_delivery_lock = threading.Lock()
 
@@ -1737,7 +1745,7 @@ def _fetch_needs_corruption_check(run_func, result) -> bool:
 
     生产路径（run_func=None）恒真——实测一次只解复用的校验 0.05s，可以每片段都做。
     测试注入的假执行写的是占位字节（不是真下载），默认跳过；需要覆盖这道自检的
-    测试给 runner 显式打上 ``_checks_enabled = True``（见 tests/test_clip_quality.py）。
+    测试给 runner 显式打上 ``_checks_enabled = True``。
     """
     if run_func is None:
         return True
@@ -1840,7 +1848,7 @@ def count_glitch_blocks(frames, width: int, height: int) -> tuple[int, int, floa
 # 好副本逐帧对齐后，偏移从 0 漂到 -20 帧再回到 0——即那 20 帧内容真的缺失了，任何
 # 重编码/锐化都补不回来，只能换一份取回。
 #
-# **判据的口径**（为什么是这四个条件，见 docs/_glitch_fix_proposal.md）：
+# **判据的口径**（为什么是这四个条件）：
 #   * 只在**画面区**（左半幅）量：右侧弹幕面板本来就会长时间不动，而且好/坏两份的
 #     弹幕静止段完全一致——整帧口径会把两件事混在一起，这正是前六次检测失败的原因。
 #   * 静止段长度 ≥ ``_HOLD_MIN_FRAMES``（0.5 秒）只是**必要**条件，不是判据：
@@ -3448,13 +3456,24 @@ def fetch_segment(
                         # （测试者反馈）。先按失败重试（走 refresh 阶梯）；最后一次
                         # 尝试仍短就接受，宁可短一点也不丢整个 clip。
                         #
-                        # 但"连续失败 90s 就放弃"的预算不能把短交付算进去：慢 CDN 上
-                        # 两次 40-50s 的抓取就够触发，结果是"接受一个短 clip"变成
-                        # "丢掉整个 clip"。预算已耗尽时直接走接受分支。
+                        # 但"连续失败太久就放弃"的预算（`_SEGMENT_FAIL_BUDGET_SECONDS`）
+                        # 不能把短交付算进去：慢 CDN 上两次 40-50s 的抓取就够触发，
+                        # 结果是"接受一个短 clip"变成"丢掉整个 clip"。预算已耗尽时
+                        # 直接走接受分支（该值已从 90 提到 240，正是为了少走这条）。
+                        #
+                        # 还有一层：同一 URL 永远返回同一份字节（实测多次），所以
+                        # **没重新解析过的重试只会拿到同样短的那一份**，白白消耗重试
+                        # 名额和预算，最后仍走接受分支。所以只要这次取回还没换过
+                        # payload（`refreshed` 未置位）就先失败一次，把机会留给
+                        # refresh 阶梯；等 refresh 真的跑过（或压根没有 refresh_func）
+                        # 再考虑接受。
                         budget_exhausted = (
                             _fail_budget_started is not None
-                            and time.monotonic() - _fail_budget_started > 90)
-                        if attempt + 1 < allowed_attempts and not budget_exhausted:
+                            and time.monotonic() - _fail_budget_started
+                            > _SEGMENT_FAIL_BUDGET_SECONDS)
+                        retry_can_learn = (refresh_func is not None and not refreshed)
+                        if ((attempt + 1 < allowed_attempts or retry_can_learn)
+                                and not budget_exhausted):
                             raise SegmentFetchError(
                                 f"FFmpeg segment delivered {actual_duration:g}s of the "
                                 f"requested {expected_duration:g}s "
@@ -3563,7 +3582,7 @@ def fetch_segment(
                            f"the source offers {expected_h}p; re-fetching it at the "
                            f"source's own quality instead of using the lower one")
                 # 不写缓存、不进失败计数：这只是"换一次再抓"，属于同一片段的
-                # 下一次尝试（预算由既有的 90s 与单次超时兜底）。
+                # 下一次尝试（预算由 `_SEGMENT_FAIL_BUDGET_SECONDS` 与单次超时兜底）。
                 continue
             # 只有"源里最高档就这个水平"才在这里登记说明（is_source_best）；
             # "源里有更高档但我们没能拿到"是真正的降级，**不能**报成源侧限制，
@@ -3608,12 +3627,12 @@ def fetch_segment(
                 )
             # 网络命令失败一次后，下一次尝试改用本地分片窗口（长 playlist 上
             # ffmpeg 的 seek 退化时这是唯一能出帧的路径），并把持续失败预算重新
-            # 计时：组窗口是几百 MB 的下载 + 一次 remux，本身可能几十秒，让 90s
-            # 预算把它掐死就退回"每个坏 clip 都失败"的原地状态。
+            # 计时：组窗口是几百 MB 的下载 + 一次 remux，本身可能几十秒，预算太短
+            # 会把它掐死，于是退回"每个坏 clip 都失败"的原地状态。
             #
             # 顺序很重要：这一步必须先于预算检查。深位置的第一次网络尝试通常会
             # 直接跑满单次超时（实测 120s），若先检查预算，第一次失败就已经超过
-            # 90s，预算立刻抛错，`hls_local_retry` 永远没机会置位（实测踩过）。
+            # 整个预算，预算立刻抛错，`hls_local_retry` 永远没机会置位（实测踩过）。
             if not hls_local_retry:
                 hls_local_retry = True
                 _fail_budget_started = time.monotonic()
@@ -3623,9 +3642,10 @@ def fetch_segment(
                     _mark_hls_seek_broken(identity)
             elif _fail_budget_started is None:
                 _fail_budget_started = time.monotonic()
-            elif time.monotonic() - _fail_budget_started > 90:
+            elif time.monotonic() - _fail_budget_started > _SEGMENT_FAIL_BUDGET_SECONDS:
                 raise SegmentFetchError(
-                    f"Segment fetch for {start}-{end} kept failing for 90s; "
+                    f"Segment fetch for {start}-{end} kept failing for "
+                    f"{_SEGMENT_FAIL_BUDGET_SECONDS:g}s; "
                     f"giving up on this clip (the VOD stream for this interval "
                     f"may be unavailable).")
             # 无视频流（音频正常）→ 大概率是当前 video_url 的 CDN 边缘对本

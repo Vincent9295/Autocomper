@@ -3447,6 +3447,82 @@ def _release_grab(window):
         pass
 
 
+def _grab_holder(window):
+    """Return the widget holding the application grab, or None.
+
+    Tkinter's ``window.grab_current()`` asks Tk for the holder's path name and then
+    converts it with ``nametowidget``, which walks ``children`` step by step. A
+    Combobox popdown that has been closed or destroyed is no longer in ``children``
+    while Tk can still report its path, so the conversion raises ``KeyError`` - and
+    that is not a ``tk.TclError``, so it escapes and Tk prints a callback traceback
+    (reported: pressing a preset while a URL import was running, once per watchdog
+    tick). Read the raw Tcl answer instead: only whether someone holds the grab
+    matters here, not which widget it is.
+    """
+    try:
+        name = window.tk.call("grab", "current", window._w)
+    except tk.TclError:
+        return None
+    if not name:
+        return None
+    name = str(name)
+    if name == "none":
+        return None
+    try:
+        return window.nametowidget(name)
+    except (KeyError, tk.TclError):
+        return name
+
+
+def _focused_widget(window):
+    """Return the widget that currently has focus, or None.
+
+    ``window.focus_displayof()`` converts Tk's answer through the same
+    ``nametowidget`` walk as ``grab_current()``, so it fails exactly the same way when
+    the focused widget is destroyed just before the call: ``KeyError``, not
+    ``tk.TclError``, which the surrounding guards do not catch. Here the widget itself
+    is what the caller needs (to tell "focus is inside this dialog" from "focus is in a
+    child dialog"), so a path name that cannot be resolved is reported as None - the
+    caller then takes the same branch as "no focus in this dialog".
+    """
+    try:
+        name = window.tk.call("focus", "-displayof", window._w)
+    except tk.TclError:
+        return None
+    if not name:
+        return None
+    name = str(name)
+    if name == "none":
+        return None
+    try:
+        return window.nametowidget(name)
+    except (KeyError, tk.TclError):
+        return None
+
+
+def _focus_is_inside(window, focused) -> bool:
+    """Whether focus sits on the dialog itself or on one of its own widgets.
+
+    ``focus_displayof()`` returns the focused **widget**, so an ``is window`` test is
+    False as soon as any child widget has focus (measured: ``.!toplevel`` vs
+    ``.!toplevel.!entry``), which left the grab watchdog unable to ever take the grab
+    back while the user was typing in the dialog.
+
+    ``winfo_children()`` lists **direct** children only, which is what keeps a nested
+    dialog out of this: a child dialog's entry point is e.g.
+    ``.!toplevel.!toplevel.!entry``, not a direct child of the outer window, so the
+    outer watchdog still leaves that grab to the child dialog's own handling.
+    """
+    if focused is None:
+        return False
+    if focused is window:
+        return True
+    try:
+        return focused in window.winfo_children()
+    except tk.TclError:
+        return False
+
+
 # 应用级模态框的抓取登记：grab 属于整个应用，但 Tk 的 grab 和 Windows 的焦点
 # 恢复会互相打架。测试者实测：打开 Import External Audio 的配对窗口后按 Alt+Tab
 # 切走，就再也切不回程序（任务栏点不动、Alt+Tab 回不来）。原因是那个窗口只做了
@@ -3512,7 +3588,8 @@ class _ModalGrab:
         try:
             if not window.winfo_exists():
                 return
-            if window.grab_current() is None and window.focus_displayof() is window:
+            if (_grab_holder(window) is None
+                    and _focus_is_inside(window, _focused_widget(window))):
                 window.grab_set()
         except tk.TclError:
             pass
@@ -3545,7 +3622,7 @@ class _ModalGrab:
         try:
             if not window.winfo_exists():
                 return
-            if window.grab_current() is not None:
+            if _grab_holder(window) is not None:
                 return
             window.grab_set()
         except tk.TclError:
