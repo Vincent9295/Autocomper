@@ -269,7 +269,23 @@ def load_audio(file: str | MediaSource, sr: int, frame_count: int,
             file, sr, frame_count, stall_timeout=DEFAULT_STALL_TIMEOUT
         )
         return
-    yield from _load_audio_direct(file, sr, frame_count)
+    # 字符串输入（既包括裸 URL，也包括 **Audio Cache 模式下的本地缓存 m4a 路径**）。
+    # 两者都必须带停滞看门狗：
+    #   * 数据在中间断掉（截断的 .m4a）时 ffmpeg 在坏点之后一个字节都不再输出，
+    #     没有超时就会永久阻塞在 read() 上——实测一个截断的 Bilibili 缓存文件
+    #     （容器 2158s、实际只解出 1010s）挂住 10 分钟以上，表现就是检测阶段卡在
+    #     某个源不动、界面还"响应中"；
+    #   * 缓存文件是本地文件，但它的内容来自网络下载，所以同样会截断。
+    # 停滞时抛 AudioDecodeError 而不是 RemoteAudioStallError：后者在上层有自己的
+    # 分支，只把该源标记为"跳过"，不会清理缓存文件；而 AudioDecodeError 会落到通用
+    # 异常分支，那里对本地缓存音频会删除损坏的 m4a + 同名 json 并重新下载一次再重试
+    # ——损坏的缓存由此自愈，而不是留在盘上让下次运行再撞一次。
+    try:
+        yield from _load_audio_direct(file, sr, frame_count,
+                                      stall_timeout=DEFAULT_STALL_TIMEOUT)
+    except RemoteAudioStallError as exc:
+        raise AudioDecodeError(-1, [str(file)],
+                               stderr=f"audio stalled: {exc}") from exc
 
 
 def _load_audio_twitch_retry(source, sr, frame_count, duration, refresh_func=None):
@@ -511,6 +527,98 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
             raise last_error
 
 
+class _LookaheadBlocks:
+    """Yield audio blocks while decoding the next one in the background.
+
+    Detection is strictly serial today: read a block, run the model on it, read the next one. On a
+    long VOD that means the network and the CPU take turns, even though the model needs roughly 3x
+    real time while the audio download manages 100x - the link sits idle for most of the run.
+
+    This wraps the block iterator in one background thread and a **bounded** queue (``depth``
+    blocks, default 1): the worker keeps one block ahead, so inference of block N overlaps the
+    download of block N+1. The bound is what keeps memory honest - a 600 s block of PCM is about
+    106 MB, so depth 1 costs one extra block, and a slow consumer simply stops the reader.
+
+    Ordering, error propagation and cleanup are preserved: the worker pulls blocks in order, an
+    exception surfaces on the consumer (as before, at the point the block would have been read),
+    and closing the wrapper closes the underlying generator so its ffmpeg process is terminated.
+    """
+
+    def __init__(self, blocks, depth=1):
+        self._blocks = blocks
+        self._depth = max(1, int(depth))
+        self._queue = None
+        self._thread = None
+        self._error = None
+        self._closed = False
+        self._started = False
+
+    def __len__(self):
+        return len(self._blocks)
+
+    def _start(self):
+        if self._started:
+            return
+        self._started = True
+        import queue as _queue
+        import threading as _threading
+        self._queue = _queue.Queue(maxsize=self._depth)
+
+        def worker():
+            try:
+                for block in self._blocks:
+                    if self._closed:
+                        break
+                    self._queue.put(block)            # 队列满就在这里等：读到的块数受 depth 限制
+            except BaseException as exc:              # noqa: BLE001 - 原样交给消费方
+                self._error = exc
+            finally:
+                try:
+                    self._queue.put(None)
+                except BaseException:
+                    pass
+
+        self._thread = _threading.Thread(target=worker, name="audio-lookahead", daemon=True)
+        self._thread.start()
+
+    def __iter__(self):
+        self._start()
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            yield item
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise error
+
+    def close(self):
+        """Stop the reader and close the source iterator (which stops its ffmpeg).
+
+        只对**支持 close 的**迭代器调用 close：包装对象可能只是普通迭代器（生成器有
+        close，`_SizedIterable` 这类没有），强行调用会抛 AttributeError 把收尾搞崩。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        closer = getattr(self._blocks, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:                                  # noqa: BLE001
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def __del__(self):                                        # pragma: no cover - 兜底
+        try:
+            self.close()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
 def _load_audio_prefetched(source, sr, frame_count, prefetch_chunk_size,
                            prefetch_concurrency, progress_callback=None,
                            refresh_func=None):
@@ -677,6 +785,77 @@ def _detection_cache_args(source, model, precision, block_size, threshold, focus
     )
 
 
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_SUFFIX = ".progress.json"
+
+
+def _checkpoint_path(cache_store, args):
+    """按检测缓存同样的键取检查点路径（同目录、同哈希、不同后缀）。"""
+    return cache_store.get_detection_cache_path(*args).with_suffix(_CHECKPOINT_SUFFIX)
+
+
+def _save_checkpoint(cache_store, args, blocks_done, timestamps, duration, block_size):
+    """把一个源已完成的块原子落盘，供中断后续跑。
+
+    以前只有整源跑完才写结果（`save_detection_result`），所以一个 6 小时源在中途失败
+    （Twitch 签名 URL 过期、网络抖动）会丢掉**全部**推理成果，重跑又从第 1 块开始。
+    这里每完成一块就记录"已完成到第几块"以及累计的时间戳，重跑时跳过已完成的块。
+    """
+    if cache_store is None:
+        return
+    payload = {
+        "version": _CHECKPOINT_VERSION,
+        "source_id": args[1],
+        "block_size": int(block_size),
+        "duration": (round(float(duration), 3) if duration else None),
+        "blocks_done": int(blocks_done),
+        "timestamps": list(timestamps),
+    }
+    try:
+        cache_store.save_json(_checkpoint_path(cache_store, args), payload)
+    except Exception:                                            # noqa: BLE001
+        # 检查点只是"省时间"的优化：写不进去不该让检测失败。
+        pass
+
+
+def _load_checkpoint(cache_store, args, duration, block_size):
+    """读回可用的检查点；不可用/不匹配返回 None。
+
+    时长不匹配就丢弃：源换了或长度变了，块边界不再对应同一段音频，硬续会错位。
+    """
+    if cache_store is None:
+        return None
+    try:
+        data = cache_store.read_json(_checkpoint_path(cache_store, args))
+    except Exception:                                            # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or data.get("version") != _CHECKPOINT_VERSION:
+        return None
+    if data.get("source_id") != args[1] or int(data.get("block_size") or 0) != int(block_size):
+        return None
+    if duration is None:
+        return None                        # 没有时长就没法确认块边界，宁可不续
+    try:
+        if abs(float(data.get("duration") or 0.0) - float(duration)) > 1.0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    blocks_done = int(data.get("blocks_done") or 0)
+    timestamps = data.get("timestamps") or []
+    if blocks_done <= 0 or not isinstance(timestamps, list):
+        return None
+    return {"blocks_done": blocks_done, "timestamps": timestamps}
+
+
+def _clear_checkpoint(cache_store, args):
+    if cache_store is None:
+        return
+    try:
+        _checkpoint_path(cache_store, args).unlink(missing_ok=True)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_gpu=True, cache_store=None, progress_callback=None,
@@ -762,9 +941,32 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     processed_blocks = 0
     started_at = time.monotonic()
 
+    # 续跑：上次中断前已完成的块直接复用，不重复推理。只对远端源做（本地文件没有
+    # 中断/过期这回事，且每次都会变），并且检查点里的时长必须与本次一致。
+    resume_args = None
+    resumed_blocks = 0
+    if is_remote and cache_store is not None:
+        resume_args = _detection_cache_args(file, model, precision, block_size, threshold, focus_idx)
+        checkpoint = _load_checkpoint(cache_store, resume_args, _dur, block_size)
+        if checkpoint is not None:
+            resumed_blocks = min(checkpoint["blocks_done"], max(0, block_count - 1))
+            if resumed_blocks > 0:
+                info['timestamps'] = list(checkpoint["timestamps"])
+                offset = resumed_blocks * block_size
+                processed_blocks = resumed_blocks
+                print(f"Remote Stream resumed: {resumed_blocks}/{block_count} blocks "
+                      f"already done, continuing from block {resumed_blocks + 1}")
+
     if logger:
         bar_logger = default_bar_logger(logger)
         blocks = bar_logger.iter_bar(block=blocks)
+
+    # 单块预读：推理第 N 块的同时，后台线程把第 N+1 块读好。只对远端源做——本地文件读取
+    # 本来就不是瓶颈，而且多一个线程只会添乱。队列深度 1（多一块 PCM），见 _LookaheadBlocks。
+    lookahead = None
+    if is_remote:
+        lookahead = _LookaheadBlocks(blocks, depth=1)
+        blocks = lookahead
 
     wav_file = None
     wav_data_size = 0
@@ -772,6 +974,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         wav_file = _open_wav_writer(save_audio_path)
     try:
         for block_index, block in enumerate(blocks, 1):
+            if block_index <= resumed_blocks:
+                continue          # 已完成的块：音频照读（要按序解码），但不重复推理
             processed_blocks = block_index
             if wav_file is not None:
                 wav_file.write(block)
@@ -794,9 +998,16 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
             preds = framewise_output[0]
             info["timestamps"].extend(compute_timestamps(preds, precision, threshold, focus_idx, offset))
             offset += block_size
+            # 每完成一块就落一次检查点：中途失败（URL 过期、网络抖动）时前面的推理
+            # 成果不会丢，重跑从这一块之后继续。
+            if resume_args is not None:
+                _save_checkpoint(cache_store, resume_args, block_index,
+                                 info["timestamps"], _dur, block_size)
     finally:
         if wav_file is not None:
             _finalize_wav(wav_file, wav_data_size)
+        if lookahead is not None:
+            lookahead.close()       # 收尾：停掉预读线程并关掉底层生成器（终止其 ffmpeg）
 
 
     if is_remote and _dur is not None:
@@ -816,6 +1027,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
             *_detection_cache_args(file, model, precision, block_size, threshold, focus_idx),
             cache_result,
         )
+        if resume_args is not None:
+            _clear_checkpoint(cache_store, resume_args)   # 整源结果已落盘，检查点作废
 
     if len(timestamps_dict) >= MAX_CACHE_SIZE:
         timestamps_dict.popitem(last=False)
