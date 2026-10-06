@@ -388,22 +388,156 @@ def format_playlist_duration(duration):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+_DATE_TIME_PATTERNS = (
+    # 中文直播标题：2022年11月4日21点场 / 2022年11月4日 21:30（"点"与分钟都可选）
+    (r'(?<!\d)(\d{4})年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日'
+     r'(?:[T\s_\-]*(\d{1,2})\s*点?(?:\s*[:：]\s*(\d{2}))?(?:\s*[:：]\s*(\d{2}))?)?'),
+    # 2022/03/12 , 2026.10.05 , 2022-07-19 , 2022_07_19（可带 " HH:MM" / " HH点"）
+    (r'(?<!\d)(\d{4})[/._\-](\d{1,2})[/._\-](\d{1,2})'
+     r'(?:[T\s_]+(\d{1,2})(?::(\d{2}))?\s*点?)?'),
+    # 紧凑档名：20251224 / 20211013-234638 / 2026.04.13-234638
+    (r'(?<!\d)(\d{4})[/._\-]?(\d{2})[/._\-]?(\d{2})'
+     r'(?:[T\s_\-]?(\d{2})(\d{2})(\d{2})?)?(?!\d)'),
+)
+_YEAR_IN_DIGIT_RUN = re.compile(r'(?<=\d)(?=(?:19|20)\d{2}[/._\-]\d{1,2}[/._\-]\d{1,2})')
+
+
+def _valid_date_parts(year, month, day):
+    return 1900 <= year <= 2999 and 1 <= month <= 12 and 1 <= day <= 31
+
+
+def parse_datetime_key(text):
+    """从文本里解析日期（及可能的时刻），返回可排序的 ``(date_key, time_key)``。
+
+    两个键都是字符串，**字符串比较等同于时间先后**：``date_key`` 为 ``YYYYMMDD``，
+    ``time_key`` 为 ``HHMMSS``；解析不到时刻时 ``time_key`` 是空串，因此"只有日期"的条目
+    排在"同日带时刻"的条目前面。
+
+    为什么要它：排序原先只用 yt-dlp 的 ``upload_date``（只有年月日）和几条写死的正则，
+    所以同一天上传的多个录播在排序键上完全相等、且 ``2026.10.05`` 这类格式根本认不出来
+    （认不出就掉进"按文件名字符串排"的兜底分支，跨天乱序）。
+
+    所有规则都跑一遍并**优先取带时刻的那个匹配**：``2026.04.13-234638`` 会先被"日期"规则
+    匹配到（无时刻），若一匹配就返回，紧凑规则里的 ``234638`` 就永远拿不到。
+    """
+    if text is None:
+        return "", ""
+    # 日期紧跟在别的数字后面时先插入边界：`卡bug天际线22024-08-08` 里的 `2` 是型号的一部分，
+    # 但 `(?<!\d)` 会因此拒绝整个日期，让该条目退回上传日、被扔进别的日期组。
+    source = _YEAR_IN_DIGIT_RUN.sub(" ", str(text))
+    date_only_key = ""
+    for pattern in _DATE_TIME_PATTERNS:
+        match = re.search(pattern, source)
+        if not match:
+            continue
+        groups = match.groups()
+        year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+        if not _valid_date_parts(year, month, day):
+            continue
+        date_key = f"{year:04d}{month:02d}{day:02d}"
+        hour = minute = second = 0
+        if len(groups) > 3 and groups[3] is not None:
+            raw_hour = str(groups[3])
+            has_minute = len(groups) > 4 and groups[4] is not None
+            has_second = len(groups) > 5 and groups[5] is not None
+            # 单个数字不算小时：`2024-07-25 2` 的 `2` 是"第 2 段"，真实时刻写作
+            # `21` / `21:30` / `21点`。秒同理不会写成单数字。
+            if (len(raw_hour) == 2 or has_minute or "点" in match.group(0)
+                    or (has_second and len(str(groups[5])) == 2)):
+                hour = int(groups[3])
+                minute = int(groups[4]) if has_minute else 0
+                second = int(groups[5]) if has_second else 0
+                # 小时必须是小时：24-59 是 `-2` / `[2]` 这类"第几部分"后缀，不是时刻。
+                if not (0 <= hour <= 23):
+                    hour = minute = second = 0
+                elif not (0 <= minute <= 59 and 0 <= second <= 59):
+                    minute = second = 0
+        if hour == 0:
+            date_only_key = date_only_key or date_key
+            continue
+        return date_key, f"{hour:02d}{minute:02d}{second:02d}"
+    return (date_only_key, "") if date_only_key else ("", "")
+
+
 def extract_part_number(title):
     """Return a one-based part/episode number from a title, when recognizable."""
     text = str(title or "")
     patterns = (
         r"第\s*(\d+)\s*(?:部分|集)",
         r"\b[Pp]\s*0*(\d+)\b",
-        r"\bPart\s+0*(\d+)\b",
+        r"\bParts?\s+0*(\d+)\b",
         r"\b[Pp]\s*0*(\d+)\s*/\s*\d+\b",
-        r"\bPart\s+0*(\d+)\s*/\s*\d+\b",
+        r"\bParts?\s+0*(\d+)\s*/\s*\d+\b",
         r"第\s*(\d+)\s*/\s*\d+\s*部分",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return int(match.group(1))
-    return None
+    return _trailing_part_suffix(text)
+
+
+_PART_SUFFIX_PATTERNS = (
+    r'[\s\-]\d{1,2}(?=\s*[\[\(（])',                    # 紧贴日期括号前：工作音杂谈-1[2022/…]
+    r'[\s_\-]*\b[Pp](?:arts?)?[\s_\-]*0*\d{1,3}\b',      # Part 2 / Parts 10 / P3
+    r'[\s\-]\d{1,2}\s*$',                                # 结尾段号
+)
+
+
+def _trailing_part_suffix(text):
+    """Return the ``N`` of a part suffix attached to a title, else None.
+
+    录制工具会把同一场直播切成多段：``工作音杂谈-1`` / ``工作音杂谈-2``，中间没有 ``Part``
+    字样，末尾还跟着日期括号。这种后缀原先完全不被识别，于是同一场的多段只能退回原始顺序。
+
+    只在**明确的位置**取数字：``-N`` 后面必须是列表括号、字符串结尾或分隔符，所以
+    ``-2022/02/13`` 里的 ``2022``（后面是 ``/``）不会被当成段号。
+    """
+    match = re.search(r'[\-\s]0*(\d{1,2})(?=\s*(?:[\[\(（【]|$|[\-_]))', str(text or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _segment_part_number(entry):
+    """The part number used for *ordering*, preferring the author's own title segment.
+
+    标题里的段号（``工作音杂谈-1`` / ``Part 2``）最可靠，优先使用；标题里没有时才退回
+    元数据的 ``part_number``——那对**真正的多P视频**（同一标题、分P）是正确来源，
+    但对 B 站 space 投稿它是**整个集合里的分P序号**（实测 40、41、45、46 一路递增），
+    不能用来比较同一场的 ``-1``/``-2``（那种标题里一定带段号，会走前一条分支）。
+    """
+    title = str(getattr(entry, "title", "") or "")
+    for pattern in _PART_SUFFIX_PATTERNS:
+        if re.search(pattern, title):
+            return _trailing_part_suffix(title)
+    metadata = getattr(entry, "metadata", {}) or {}
+    if metadata.get("part_number") is not None:
+        try:
+            return int(metadata["part_number"])
+        except (TypeError, ValueError):
+            pass
+    return extract_part_number(title)
+
+
+def _title_stream_stem(title):
+    """Return the part of a title identifying **which stream** it is, or "" when unsure.
+
+    录制工具把同一场切成多段（``工作音杂谈-1`` / ``工作音杂谈-2``）；同一天可能还有**另一场**
+    也带段号（``情人节歌杂-1``），两边段号都是 1，只靠段号排序会被原始顺序插开。所以需要
+    一层"哪一场"的归组键：去掉 ``【…】`` 频道名前缀与可识别的段号后缀。
+
+    刻意**保留日期括号**：去掉它会让 ``早安歌杂-1[2022/02/14…]`` 与 ``早安歌杂[2022/02/13…]``
+    变成同一个词干，而它们是不同的两场。
+    """
+    text = re.sub(r'【[^】]*】', ' ', str(title or "")).strip()
+    for pattern in _PART_SUFFIX_PATTERNS:
+        text = re.sub(pattern, ' ', text, count=1)
+    stem = " ".join(text.split()).casefold()
+    return stem if re.search(r'[^\W\d_]', stem) else ""
 
 
 def playlist_entry_part_number(entry):
@@ -418,23 +552,31 @@ def playlist_entry_part_number(entry):
 
 
 def sort_playlist_entries(entries):
-    """Return entries sorted by group/date/title/part, preserving unknown-part index."""
-    def normalized_title(title):
-        text = str(title or "Unknown")
-        text = re.sub(r"第\s*\d+\s*(?:部分|集)", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\b[Pp]\s*0*\d+\b", "", text)
-        text = re.sub(r"\bPart\s+0*\d+\b", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\b0*\d+\s*/\s*\d+\b", "", text)
-        return " ".join(text.split()).casefold()
-
+    """Return entries sorted by group/stream date/time/stream identity/part."""
     def key(entry):
         metadata = getattr(entry, "metadata", {}) or {}
         group = str(metadata.get("group") or metadata.get("series") or "").casefold()
-        date = str(getattr(entry, "upload_date", "") or "")
+        upload_date = str(getattr(entry, "upload_date", "") or "")
         raw_title = str(getattr(entry, "title", "") or "Unknown")
-        title = normalized_title(raw_title)
-        part = playlist_entry_part_number(entry)
-        return (group, date, title, part is None, part if part is not None else entry.index, entry.index)
+        # 标题里的**场次日期**才是权威时间，上传日只是后备：补档/重投的标题写着原始场次，
+        # 上传日却在很久以后（"…2026.04.13[2]补档" 上传于 04-26），按上传日排会被扔进
+        # 04-26 那一堆，而它本该紧跟在 04.13 那场后面。
+        title_date, title_time = parse_datetime_key(raw_title)
+        # 段号取标题里的"第几段"，**不用**元数据的 part_number（那是投稿集合内的分P序号）；
+        # 同一场（词干相同）按段号升序，于是 -1 排在 -2 前面。
+        # 词干为空（认不出是哪一场）时**不要**拿整条标题当键：那会让 "2026.04.13" 与
+        # "2026.04.13[2]补档" 按字符串比较，补档反而排到原件前面。用空键即可，
+        # 后面的 entry.index 会保持原始顺序。
+        part = _segment_part_number(entry)
+        return (
+            group,
+            title_date or upload_date,
+            title_time,
+            part is None,
+            _title_stream_stem(raw_title),
+            part if part is not None else entry.index,
+            entry.index,
+        )
 
     return sorted(entries, key=key)
 
@@ -3381,44 +3523,32 @@ def _smart_sort_key(filepath):
     folder = os.path.basename(os.path.dirname(filepath)).lower()
     name_no_ext = os.path.splitext(name)[0]
 
-    # --- folder key: extract date+time for both folder names and loose filenames
-    _h = lambda s: ('{:02d}'.format(int(m.group(1))) if (m := re.search(r'(\d{1,2})点场?', s)) else '\uffff')
+    # --- folder key: date 优先；日期格式统一交给 parse_datetime_key
+    # 旧版只认 `2022年11月4日` / `2022-07-19` / `2022_07_19`，于是一批用 `2026.10.05`、
+    # `20251224`、`20211013-234638` 命名的素材认不出日期，掉进"按文件名字符串排"的兜底
+    # 分支，跨天乱序（用户实测：29 日排进 19/23 日之间）。
     _src = folder if re.search(r'\d{4}年', folder) else name
-    fm = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', _src)
-    if fm:
-        fkey = (0, f'{fm[1]}{int(fm[2]):02d}{int(fm[3]):02d}', _h(_src))
+    folder_date, folder_time = parse_datetime_key(_src)
+    if folder_date:
+        fkey = (0, folder_date, folder_time)
     else:
-        fm = re.search(r'(\d{4})年(\d{1,2})月', _src)
-        if fm:
-            fkey = (0, f'{fm[1]}{int(fm[2]):02d}', _h(_src))
-        else:
-            fm = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', _src)
-            if fm:
-                fkey = (0, f'{fm[1]}{fm[2]}{fm[3]}', _h(_src))
-            elif re.search(r'(\d{4})[-_](\d{2})', _src):
-                fm = re.search(r'(\d{4})[-_](\d{2})', _src)
-                fkey = (0, f'{fm[1]}{fm[2]}', _h(_src))
-            else:
-                fp = re.split(r'(\d+)', folder)
-                fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
+        fp = re.split(r'(\d+)', folder)
+        fkey = (1, tuple(int(p) if p.isdigit() else p.lower() for p in fp), folder)
 
     # --- file key
     _of = lambda n: 1 if re.search(r'\bOriginal\b', n) else 0
-    _pp = lambda n: int(re.search(r'^p?(\d{1,2})[\s_\-]', n).group(1)) if re.search(r'^p?(\d{1,2})[\s_\-]', n) else (int(re.search(r'part\s*(\d+)', n, re.I).group(1)) if re.search(r'part\s*(\d+)', n, re.I) else 0)
-    # 1. Chinese live stream date
-    m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})点场?', name)
-    if m:
-        return (fkey, 0, f'{m[1]}{int(m[2]):02d}{int(m[3]):02d}_{int(m[4]):02d}', _of(name), _pp(name))
-    # 2. ISO date: "2022-07-19" or "2022_07_19"
-    m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', name)
-    if m:
-        return (fkey, 0, f'{m[1]}{m[2]}{m[3]}', _of(name), _pp(name))
-    # 3a. Part FIRST: "p0-title" or "0-title" (Bilibili)
+    _pp = lambda n: int(re.search(r'^p?(\d{1,2})[\s_\-]', n).group(1)) if re.search(r'^p?(\d{1,2})[\s_\-]', n) else (int(re.search(r'parts?\s*(\d+)', n, re.I).group(1)) if re.search(r'parts?\s*(\d+)', n, re.I) else 0)
+    # 1. 档名里的日期（含时刻）：2022年11月4日21点场 / 2022/03/12 / 2026.10.05 /
+    #    20251224 / 20211013-234638，时刻一起参与排序。
+    date, time_of_day = parse_datetime_key(name)
+    if date:
+        return (fkey, 0, date, time_of_day, _of(name), _pp(name))
+    # 2. Part FIRST: "p0-title" or "0-title" (Bilibili)
     m = re.search(r'^p?(\d{1,2})[\s_\-]+(.+)$', name_no_ext, re.IGNORECASE)
     if m:
         return (fkey, 1, m[2].strip().lower(), int(m[1]), _of(name))
-    # 3b. Part LAST: "video_p1", "video part 2", "movie (3)"
-    m = re.search(r'^(.*?)[\s_\-]+p(?:art[\s_]*)?(\d+)$', name_no_ext, re.IGNORECASE)
+    # 3. Part LAST: "video_p1", "video part 2", "video Parts 3", "movie (3)"
+    m = re.search(r'^(.*?)[\s_\-]+p(?:arts?[\s_]*)?(\d+)$', name_no_ext, re.IGNORECASE)
     if not m:
         m = re.search(r'^(.*?)\s*\((\d+)\)\s*$', name_no_ext)
     if m:
