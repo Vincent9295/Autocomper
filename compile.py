@@ -1138,19 +1138,195 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
             detail += f"\nMissing: {missing}"
         if no_video and len(no_video) <= 5:
             detail += f"\nNo video stream: {no_video}"
-        raise Exception(f"FFmpeg concat failed:{detail}\n[stderr]\n{_sanitize_ffmpeg_detail(result.stderr)}\n[stdout]\n{_sanitize_ffmpeg_detail(result.stdout)}")
+        raise Exception(f"FFmpeg concat failed:{detail}\n[stderr]\n{_sanitize_ffmpeg_detail(result.stderr)}\n[stdout]\n{_sanitize_ffmpeg_detail(result.stdout)}{_disk_full_hint(result.stderr)}")
     return True
 
 
-# 层内并行合并时每个任务预留多少可用内存（MB）。单个 concat ffmpeg 要把 batch_size 个
-# 1080p 输入解码进滤镜再编码，实测可占数百 MB；8 GB 机器上"空闲不到 1 GB 还开 3 个"
-# 就是把整轮拖进页面文件（比串行更慢）。用户实测：合并时真正可用物理内存只剩 425 MB，
-# 于是自动降回 1 个任务 —— 这正是这套保护该做的事。
-_MERGE_MEMORY_PER_WORKER_MB = 900.0
+# 层内并行合并时每个任务预留多少可用内存（MB）。一个 concat ffmpeg 要把 batch_size 个
+# 1080p 输入**同时**解码进滤镜图，所以内存随 batch_size 线性增长，不是一个固定值：实测
+# （本机 NVENC、1080p30 片段、进程提交量）batch 6 = 1060 MB、batch 10 = 1398 MB、
+# batch 20 = 2250 MB，混合分辨率走放大链再多约 20%（batch 20 = 2554 MB），拟合结果约
+# 0.55 GB 底 + 每输入 0.085 GB。旧版写死 900 MB，在默认 batch 6 上就已经低于实测、
+# batch 10 明显低估，一开并行就把整机拖进页面文件。所以预留下限之外再按公式放大：
+_MERGE_MEMORY_PER_WORKER_MB = 900.0        # 任何 batch 都不低于这个值
+_MERGE_MEMORY_BASE_MB = 600.0              # 单个合并进程的固定开销（解码器+滤镜+编码器）
+_MERGE_MEMORY_PER_INPUT_MB = 120.0         # 每个输入的解码/缩放缓冲（按混合分辨率实测上取）
+# 合并并行只允许用掉「可用内存」的这个比例：给播放器/浏览器/杀软留余量，避免刚好卡在
+# 边界上把整机拖进页面文件。
+_MERGE_MEMORY_HEADROOM = 0.5
+# 合并并行的硬上限：这是整轮编译里最重的一段，用户设 4 也不代表机器吃得下（实测单进程
+# batch 10 就要 1.4 GB）。超过这个数的请求会被压下来。
+_MERGE_MAX_WORKERS = 3
+
+
+def _merge_memory_per_worker_mb(batch_size) -> float:
+    """一个并行合并任务要预留多少内存（MB）：随 Merge Batch Size 线性增长。"""
+    try:
+        batch = max(1, int(batch_size))
+    except (TypeError, ValueError):
+        batch = 6
+    return max(_MERGE_MEMORY_PER_WORKER_MB,
+               _MERGE_MEMORY_BASE_MB + _MERGE_MEMORY_PER_INPUT_MB * batch)
 # 逐段切分 / 完整性校验的每个并行任务预留多少内存（MB）。这两段比合并轻得多
 # （切分是单窗口解码+编码，校验是 320x180 的小解码），所以预留可以小很多；
 # 主要限制是 CPU 与磁盘并发读，实测 2-3 个并发是安全区间。
 _CLIP_MEMORY_PER_WORKER_MB = 400.0
+
+# 合并中间产物的空间守卫。合并的每一层都是一次**整片重编码**，所以每层的体积≈一整支
+# 成片、与该层装了多少个文件无关（1080p 工程实测：每层 16.3 GB，成片 13.2 GB）。
+# 层边界用**实测**的本层体积判断剩余空间，最坏也只在第一层之后就停下，而不是跑到最后
+# 一层才因为磁盘写满失败。
+_DISK_SPACE_SAFETY = 1.2
+
+
+def _total_size(paths) -> int:
+    total = 0
+    for path in paths:
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            continue
+    return total
+
+
+def _free_space_bytes(path):
+    """path 所在卷的可用字节；路径还不存在时取其最近的已存在父目录；测不到返回 None。"""
+    try:
+        target = os.path.abspath(str(path))
+        while target and not os.path.isdir(target):
+            parent = os.path.dirname(target)
+            if parent == target:
+                return None
+            target = parent
+        return shutil.disk_usage(target).free
+    except OSError:
+        return None
+
+
+def _same_volume(first, second) -> bool:
+    try:
+        return (os.path.splitdrive(os.path.abspath(str(first)))[0].lower()
+                == os.path.splitdrive(os.path.abspath(str(second)))[0].lower())
+    except (TypeError, ValueError):
+        return False
+
+
+def _merge_layers_remaining(count: int, batch_size: int) -> int:
+    """从这批输入开始还要再写出多少层中间产物（每层≈一整片）。"""
+    layers = 0
+    current = int(count)
+    while current > batch_size:
+        current = -(-current // batch_size)
+        layers += 1
+    return layers
+
+
+def _disk_full_hint(text) -> str:
+    """把 ffmpeg 的磁盘写满报错翻译成一句可操作的提示。"""
+    lowered = str(text or "").lower()
+    for marker in ("no space left on device", "not enough space on the disk",
+                   "there is not enough space", "disk full", "enospc"):
+        if marker in lowered:
+            return ("\nThe merge ran out of space on the scratch drive. Free space "
+                    "there, raise 'Merge Batch Size' (fewer merge layers), or set "
+                    "'Merge Scratch Folder' to a drive with more room, then compile "
+                    "again.")
+    return ""
+
+
+def _open_temp_dir(scratch_dir):
+    """合并用的临时工作目录。
+
+    默认仍是系统临时目录（行为与以前一致）；设置了 Merge Scratch Folder 时改到该目录，
+    让合并的中间产物不再落到系统盘。目录不可用就退回系统临时目录并打印一行——绝不因为
+    一个设置项让编译失败。
+    """
+    requested = str(scratch_dir or "").strip()
+    if requested:
+        try:
+            os.makedirs(requested, exist_ok=True)
+            return tempfile.TemporaryDirectory(dir=requested)
+        except OSError as exc:
+            print(f"{Fore.YELLOW}Merge scratch folder unusable ({requested}): "
+                  f"{str(exc)[:200]}; using the system temp folder.{Style.RESET_ALL}")
+    return tempfile.TemporaryDirectory()
+
+
+def _report_merge_space(file_list, temp_dir, output_file, layers_remaining,
+                        release_inputs, level) -> None:
+    """层边界的空间检查：不够就带着数字停下，而不是写到一半失败。"""
+    temp_free = _free_space_bytes(temp_dir)
+    layer_bytes = _total_size(file_list)
+    if temp_free is None or layer_bytes <= 0:
+        return
+    if level < 1:
+        # 第一层的输入是刚切好的片段，还算不出"一层"的体积，只报数字。
+        print(f"  Merge scratch: {temp_dir} ({temp_free / 1e9:.1f} GB free); "
+              f"clips {layer_bytes / 1e9:.1f} GB")
+        return
+    # 早释放时同时存在的只有"上一层的产物 + 正在写的这一层"= 两层；不早释放时，
+    # 下面每一层都会留在盘上直到整条链结束。
+    temp_layers = 2 if release_inputs else layers_remaining + 1
+    temp_need = layer_bytes * temp_layers
+    print(f"  Merge space: layer {level + 1} input {layer_bytes / 1e9:.1f} GB; "
+          f"{temp_free / 1e9:.1f} GB free in {temp_dir}; still needs about "
+          f"{temp_need * _DISK_SPACE_SAFETY / 1e9:.1f} GB")
+    if temp_free < temp_need * _DISK_SPACE_SAFETY:
+        raise Exception(
+            f"Not enough free space for the merge: about "
+            f"{temp_need * _DISK_SPACE_SAFETY / 1e9:.1f} GB is needed in {temp_dir} "
+            f"and only {temp_free / 1e9:.1f} GB is free. Free space on that drive, "
+            f"raise 'Merge Batch Size' (fewer merge layers), or set "
+            f"'Merge Scratch Folder' to a drive with more room, then compile again.")
+    if not _same_volume(temp_dir, output_file):
+        output_free = _free_space_bytes(output_file)
+        output_need = layer_bytes * _DISK_SPACE_SAFETY
+        if output_free is not None and output_free < output_need:
+            raise Exception(
+                f"Not enough free space for the finished film: about "
+                f"{output_need / 1e9:.1f} GB is needed for {output_file} and only "
+                f"{output_free / 1e9:.1f} GB is free on that drive.")
+
+
+def _release_merge_inputs(file_list, temp_dir, produced):
+    """回收已被本层消费的合并输入，返回 (文件数, 字节数)。
+
+    只在**本层全部批次成功**之后调用（层内是并发的，早删会打断别的批次）。只删本次
+    调用收到的确切路径，且只删落在本次合并工作目录内的文件——输入始终是我们自己的
+    切段/层产物，用户文件不可能被删。产物缺失或为空时一个都不删，让上层的报错照常发生。
+    """
+    if not produced:
+        return 0, 0
+    for path in produced:
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                return 0, 0
+        except OSError:
+            return 0, 0
+    root = os.path.abspath(str(temp_dir)) if temp_dir else None
+    released = freed = 0
+    for path in file_list:
+        absolute = os.path.abspath(str(path))
+        if root is not None:
+            try:
+                if os.path.normcase(os.path.commonpath([root, absolute])) != \
+                        os.path.normcase(root):
+                    continue
+            except ValueError:
+                continue
+        try:
+            size = os.path.getsize(absolute)
+        except OSError:
+            size = 0
+        try:
+            os.remove(absolute)
+        except OSError:
+            continue
+        released += 1
+        freed += size
+    return released, freed
+
+
 _INTEGRITY_MEMORY_PER_WORKER_MB = 300.0
 
 
@@ -1186,12 +1362,15 @@ def _available_memory_mb():
     return None
 
 
-def _worker_count(requested, tasks, per_worker_mb, label):
+def _worker_count(requested, tasks, per_worker_mb, label, budget_fraction=1.0):
     """请求的并发数、任务数、可用内存三者取最小。
 
     每个并行 ffmpeg 都要解码自己的输入，所以并发数是**内存**问题而不只是 CPU 问题：
     内存不够就自动降到 1，绝不把整轮拖进页面文件（那比串行更慢）。量不到可用内存时
     保守取 2。
+
+    ``budget_fraction`` 用来在重负载段（合并）留出余量：只按可用内存的这个比例算名额，
+    默认 1.0（切分/校验这些轻量段照旧）。
     """
     try:
         workers = int(requested)
@@ -1203,26 +1382,37 @@ def _worker_count(requested, tasks, per_worker_mb, label):
     available_mb = _available_memory_mb()
     if available_mb is None:
         return min(workers, 2)
-    allowed = int(available_mb // per_worker_mb)
+    try:
+        fraction = float(budget_fraction)
+    except (TypeError, ValueError):
+        fraction = 1.0
+    if not 0 < fraction <= 1:
+        fraction = 1.0
+    budget_mb = available_mb * fraction
+    allowed = int(budget_mb // per_worker_mb)
     if allowed < workers:
-        print(f"  Memory check: {available_mb:.0f} MB available, so {max(1, allowed)} "
-              f"parallel {label} task(s) instead of {workers}.")
+        print(f"  Memory check: {available_mb:.0f} MB available"
+              + (f" (using {fraction:.0%} of it as budget)" if fraction < 1 else "")
+              + f", so {max(1, allowed)} parallel {label} task(s) instead of {workers} "
+                f"({per_worker_mb:.0f} MB reserved per task).")
     return max(1, min(workers, allowed))
 
 
 def _run_parallel(tasks, worker, requested, per_worker_mb, label, progress_note=None,
-                  progress_callback=None):
+                  progress_callback=None, budget_fraction=1.0):
     """把一批互相独立的任务并发跑完；返回失败列表 [(任务, 异常)]。
 
     - 并发数由 ``_worker_count`` 决定（`requested` / 任务数 / 可用内存取最小）；
     - 并发数 <= 1 时**完全走原来的串行路径**，行为与不开并行时逐字节一致；
     - **本批全部收尾后才返回**（不留半跑的任务），失败聚合返回给调用方决定怎么报；
-    - 进度回调在并发下加锁（否则进度条会串）。
+    - 进度回调在并发下加锁（否则进度条会串）；
+    - ``budget_fraction`` 见 ``_worker_count``（合并段只用可用内存的一半）。
     """
     tasks = list(tasks)
     if not tasks:
         return []
-    workers = _worker_count(requested, tasks, per_worker_mb, label)
+    workers = _worker_count(requested, tasks, per_worker_mb, label,
+                            budget_fraction=budget_fraction)
     if workers <= 1:
         failures = []
         for task in tasks:
@@ -1235,7 +1425,8 @@ def _run_parallel(tasks, worker, requested, per_worker_mb, label, progress_note=
             except Exception as exc:                                   # noqa: BLE001
                 failures.append((task, exc))
         return failures
-    print(f"  Running {len(tasks)} {label} task(s) with {workers} parallel worker(s).")
+    print(f"  Running {len(tasks)} {label} task(s) with {workers} parallel worker(s) "
+          f"({per_worker_mb:.0f} MB reserved each).")
     progress_lock = threading.Lock()
 
     def wrapped(task):
@@ -1264,7 +1455,7 @@ def _run_parallel(tasks, worker, requested, per_worker_mb, label, progress_note=
 def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, batch_size=6,
                            fps=None, _lvl=0, progress_callback=None,
                            temp_dir=None, total_duration=None, audio_out=None,
-                           sharpen=None, max_parallel=1):
+                           sharpen=None, max_parallel=1, release_inputs=False):
     """Batched concat for large file lists. 批数仍超 batch_size 时递归分批，
     保证任意 clip 数量下单条 ffmpeg 命令行都不会爆 Windows 32767 上限。
 
@@ -1279,6 +1470,11 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
 
     batch_size < 2 时无法收缩工作集（单元素批次递归自身）→ 实测无限递归
     直到 RecursionError/数小时 IO 空转。入口强制钳到 ≥2。
+
+    **层边界回收**：本层全部批次都成功之后，``release_inputs`` 为真时立刻删掉本层的
+    输入——它们已经没有读者（完整性校验在合并之前跑完，编译没有断点续传，失败或取消
+    时整个临时目录本来就会被删）。这样盘上任何时刻只有相邻两层，而不是所有层的中间
+    产物同时存在，峰值从"层数 × 一整片"降到"两层 × 一整片"。
     """
     if not file_list:
         return False
@@ -1305,6 +1501,9 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
     # 中间文件默认与输出同盘；调用方可传入 compile 的临时目录，避免大批量
     # 合并时 _batchL* 中间件 flood 用户输出文件夹。
     temp_dir = temp_dir or os.path.dirname(output_file) or os.path.dirname(file_list[0])
+    _report_merge_space(file_list, temp_dir, output_file,
+                        _merge_layers_remaining(len(file_list), batch_size),
+                        release_inputs, _lvl)
     # 中间件必须带**本次调用**的标识：一次 compile 里多个源会在同一个临时目录下并发
     # 跑各自的合并（每源≥batch_size+1 段时走 _ffmpeg_cut 的多段分支），若只用
     # `_batchL{层}_{序号}` 命名，两条并发的合并线会写同一个文件——产物静默串源，
@@ -1341,15 +1540,29 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                 return format_compile_progress(
                     0, None, 0, f"Batch layer {_lvl + 1}: {done['count']}/{len(batches)} done")
 
-        failures = _run_parallel(layer, merge_one, max_parallel, _MERGE_MEMORY_PER_WORKER_MB,
+        # 合并并行的名额：用户请求值先压到硬上限，预留值按 batch_size 缩放，并且只允许
+        # 用掉可用内存的一半。三者缺一，batch 10 上开 4 个并发就能把整机拖进页面文件。
+        try:
+            merge_workers = int(max_parallel)
+        except (TypeError, ValueError):
+            merge_workers = 1
+        merge_workers = max(1, min(merge_workers, _MERGE_MAX_WORKERS))
+        failures = _run_parallel(layer, merge_one, merge_workers,
+                                 _merge_memory_per_worker_mb(batch_size),
                                  "merge", progress_note=note,
-                                 progress_callback=progress_callback)
+                                 progress_callback=progress_callback,
+                                 budget_fraction=_MERGE_MEMORY_HEADROOM)
         if failures:
             # 本层全部收尾后再报错：留下半跑的任务比直接抛出更糟。
             first_index, first_error = failures[0]
             raise Exception(
                 f"Batch {first_index[0] + 1} of layer {_lvl + 1} failed "
                 f"({len(failures)} of {len(batches)} batches failed): {first_error}")
+        if release_inputs:
+            released, freed = _release_merge_inputs(file_list, temp_dir, batch_files)
+            if released:
+                print(f"  Released {released} merged input file(s) "
+                      f"({freed / 1e9:.1f} GB) from layer {_lvl + 1}")
         print(f"  Final merge ({len(batch_files)} files)...")
         if progress_callback is not None:
             progress_callback(format_compile_progress(0, None, 0, "Final merge: starting"))
@@ -1362,7 +1575,8 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                                           temp_dir=temp_dir,
                                           total_duration=total_duration,
                                           audio_out=audio_out, sharpen=sharpen,
-                                          max_parallel=max_parallel)
+                                          max_parallel=max_parallel,
+                                          release_inputs=release_inputs)
         _ffmpeg_concat(batch_files, output_file, res=res, normalize=normalize, fps=fps,
                        progress_callback=progress_callback, total_duration=total_duration,
                        audio_out=audio_out, sharpen=sharpen)
@@ -1644,7 +1858,8 @@ def clip_quality_problem(clip_file, expected_height, is_source_best=False):
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
                 excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None,
-                output_fps=None, max_parallel=1, clip_parallel=1, integrity_parallel=1):
+                output_fps=None, max_parallel=1, clip_parallel=1, integrity_parallel=1,
+                scratch_dir=""):
     """Compile every clip into the output film.
 
     Three independent parallelism knobs, each clamped by task count and free memory at use
@@ -1699,7 +1914,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
 
     tempfiles = []
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with _open_temp_dir(scratch_dir) as temp_dir:
             tasks = []
 
             # 输出帧率必须显式给（见 _resolve_output_fps 上方的实测记录：不给的话
@@ -2022,6 +2237,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         progress_callback=progress_callback,
                         temp_dir=temp_dir, total_duration=total_duration,
                         batch_size=batch_size, sharpen=sharpen,
+                        max_parallel=max_parallel, release_inputs=True,
                     )
                 else:
                     concat_func(tempfiles, output, normalize=normalize,

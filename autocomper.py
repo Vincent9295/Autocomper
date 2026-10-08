@@ -122,6 +122,7 @@ DEFAULT_SETTINGS = {
     'max_download_speed': '0',
     'output_text_path': "No file selected!",
     'remote_cache_path': str(CacheStore().root),
+    'merge_scratch_dir': '',
 }
 
 REMOTE_MODES = ("Remote Stream", "Audio Cache", "Full Download")
@@ -220,26 +221,45 @@ MERGE_BATCH_TOOLTIP_TEXT = (
     "Smaller batches (e.g. 6) use less RAM per FFmpeg process and are safer on\n"
     "weak machines or very large 4K clips. Larger batches (e.g. 12-20) produce\n"
     "fewer intermediate files and finish faster on a capable PC. If a merge ever\n"
-    "runs out of memory, lower this. Default: 6."
+    "runs out of memory, lower this. Default: 6.\n\n"
+    "This multiplies with Parallel Merge Tasks: each parallel batch process decodes\n"
+    "this many inputs at once, so a big batch size and several parallel tasks\n"
+    "together are what eats memory (measured: one merge process needs about\n"
+    "1.1 GB at batch 6 and 1.4 GB at batch 10)."
 )
 MERGE_BATCH_DEFAULT = 6
 # 下限 2：batch_size=1 时 _ffmpeg_concat_batched 每批只剩单文件、递归无法
 # 收缩工作集（实测 151 层直到 RecursionError，默认栈深下表现为数小时 IO 空转）。
 MERGE_BATCH_MIN = 2
 MERGE_BATCH_MAX = 50
+MERGE_SCRATCH_TOOLTIP_TEXT = (
+    "Where the merge writes its temporary layers. Every merge layer re-encodes the\n"
+    "whole film, so a large batch needs several times the size of the finished file\n"
+    "while it runs. Leave empty to use the system temp folder; choose a folder on a\n"
+    "drive with plenty of room (for example the drive that holds the output) when\n"
+    "the system drive is short of space.\n\n"
+    "Merge layers are released as soon as they are consumed, so the peak space is\n"
+    "about two layers instead of one layer per merge pass for the whole run."
+)
+MERGE_SCRATCH_DEFAULT = ""
 # ── 编译阶段的三个并发旋钮（各自独立，默认 1 = 与旧版逐字节相同的行为）──
 # 实测（用户 2292 片段、约 3 小时成片）：切片 1 小时、完整性校验 1 小时、最终合并 2 小时。
 # 切片与校验的任务互相独立、内存占用小，是最值得并行的一段；合并那一段受内存限制最大。
 MERGE_PARALLEL_TOOLTIP_TEXT = (
-    "How many merge batches FFmpeg may work on at the same time (final merge step).\n"
-    "Batches inside one layer are independent, so 2-3 together shorten a long merge\n"
-    "(measured about 1.5x). Each parallel batch decodes its own inputs, so this costs\n"
-    "RAM: AutoComper checks free memory before every layer and quietly drops back to 1\n"
-    "when there is not enough. Low-spec machines should leave this at 1. Default: 1."
+    "How many merge batches FFmpeg may work on at the same time, including the final\n"
+    "merge. Batches inside one layer are independent, so 2 together shorten a long\n"
+    "merge. Each parallel batch decodes its own inputs, so the RAM cost is roughly\n"
+    "this number times the cost of one batch, and one batch already scales with Merge\n"
+    "Batch Size (measured: about 1.1 GB for batch 6, 1.4 GB for batch 10 per process).\n"
+    "AutoComper reserves memory per task, only spends half of what is free, caps this\n"
+    "at 3, and quietly drops back to 1 when there is not enough. Low-spec machines\n"
+    "should leave this at 1. Default: 1."
 )
 MERGE_PARALLEL_DEFAULT = 1
 MERGE_PARALLEL_MIN = 1
-MERGE_PARALLEL_MAX = 4
+# 和 compile._MERGE_MAX_WORKERS 保持一致：合并是全流程最重的一段，界面上就不该给出
+# 一个代码永远不会兑现的选项（选 4 只会跑 3）。测试里有一条断言盯着这两个常量不许漂移。
+MERGE_PARALLEL_MAX = 3
 CLIP_PARALLEL_TOOLTIP_TEXT = (
     "How many clips may be cut at the same time (writing the clip files).\n"
     "Each clip reads its own window of the source and writes its own temporary file,\n"
@@ -724,6 +744,25 @@ def normalize_remote_settings(data):
         elif merge_batch > MERGE_BATCH_MAX:
             merge_batch = MERGE_BATCH_MAX
         normalized["merge_batch_size"] = merge_batch
+    # 三个并发旋钮同样按各自的上限收口：手改过的预设（或另一台机器存的预设）不该让界面
+    # 显示一个代码永远不会兑现的值（合并最大 3，见 MERGE_PARALLEL_MAX）。
+    for key, default, lower, upper in (
+        ("clip_parallel", CLIP_PARALLEL_DEFAULT, CLIP_PARALLEL_MIN, CLIP_PARALLEL_MAX),
+        ("integrity_parallel", INTEGRITY_PARALLEL_DEFAULT, INTEGRITY_PARALLEL_MIN,
+         INTEGRITY_PARALLEL_MAX),
+        ("merge_parallel", MERGE_PARALLEL_DEFAULT, MERGE_PARALLEL_MIN, MERGE_PARALLEL_MAX),
+    ):
+        if key not in normalized:
+            continue
+        try:
+            value = int(normalized[key])
+        except (TypeError, ValueError):
+            value = default
+        if value < lower:
+            value = default
+        elif value > upper:
+            value = upper
+        normalized[key] = value
     normalized.pop("remote_cache_size", None)
     return normalized
 
@@ -4519,6 +4558,10 @@ class VideoProcessorApp:
 
         self.keep_downloaded_vids = tk.BooleanVar(value=False)
         self.download_video_path = tk.StringVar()
+        # 合并暂存目录（空 = 系统临时目录）。合并的每一层≈一整支成片，放系统盘容易写满。
+        self.merge_scratch_dir = tk.StringVar(
+            value=self.preferences.get("Settings", "merge_scratch_dir",
+                                       fallback=MERGE_SCRATCH_DEFAULT))
         # 跳过检测时优先读哪个 timestamps 文件（ask = 每次让用户选）。
         # 存在多个（base / _reverified / _selected）时才用得上。
         self.timestamps_load_preference = tk.StringVar(value="ask")
@@ -4931,14 +4974,45 @@ class VideoProcessorApp:
             self.merge_batch_spinbox, MERGE_BATCH_TOOLTIP_TEXT
         )
 
+        # Merge scratch folder (empty = system temp folder)
+        merge_scratch_row = ttk.Frame(self.checkbox_frame)
+        merge_scratch_row.pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(merge_scratch_row, text="Merge Scratch Folder:").pack(anchor=tk.W)
+        self.merge_scratch_entry = ttk.Entry(
+            merge_scratch_row, textvariable=self.merge_scratch_dir, width=24)
+        self.merge_scratch_entry.pack(anchor=tk.W, pady=(2, 2))
+        self.merge_scratch_hint = tk.StringVar()
+        self.merge_scratch_hint_label = ttk.Label(
+            merge_scratch_row, textvariable=self.merge_scratch_hint,
+            wraplength=280, justify=tk.LEFT)
+        self.merge_scratch_hint_label.pack(anchor=tk.W)
+        merge_scratch_buttons = ttk.Frame(merge_scratch_row)
+        merge_scratch_buttons.pack(anchor=tk.W, pady=(3, 0))
+        self.merge_scratch_choose_button = ttk.Button(
+            merge_scratch_buttons, text="Choose Folder", command=self.choose_merge_scratch_dir)
+        self.merge_scratch_choose_button.pack(side=tk.LEFT)
+        self.merge_scratch_reset_button = ttk.Button(
+            merge_scratch_buttons, text="Use System Temp",
+            command=self.reset_merge_scratch_dir)
+        self.merge_scratch_reset_button.pack(side=tk.LEFT, padx=(4, 0))
+        self.merge_scratch_tooltip = CustomHovertip(
+            merge_scratch_row, MERGE_SCRATCH_TOOLTIP_TEXT
+        )
+        self.merge_scratch_dir.trace_add(
+            "write", lambda *_args: self.refresh_merge_scratch_hint())
+        self.refresh_merge_scratch_hint()
+
         # 编译并发：切片 / 完整性校验 / 合并（都用同一套"请求值、任务数、可用内存取最小"）
         self.clip_parallel = tk.IntVar(value=CLIP_PARALLEL_DEFAULT)
         self.integrity_parallel = tk.IntVar(value=INTEGRITY_PARALLEL_DEFAULT)
         self.merge_parallel = tk.IntVar(value=MERGE_PARALLEL_DEFAULT)
-        for attribute, label, hint in (
-            ("clip_parallel_spinbox", "Parallel Clip Writes:", CLIP_PARALLEL_TOOLTIP_TEXT),
-            ("integrity_parallel_spinbox", "Parallel Verification:", INTEGRITY_PARALLEL_TOOLTIP_TEXT),
-            ("merge_parallel_spinbox", "Parallel Merge Tasks:", MERGE_PARALLEL_TOOLTIP_TEXT),
+        for attribute, label, hint, lower, upper in (
+            ("clip_parallel_spinbox", "Parallel Clip Writes:", CLIP_PARALLEL_TOOLTIP_TEXT,
+             CLIP_PARALLEL_MIN, CLIP_PARALLEL_MAX),
+            ("integrity_parallel_spinbox", "Parallel Verification:",
+             INTEGRITY_PARALLEL_TOOLTIP_TEXT, INTEGRITY_PARALLEL_MIN, INTEGRITY_PARALLEL_MAX),
+            ("merge_parallel_spinbox", "Parallel Merge Tasks:", MERGE_PARALLEL_TOOLTIP_TEXT,
+             MERGE_PARALLEL_MIN, MERGE_PARALLEL_MAX),
         ):
             row = ttk.Frame(self.checkbox_frame)
             row.pack(anchor=tk.W, pady=(4, 0))
@@ -4946,7 +5020,10 @@ class VideoProcessorApp:
             variable = {"clip_parallel_spinbox": self.clip_parallel,
                         "integrity_parallel_spinbox": self.integrity_parallel,
                         "merge_parallel_spinbox": self.merge_parallel}[attribute]
-            spinbox = ttk.Spinbox(row, from_=1, to=4, width=5, textvariable=variable)
+            # 每个旋钮用自己的上下限：合并是 1-3（见 MERGE_PARALLEL_MAX 的注释），
+            # 切分与校验每任务只预留 400/300 MB，4 个是有意义的。
+            spinbox = ttk.Spinbox(row, from_=lower, to=upper, width=5,
+                                  textvariable=variable)
             spinbox.pack(side=tk.LEFT, padx=(6, 0))
             setattr(self, attribute, spinbox)
             setattr(self, attribute.replace("_spinbox", "_tooltip"),
@@ -5263,6 +5340,9 @@ class VideoProcessorApp:
             self.clip_parallel_spinbox,
             self.integrity_parallel_spinbox,
             self.merge_parallel_spinbox,
+            self.merge_scratch_entry,
+            self.merge_scratch_choose_button,
+            self.merge_scratch_reset_button,
             self.output_location_button,
             self.normalize_audio_checkbox,
             self.toggle_button,
@@ -6286,7 +6366,8 @@ class VideoProcessorApp:
             elif isinstance(v, tk.StringVar):
                 preset[attr] = v.get()
         # remove transient/state vars
-        for k in ['active_thread', 'thread_active', 'remote_cache_size']:
+        for k in ['active_thread', 'thread_active', 'remote_cache_size',
+                  'merge_scratch_hint']:
             preset.pop(k, None)
         return preset
 
@@ -6394,6 +6475,40 @@ class VideoProcessorApp:
         self.remote_cache_path.set(str(store.root))
         self.save_settings()
         self.refresh_remote_cache_size()
+
+    def refresh_merge_scratch_hint(self):
+        """告诉用户合并中间产物实际会落在哪里，以及目录被删掉时会发生什么。
+
+        空设置 = 系统临时目录；填了目录就在下次编译时创建并使用它（删掉也一样会被
+        重建），只有"创建不出来"时才会退回系统临时目录——所以这里把那两种情况分开写。
+        """
+        chosen = (self.merge_scratch_dir.get() or "").strip()
+        system_temp = tempfile.gettempdir()
+        if not chosen:
+            note = f"Using the system temp folder: {system_temp}"
+        elif os.path.isdir(chosen):
+            note = f"Scratch folder in use: {chosen}"
+        elif os.path.exists(chosen):
+            note = (f"{chosen} is a file, not a folder - the system temp folder "
+                    f"({system_temp}) will be used")
+        else:
+            note = (f"Scratch folder: {chosen} (created on the next compile; the "
+                    f"system temp folder is used if it cannot be created)")
+        self.merge_scratch_hint.set(note)
+
+    def choose_merge_scratch_dir(self):
+        selected_path = filedialog.askdirectory(title="Choose Merge Scratch Folder")
+        if not selected_path:
+            return
+        self.merge_scratch_dir.set(selected_path)
+        self.save_settings()
+        self.refresh_merge_scratch_hint()
+
+    def reset_merge_scratch_dir(self):
+        """清空设置 = 回到系统临时目录。"""
+        self.merge_scratch_dir.set("")
+        self.save_settings()
+        self.refresh_merge_scratch_hint()
 
     def import_external_audio(self):
         if self._external_audio_import_active:
@@ -7040,6 +7155,8 @@ class VideoProcessorApp:
             "Settings", "output_text_path", self.output_text_path.get())
         self.preferences.set(
             "Settings", "remote_cache_path", str(self.remote_cache_store.root))
+        self.preferences.set(
+            "Settings", "merge_scratch_dir", self.merge_scratch_dir.get())
         self.preferences.set(
             "Settings", "timestamps_load_preference",
             self.timestamps_load_preference.get() or "ask")
@@ -8076,6 +8193,7 @@ class VideoProcessorApp:
                     max_parallel=self.merge_parallel.get(),
                     clip_parallel=self.clip_parallel.get(),
                     integrity_parallel=self.integrity_parallel.get(),
+                    scratch_dir=self.merge_scratch_dir.get(),
                     output_fps=output_fps_choice(self.output_frame_rate.get()))
                     except Exception as exc:
                         raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
@@ -8498,6 +8616,7 @@ class VideoProcessorApp:
                     max_parallel=self.merge_parallel.get(),
                     clip_parallel=self.clip_parallel.get(),
                     integrity_parallel=self.integrity_parallel.get(),
+                    scratch_dir=self.merge_scratch_dir.get(),
                     output_fps=output_fps_choice(self.output_frame_rate.get()))
                 except Exception as exc:
                     raise Exception(f"{_compile_failure_label(compile_entries)}: {exc}") from exc
