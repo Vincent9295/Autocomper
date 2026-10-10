@@ -21,15 +21,20 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat. |
 | **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
 | **Output Frame Rate** | Choose **Auto (60/30)**, **30 fps**, or **60 fps** next to the Process Videos button. Auto follows the batch: mostly-60fps material (typical for YouTube/Twitch) is delivered at 60fps with every frame kept, anything else stays at 30fps. 30fps output (what earlier versions always did) drops half the frames of a 60fps source; 60fps output costs ~30% more encode time but does not enlarge the file. Saved in settings. |
+| **Pause / Resume** | A **Pause** button next to **Process Videos** (the icon turns into a play button) stops a run without cancelling it, then continues it from the same place when you press it again. It pauses between steps: the clip download, clip cut, integrity check, merge batch or detection block already in flight finishes first, and **Cancel** still works instantly while paused. The final merge cannot be interrupted (it is one FFmpeg pass over the whole film), so a pause asked for during it takes effect when that pass ends. While paused the app keeps its memory and its temporary files, and closing it still loses the compile work, exactly like Cancel. See [Pausing a Run](#pausing-a-run). |
 | **Remote VOD Processing** | Process Bilibili, YouTube, and Twitch VODs from remote audio; fetch only selected video segments. |
 | **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
 | **Compile Progress Monitoring** | Live remote clip preparation, FFmpeg encoding progress, merge progress, speed, and ETA. |
 | **Max Download Concurrency** | Control how many remote clips are fetched at once while preparing a compilation (default 5). |
 | **Fixed Timestamps Files** | Timestamps are always saved as fixed names — `timestamps.txt` (detection), with re-verify writing `timestamps_reverified.txt` and review writing `timestamps_selected.txt`. Each is overwritten per run, so nothing piles up across videos. |
-| **Merge Batch Size** | Adjust how many clips each FFmpeg merge batch combines before the final concat. Lower it for laptops/weak CPUs; higher is faster on strong machines. |
+| **Merge Batch Size** | Adjust how many clips each FFmpeg merge batch combines before the final concat. Lower it for laptops/weak CPUs; higher is faster on strong machines. Default 6, range 2-50. |
+| **Parallelism Controls** | Three independent knobs for the compile: **Parallel Clip Writes** (how many clips are cut at once), **Parallel Verification** (how many clips the integrity pass re-reads at once) and **Parallel Merge Tasks** (how many merge batches *within one layer* run at once). All three default to 1, which reproduces the old serial behaviour. Each one is a request: AutoComper lowers it automatically when free memory is tight and prints the number it actually used. See [Parallelism and Memory](#parallelism-and-memory). |
+| **Merge Scratch Folder** | Chooses the drive used for a merge's intermediate files (default: the system temp folder). Point it at the same fast drive as your output when the system drive is small or slow. The folder is only used while a compilation runs, and each layer's files are deleted as soon as the next layer has been written. |
+| **Merge Disk Headroom** | Before every merge layer, AutoComper checks the free space the remaining layers still need and stops with a clear message instead of filling the drive. Releasing each layer's inputs keeps peak usage at two layers instead of every intermediate at once, which is what makes compilations of several thousand clips fit on a normal drive. |
 | **Import URLs from Timestamps .txt** | The **Add Media** menu can queue every URL listed in an existing timestamps file. Each section title in that file is the source of one video, so a batch can be rebuilt without pasting URLs again. Titles that are neither a URL nor a media file path, files that no longer exist, and entries already in the list are skipped (and counted in the log). |
 | **Rate-Limit Pause and Retry** | If the platform rate-limits source resolving (YouTube bot check, HTTP 429, Bilibili 412), AutoComper offers to wait 5/15/30 minutes and then retries **only** the sources that failed. The countdown is shown in the progress panel and can be cancelled with Stop. |
 | **Shorter-Clip Warnings** | Clips that end up shorter than requested are no longer silent: a remote segment that arrives short is fetched again under the normal retry policy, and a remaining shortfall (or padding clipped by a clip next to it) is reported in a summary line. |
+| **Media List Sorting** | The **Sort** button orders the list the way a batch is normally watched: it recognises more date formats in file names and titles, falls back to the stream date inside the title when the name has none, and keeps the parts of one stream together and in order. |
 | **Improved UI** | Scrollable settings panel, stable Settings layout, clearer remote clip progress, and repositioned tooltips. |
 
 ### Technical Improvements vs. the Original
@@ -41,7 +46,7 @@ The following are improvements in this Enhanced version compared with the origin
 | **Video pipeline** | MoviePy (`libx264` CPU) | Native FFmpeg subprocess (`h264_nvenc` GPU) |
 | **Inference** | `onnxruntime` (CPU) | `onnxruntime-gpu` (CUDA) — falls back to CPU automatically; **CPU/GPU toggle** for quiet overnight runs |
 | **Audio loading** | `list()` full memory load | Streaming generator + LRU cache |
-| **Frame rate** | Inherit from source | **Auto (60/30 fps)**, or fixed **30 / 60 fps** — the output grid is always explicit (a mixed-rate batch with no explicit rate collapses to 25fps) |
+| **Frame rate** | Inherit from source | **Auto (60/30 fps)**, or fixed **30 / 60 fps** — the output grid is always explicit: Auto picks 60 only when most clips really run above 48 fps, and everything else (23.976, 25, 29.97, and mixed batches) stays at 30 |
 | **Audio sample rate** | Variable | Fixed **44100 Hz** output |
 | **Concat method** | Concat demuxer (timestamp bugs) | Concat **filter** (frame-level, no drift) |
 | **Mixed resolutions** | Not handled | Auto-detect → scale/pad all to mode resolution |
@@ -49,7 +54,7 @@ The following are improvements in this Enhanced version compared with the origin
 | **Stereo input** | Left channel only | **50/50 L+R mix** |
 | **Re-verify** | None | DRC **+8dB**, scans ±5s around each clip, min confidence **0.40**, >0.75 direct accept, argmax gate + margin + energy floor on mid-score hits |
 | **False positives** | None | Optional **Strict FP filter** (drop clips where burp isn't the top class); suspect clips pre-deselected in Review |
-| **Memory** | Unbounded | `-threads 2`, batched concat (6 files/batch), segment-by-segment encoding |
+| **Memory** | Unbounded | `-threads 2`, batched concat (6 files/batch by default, 2-50), segment-by-segment encoding, and every parallel stage sized from the free memory at the moment it starts: a merge task reserves `max(900, 600 + 120 × batch)` MB, at most 3 run at once, and only half of the free RAM is ever spent |
 
 ---
 
@@ -82,6 +87,14 @@ python setup.py build
 ```
 
 The executable is at `build/exe.win-*/autocomper.exe`. Copy `ffmpeg/`, `img/`, and `models/` into the build directory.
+
+For a release-style build (frozen exe with `ffmpeg/`, `img/` and `models/` bundled, then a validated target folder) use the packaging entry point instead:
+
+```powershell
+python package_windows.py --target .\dist
+```
+
+It refuses to overwrite a package that is currently running, and `--no-kill` / `--preserve-user` exist for local testing.
 
 ---
 
@@ -116,7 +129,43 @@ If CUDA isn't installed, the app falls back to CPU automatically.
 5. **Optional: Re-verify** — rescan near detected clips to catch missed sounds.
 6. **Optional: Review** — preview and check/uncheck every clip before compiling. Remote video previews are fetched on demand.
 7. **Select Output File** — choose where to save the compiled video(s).
-8. **Process Videos** — compile!
+8. **Process Videos** — compile! The **Pause** button next to it can stop the run without cancelling it (see below).
+
+### Pausing a Run
+
+The **Pause** button sits between **Process Videos** and the stop button. Press it and the run stops taking on new work instead of being cancelled, so nothing you have already waited for is thrown away. The button turns into a play icon, and pressing it again resumes from the same place. The app's status line reports `Pausing...` while the current step finishes and `Paused.` once the run has actually stopped.
+
+A pause takes effect at a **step boundary**, so whatever is already in flight is allowed to finish first:
+
+- one clip download, or one clip cut (seconds);
+- one integrity check (seconds);
+- one merge batch (tens of seconds);
+- one detection block, about ten seconds of audio (about a second of work).
+
+Two things it deliberately cannot do, because killing a child process mid-write is how files get corrupted and how a healthy FFmpeg gets mistaken for a stalled one:
+
+- it cannot interrupt the **final merge**, which is a single FFmpeg pass over the whole film, so a pause asked for during it takes effect when that pass ends;
+- it cannot interrupt a download that is already running in **Full Download** or a segment being fetched. It does stop the *next* one from starting.
+
+While paused, AutoComper keeps its memory (the detection model and the caches stay loaded) and its temporary merge files on disk, so a pause is not the same as freeing the machine. Closing the app while paused loses the compile work, exactly like Cancel. **Cancel** stays usable at all times and always wins: pressing it while paused stops the run immediately.
+
+### Parallelism and Memory
+
+Three settings decide how much of the compile runs at once. They are independent, they all default to 1 (the original serial behaviour), and each one is only a *request*: AutoComper looks at the free memory when a stage starts and quietly uses fewer workers when the machine cannot afford them, printing the number it chose in the log.
+
+| Setting | What it parallelises | Cap | Memory per task |
+|---------|----------------------|-----|-----------------|
+| **Parallel Clip Writes** | cutting the selected clips into clip files | 4 | about 400 MB |
+| **Parallel Verification** | the integrity pass that re-reads every clip | 4 | about 300 MB |
+| **Parallel Merge Tasks** | merge batches *within one layer* of the final merge | 3 | `max(900, 600 + 120 × Merge Batch Size)` MB, and only half of the free memory is ever spent |
+
+Only the merge is expensive, because each task is one FFmpeg process that decodes a whole batch into a single filter graph. Measured on a real 1080p30 project, one such process commits about 1.1 GB at batch 6, 1.4 GB at batch 10 and 2.3 GB at batch 20. That is also why **Merge Batch Size** and **Parallel Merge Tasks** multiply: batch 10 with 3 tasks asks for about 5.4 GB before the app lowers it.
+
+Rules of thumb:
+
+- **8 GB of RAM:** keep **Merge Batch Size 10** and **Parallel Merge Tasks 1**. Raising the batch size past roughly 12, or the merge tasks past 1, is where memory pressure starts to be felt on such a machine.
+- **32 GB and up:** **Parallel Merge Tasks 2-3** is where a long merge gets noticeably faster.
+- Want more speed on a small machine without touching the merge? Raise **Parallel Clip Writes** and **Parallel Verification** first; together they cost a few hundred MB per task.
 
 ### Remote VOD Notes
 

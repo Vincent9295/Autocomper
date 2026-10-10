@@ -15,7 +15,7 @@ from typing import Generator, Any, Dict, Tuple
 from collections import OrderedDict
 
 from utils import (FFMPEG_PATH, run_tracked, register_proc, unregister_proc,
-                   is_twitch_platform)
+                   is_twitch_platform, pause_or_cancel)
 from proglog import default_bar_logger
 from remote_media import MediaSource, stable_source_id
 from remote_prefetch import (
@@ -976,6 +976,11 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         for block_index, block in enumerate(blocks, 1):
             if block_index <= resumed_blocks:
                 continue          # 已完成的块：音频照读（要按序解码），但不重复推理
+            # 任务边界（按块）：暂停在这里等待，取消优先。这一刻没有子进程正在被
+            # 读取——音频预读线程最多再往前读一块就会阻塞在有界队列上，所以不会
+            # 触发"长时间无输出"看门狗；暂停期间这一块只被取出、尚未推理。
+            if pause_or_cancel():
+                raise InterruptedError("Detection cancelled by user.")
             processed_blocks = block_index
             if wav_file is not None:
                 wav_file.write(block)

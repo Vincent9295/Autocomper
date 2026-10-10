@@ -20,7 +20,7 @@ from colorama import Fore, Style
 
 from progress import format_compile_progress
 from utils import (FFMPEG_PATH, run_tracked, run_tracked_progress,
-                   cancel_pending)
+                   cancel_pending, pause_or_cancel)
 import sys
 import os
 
@@ -910,7 +910,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         except subprocess.TimeoutExpired as exc:
             # 真超时或"进度不前进"卡死：NVENC 时回退 x264 重试一次
             # （ProgressStallTimeout 是 TimeoutExpired 子类，同样走这里）。
-            if cancel_pending():
+            # 上一次尝试已经结束，这里是任务边界：暂停在此等待，取消优先。
+            if pause_or_cancel(cancel_pending):
                 raise InterruptedError("Compile cancelled by user.")
             if 'h264_nvenc' not in video_codec:
                 raise
@@ -932,7 +933,7 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
             # 提示是误导，而且不重试会白扔一个 clip。这里按卡死处理。
             # 惰性导入避免模块级循环依赖。
             from sound_reader import RemoteAudioStallError
-            if (not isinstance(exc, RemoteAudioStallError) or cancel_pending()
+            if (not isinstance(exc, RemoteAudioStallError) or pause_or_cancel(cancel_pending)
                     or 'h264_nvenc' not in video_codec):
                 raise
             print(f"{Fore.YELLOW}Clip encode produced no output ({exc}); "
@@ -948,7 +949,8 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
         if result.returncode != 0 and 'h264_nvenc' in video_codec:
             # 取消导致的 rc!=0 不是 NVENC 故障：不能触发 x264 回退重试，
             # 否则取消后编译会以 CPU 编码继续跑完（用户报告的假取消）。
-            if cancel_pending():
+            # 暂停同样在这里等（重试是一次新的编码，不该在暂停时启动）。
+            if pause_or_cancel(cancel_pending):
                 raise InterruptedError("Compile cancelled by user.")
             _fallback_to_x264()
             codec = list(_X264_CODEC)
@@ -1119,7 +1121,8 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
         result = None
     if result is None or (result.returncode != 0 and 'h264_nvenc' in video_codec):
         # 同上：取消导致的失败不是 NVENC 故障，禁止整段合并的 x264 重试。
-        if cancel_pending():
+        # 上一次编码已经结束，这里是任务边界，暂停在此等待。
+        if pause_or_cancel(cancel_pending):
             raise InterruptedError("Compile cancelled by user.")
         _fallback_to_x264()
         result = _run_ffmpeg(build_cmd(list(_X264_CODEC)), timeout=concat_timeout,
@@ -1416,7 +1419,8 @@ def _run_parallel(tasks, worker, requested, per_worker_mb, label, progress_note=
     if workers <= 1:
         failures = []
         for task in tasks:
-            if cancel_pending():
+            # 任务边界：暂停在这里等待（没有任何子进程在跑），取消优先。
+            if pause_or_cancel(cancel_pending):
                 raise InterruptedError("Compile cancelled by user.")
             try:
                 worker(task)
@@ -1430,6 +1434,10 @@ def _run_parallel(tasks, worker, requested, per_worker_mb, label, progress_note=
     progress_lock = threading.Lock()
 
     def wrapped(task):
+        # 每个任务开始前是任务边界：此刻没有子进程在跑，所以暂停可以安全地等在这里。
+        # 绝不能在 ffmpeg 运行期间等待——30s 无输出的看门狗会把它当成卡死杀掉。
+        if pause_or_cancel(cancel_pending):
+            raise InterruptedError("Compile cancelled by user.")
         if progress_callback is not None and progress_note is not None:
             with progress_lock:
                 progress_callback(progress_note())

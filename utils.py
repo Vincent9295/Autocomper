@@ -71,16 +71,121 @@ def request_cancel():
 
 
 def cancel_clear():
-    """Clear the cooperative cancellation flag for a fresh run."""
-    global _cancel_requested
+    """Clear the cooperative flags for a fresh run.
+
+    Also clears pause: a stale pause flag would hang the next run at its first task
+    boundary, which is a much worse failure than a forgotten flag.
+    """
+    global _cancel_requested, _pause_requested, _paused_now
     with _cancel_lock:
         _cancel_requested = False
+    with _pause_lock:
+        _pause_requested = False
+        _paused_now = False
+    _resume_event.set()
 
 
 def cancel_pending():
     """Whether a cancel was requested (thread-safe read)."""
     with _cancel_lock:
         return _cancel_requested
+
+
+# ── Pause ─────────────────────────────────────────────────────────────────────
+# A pause is cooperative and only ever takes effect at a **task boundary**: the unit of
+# work in flight (one clip download, one segment cut, one merge batch, one detection
+# block) finishes first, then the run blocks before starting the next one. It is never
+# applied while a child process is running, so no stall watchdog can ever see a silent
+# ffmpeg. Nothing is killed and no state is written differently, which is why a pause
+# cannot change what a finished film contains.
+#
+# What it cannot do: interrupt a single long ffmpeg call. The merge's final
+# concatenation is one call over the whole film, so a pause requested during it only
+# takes effect when that call ends.
+_pause_requested = False
+_paused_now = False                 # True only while a worker is blocked in the wait
+_pause_lock = threading.Lock()
+_resume_event = threading.Event()
+_resume_event.set()                 # set = allowed to run
+
+
+def request_pause():
+    """Ask the running job to stop at the next task boundary."""
+    global _pause_requested
+    with _pause_lock:
+        _pause_requested = True
+    _resume_event.clear()
+
+
+def request_resume():
+    """Undo a pause (or a not-yet-effective pause request) and let the run continue."""
+    global _pause_requested
+    with _pause_lock:
+        _pause_requested = False
+    _resume_event.set()
+
+
+def pause_pending():
+    """Whether a pause was requested (thread-safe read)."""
+    with _pause_lock:
+        return _pause_requested
+
+
+def paused_now():
+    """Whether a worker is actually blocked in the pause wait right now.
+
+    The UI uses this to tell "pausing, waiting for the current step" from "paused".
+    """
+    with _pause_lock:
+        return _paused_now
+
+
+def pause_clear():
+    """Forget the pause state (a fresh run starts unpaused)."""
+    global _pause_requested, _paused_now
+    with _pause_lock:
+        _pause_requested = False
+        _paused_now = False
+    _resume_event.set()
+
+
+def wait_while_paused(cancel_check=None, poll_seconds=0.25) -> bool:
+    """Block while a pause is requested.
+
+    Returns True when the run may continue, False when a cancel arrived instead (cancel
+    always beats pause). Only call this at a task boundary - never while a child
+    process is running.
+    """
+    global _paused_now
+    check = cancel_check or cancel_pending
+    if not pause_pending():
+        return not check()
+    with _pause_lock:
+        _paused_now = True
+    try:
+        while pause_pending():
+            if check():
+                return False
+            _resume_event.wait(poll_seconds if poll_seconds else 0.25)
+        return not check()
+    finally:
+        with _pause_lock:
+            _paused_now = False
+
+
+def pause_or_cancel(cancel_check=None) -> bool:
+    """Drop-in for ``cancel_pending()`` at the existing check sites.
+
+    Waits while the run is paused, then reports whether the run must stop, so every
+    caller keeps its current polarity (True = stop).
+    """
+    check = cancel_check or cancel_pending
+    while True:
+        if check():
+            return True
+        if not pause_pending():
+            return False
+        wait_while_paused(cancel_check=check)
 
 
 class InsufficientDiskSpaceError(RuntimeError):

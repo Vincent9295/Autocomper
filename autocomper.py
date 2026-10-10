@@ -100,6 +100,8 @@ from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
                      cancel_clear, cancel_pending, convert_quality_str_to_int,
                      download_audio, download_video, get_bundle_filepath,
                      kill_tracked_procs, request_cancel, run_tracked,
+                     pause_clear, pause_or_cancel, pause_pending, paused_now,
+                     request_pause, request_resume,
                      run_tracked_progress, check_compile_disk_space,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
@@ -242,6 +244,18 @@ MERGE_SCRATCH_TOOLTIP_TEXT = (
     "about two layers instead of one layer per merge pass for the whole run."
 )
 MERGE_SCRATCH_DEFAULT = ""
+PAUSE_TOOLTIP_TEXT = (
+    "Pause the running job instead of cancelling it.\n"
+    "The step already in progress finishes first (one clip download, one segment cut,\n"
+    "one merge batch, one detection block), then the run waits until you press Resume.\n"
+    "Nothing is killed and nothing is written differently, so a pause cannot change\n"
+    "what ends up in the finished film.\n\n"
+    "What it cannot do: interrupt the final merge, which is a single FFmpeg pass over\n"
+    "the whole film. A pause during that pass only takes effect when it ends, which on\n"
+    "a long film can be hours.\n\n"
+    "While paused, AutoComper keeps its memory and its temporary files, and closing the\n"
+    "app still loses the compile work (same as Cancel)."
+)
 # ── 编译阶段的三个并发旋钮（各自独立，默认 1 = 与旧版逐字节相同的行为）──
 # 实测（用户 2292 片段、约 3 小时成片）：切片 1 小时、完整性校验 1 小时、最终合并 2 小时。
 # 切片与校验的任务互相独立、内存占用小，是最值得并行的一段；合并那一段受内存限制最大。
@@ -1417,6 +1431,10 @@ def resolve_remote_uploads(
                 f"fail to fetch. Re-run later if that happens.{Style.RESET_ALL}")
 
     for upload in uploaded_videos:
+        # 任务边界（每个源解析之前）：暂停在这里等待，取消优先。解析发生在下一个
+        # 源的元数据抓取开始之前，此刻没有子进程在跑。
+        if pause_or_cancel(cancel_check):
+            raise InterruptedError("Resolve cancelled by user.")
         if not upload.get_is_url():
             local_entries.append(upload)
             continue
@@ -1647,6 +1665,9 @@ def refresh_stale_remote_sources(entries, refresh_func, label="Videos"):
     print(f"{Fore.CYAN}Refreshing {len(stale_sources)} {label} "
           f"source(s), please be patient...")
     for source in stale_sources:
+        # 任务边界（每个源刷新之前）：暂停在这里等待，取消优先；此刻没有子进程在跑。
+        if pause_or_cancel(cancel_pending):
+            raise InterruptedError("Source refresh cancelled by user.")
         try:
             updated = refresh_func(source)
             if isinstance(updated, MediaSource) and updated is not source:
@@ -1896,7 +1917,8 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
         (entry_index, interval_index, source, start, end, output,
          clip_index, clips_total, video_index, duration, pred) = task
         in_flight_key = (entry_index, interval_index)
-        if cancel_pending():
+        # 任务边界（每个片段下载之前）：暂停在这里等待，取消优先。
+        if pause_or_cancel(cancel_pending):
             # 取消后不要再为排队中的任务启动 ffmpeg：让线程池的队列瞬间排空，
             # 否则每个任务都要"启动进程→被 kill"走一遍，旧线程迟迟不退出。
             return fail_task(task, InterruptedError("Operation cancelled by user."))
@@ -3356,7 +3378,8 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 new_timestamps = []
                 window_total = len(scan_windows)
                 for window_index, (ws, we) in enumerate(scan_windows):
-                    if cancel_pending():
+                    # 任务边界（每个校验窗口取音频之前）：暂停在这里等待，取消优先。
+                    if pause_or_cancel(cancel_pending):
                         raise InterruptedError("Verify cancelled by user.")
                     print(
                         f"{Fore.CYAN}Verification: fetching audio "
@@ -5196,9 +5219,22 @@ class VideoProcessorApp:
         self.process_cancel_frame.pack()
 
         # Process Video Button
+        # 宽度从 30 收到 22，给旁边的 Pause 图标键腾出位置（右列固定 400px，
+        # 三颗键加起来仍远小于它）。
         self.process_button = ttk.Button(
-            self.process_cancel_frame, text='Process Videos', width=30, padding=4.5, command=self.process_videos_multi)
+            self.process_cancel_frame, text='Process Videos', width=22, padding=4.5, command=self.process_videos_multi)
         self.process_button.grid(row=0, column=0, pady=(5, 20), padx=(0, 2.5))
+
+        # Pause / Resume Button (icon only, same style as the stop button)
+        self.pause_photo = get_photo_icon(os.path.join("img", "pause.png"))
+        self.resume_photo = get_photo_icon(os.path.join("img", "resume.png"))
+        self.pause_button = ttk.Button(
+            self.process_cancel_frame, image=self.pause_photo, width=5, padding=0,
+            command=self.toggle_pause_run)
+        self.pause_button.image = self.pause_photo
+        self.pause_button.grid(row=0, column=1, pady=(5, 20), padx=(2.5, 2.5))
+        self.pause_button["state"] = tk.DISABLED
+        self.pause_tooltip = CustomHovertip(self.pause_button, PAUSE_TOOLTIP_TEXT)
 
         # Cancel Button
         stop_photo = get_photo_icon(os.path.join("img", "stop.png"))
@@ -5207,7 +5243,7 @@ class VideoProcessorApp:
             self.process_cancel_frame, image=stop_photo, width=5, padding=0, command=self.confirm_stop_process)
         self.cancel_button.image = stop_photo
 
-        self.cancel_button.grid(row=0, column=1, pady=(5, 20), padx=(2.5, 0))
+        self.cancel_button.grid(row=0, column=2, pady=(5, 20), padx=(2.5, 0))
 
         self.cancel_button["state"] = tk.DISABLED
 
@@ -5373,7 +5409,8 @@ class VideoProcessorApp:
         ]
         
         self.enable_while_processing = [
-            self.cancel_button
+            self.cancel_button,
+            self.pause_button
         ]
 
         self._refresh_preset_combo()
@@ -5397,6 +5434,8 @@ class VideoProcessorApp:
         # 模态框会 wait_window），排在后面的 UI 更新（比如 Stop 后的
         # "Cancelling..."）就永远轮不到，界面看起来像卡死。
         self.root.after(50, self._poll_ui)
+        # 暂停按钮的两态（暂停/继续）只需在状态变化时重画，所以放在轮询里最省。
+        self._refresh_pause_controls()
         # 单轮最多处理有限条 UI 更新，避免一次性排空大量积压事件
         # 阻塞主线程事件循环导致窗口假死（与 StdoutRedirector 的渲染上限对齐）。
         processed = 0
@@ -6327,6 +6366,13 @@ class VideoProcessorApp:
 
     def _on_drop(self, event):
         """Handle drag-and-drop of video files."""
+        if self.is_thread_active():
+            # 运行中改列表是危险的：下面会按路径重排整个列表，而 Full Download 阶段
+            # 是**按下标**改条目的（self.uploaded_videos[i].set_path(...)）。列表若被
+            # 手动调过顺序，重排会让下标错位，把下载好的路径写到错误的条目上。
+            print(f"{Fore.YELLOW}Ignoring the dropped file(s): a job is running. "
+                  f"Add them once it finishes.{Style.RESET_ALL}")
+            return
         files = self.root.tk.splitlist(event.data)
         for f in files:
             video_exts = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')
@@ -6841,7 +6887,10 @@ class VideoProcessorApp:
                 "The previous run is still shutting down. Please wait a few "
                 "seconds and press Process again.")
             return
-        cancel_clear()
+        # 新一轮必须同时清掉暂停：留着一个旧暂停标志会让它卡在第一个任务边界。
+        cancel_clear()          # 内部也会清暂停并恢复 resume 事件
+        pause_clear()
+        self._pause_ui_state = None
         self.active_thread = KThread(target=self.process_videos)
         # daemon：用户取消/关闭后线程即使卡在 C 层阻塞（如 communicate），
         # 主进程也能退出，不再留下僵尸 autocomper.exe + ffmpeg。
@@ -6851,20 +6900,70 @@ class VideoProcessorApp:
     def is_thread_active(self):
         return type(self.active_thread) is KThread and self.active_thread.is_alive()
 
+    def toggle_pause_run(self):
+        """Pause the running job, or resume it. The button's icon shows which one it does."""
+        if not self.is_thread_active():
+            return
+        if pause_pending():
+            request_resume()
+            print(f"{Fore.CYAN}Resuming...{Style.RESET_ALL}")
+        else:
+            request_pause()
+            print(f"{Fore.CYAN}Pausing: the step in progress finishes first, then the "
+                  f"run waits. Press Resume to continue.{Style.RESET_ALL}")
+        self._pause_ui_state = None            # force the poll to repaint the button
+        self._refresh_pause_controls()
+
+    def _refresh_pause_controls(self):
+        """Keep the Pause/Resume button in step with the run (cheap; called by the poll)."""
+        if not hasattr(self, "pause_button"):
+            return
+        if not self.is_thread_active():
+            state = "idle"
+        elif paused_now():
+            state = "paused"
+        elif pause_pending():
+            state = "pausing"
+        else:
+            state = "running"
+        if state == getattr(self, "_pause_ui_state", None):
+            return                             # only touch Tk when something changed
+        self._pause_ui_state = state
+        try:
+            if state in ("paused", "pausing"):
+                self.pause_button.configure(image=self.resume_photo)
+            else:
+                self.pause_button.configure(image=self.pause_photo)
+        except tk.TclError:
+            return
+        if state == "paused":
+            print(f"{Fore.CYAN}Paused. Press Resume (or Cancel) to continue."
+                  f"{Style.RESET_ALL}")
+        elif state == "running" and getattr(self, "_pause_ui_state_was_paused", False):
+            print(f"{Fore.CYAN}Run resumed.{Style.RESET_ALL}")
+        self._pause_ui_state_was_paused = state in ("paused", "pausing")
+
     def confirm_stop_process(self):
         # Check if there is a thread running
         if not self.is_thread_active():
             messagebox.showerror("Error", "No process is currently running!")
             return False
         else:
-            confirm = messagebox.askyesno("Confirm Cancellation",
-                                          f"The current job will be cancelled, losing all progress. Would you like to cancel?")
+            confirm = messagebox.askyesno(
+                "Confirm Cancellation",
+                "The paused job will be cancelled, losing all progress. Would you like "
+                "to cancel?" if paused_now() else
+                "The current job will be cancelled, losing all progress. Would you like "
+                "to cancel?")
             if confirm:
                 try:
                     # 先置合作式取消标志：run_tracked/run_tracked_progress 与
                     # compile 的 executor 会在下一个循环立即 kill/停止排队，
                     # 不再依赖 KThread.terminate（它对 C 层阻塞的线程无效）。
                     request_cancel()
+                    # 再放掉暂停：卡在暂停等待里的 worker 立刻醒来，看到取消标志后
+                    # 退出（取消优先），不用等一个轮询周期。
+                    request_resume()
                     kill_tracked_procs()
                     self.active_thread.terminate()
                 finally:
@@ -7497,6 +7596,12 @@ class VideoProcessorApp:
             if not video.get_is_url():
                 print(f"{Fore.YELLOW}Not a URL, skipping...")
                 continue
+
+            # 任务边界（每个 URL 开始下载之前）：暂停在这里等待，取消优先。这一阶段
+            # 一个单位就是一整支 VOD，所以这里是"暂停后不再开始下一个下载"的唯一位置；
+            # 已经在下载的那个文件不会被打断（绝不在子进程运行时等待）。
+            if pause_or_cancel(cancel_pending):
+                raise InterruptedError("Operation cancelled by user.")
 
             if video.get_source() is None:
                 try:
@@ -8221,6 +8326,10 @@ class VideoProcessorApp:
                 def run_detection(upload, i):
                     """Run detection for one upload; returns True on success."""
                     nonlocal vids_with_clips
+                    # 任务边界（按源）：暂停在这里等待，取消优先。检测内部的按块暂停
+                    # 在 sound_reader 的块循环里，粒度约一块音频。
+                    if pause_or_cancel(cancel_pending):
+                        raise InterruptedError("Detection cancelled by user.")
                     input_video_path = remote_detection_input(
                         upload, self.remote_mode.get(), audio_cache_paths
                     )
@@ -8287,6 +8396,10 @@ class VideoProcessorApp:
                                                  precision, current_block_size, threshold,
                                                  focus_idx, selected_model, str(exc))
                         return False
+                    except InterruptedError:
+                        # 取消（含"暂停后被取消"）必须冒泡：被下面的宽泛 except 吞掉
+                        # 会把这个源记成"失败"、写进检测失败缓存，还会让整批继续跑下去。
+                        raise
                     except Exception as exc:
                         if isinstance(input_video_path, MediaSource):
                             failure = f"{get_source_display_name(input_video_path)}: {exc}"
@@ -8335,6 +8448,8 @@ class VideoProcessorApp:
                                             f"{get_source_display_name(upload)}",
                                         ),
                                 )
+                            except InterruptedError:
+                                raise       # 取消同样不能被当成"重下后仍失败"
                             except Exception as retry_detect_exc:
                                 print(f"{Fore.YELLOW}  Audio cache re-detect failed after re-download: "
                                       f"{retry_detect_exc}")
