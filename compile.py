@@ -131,9 +131,13 @@ def _ffprobe(input_file: str):
         out = run_tracked([FFMPEG_PATH, '-hide_banner', '-i', input_file,
                            '-probesize', '32M', '-analyzeduration', '100M'],
                           timeout=10, text=True)
-        result = out.stderr or ''
     except Exception:
-        result = ''
+        # 探测失败（超时/进程被杀）**不缓存**：'' 与"探测成功但无输出"无法区分，
+        # 缓存它会让 _get_video_duration/_get_video_size 在整轮编译里静默退化
+        # （时长 None → 不裁到视频轨末尾；尺寸 None → 甚至把有音轨的片段当无音轨
+        # 补静音）。下次调用重试一次，代价只是一个探测进程。
+        return ''
+    result = out.stderr or ''
     _PROBE_CACHE[key] = result
     return result
 
@@ -1010,10 +1014,18 @@ def _ffmpeg_cut(input_file, timestamps, output_file, res=None, normalize=False,
                 f"({len(cut_failures)} failed): {first_error}")
         # 多段合并：产物会继续进入 compile_vid 的最终 concat，必须写 FLAC
         # 音频（AAC 中间产物会让 concat 音频时间线逐边界拉伸 ~20ms）。
+        # release_inputs=True：本分支是唯一漏传该标志的调用点（compile_vid 与
+        # combine_vids 都传了），不传的话每一层 _batchL* 都留到整条链结束，
+        # 峰值变成"层数 × 一份片段"而不是文档写的两层；seg 文件本来就在下面的
+        # finally 里无条件删除，提前回收不会少任何东西。
+        # total_duration 用**已裁剪片段之和**而不是源文件总长：3 小时 VOD 上
+        # 20s 的片段会显示 "0:20 / 3:00:00" 并永远钉在 0%，看起来像卡死。
+        clip_span = sum(e - s for s, e in timestamps)
         _ffmpeg_concat_batched(seg_files, output_file, res=res, normalize=normalize,
                                fps=fps, progress_callback=progress_callback,
-                               total_duration=duration, batch_size=batch_size,
-                               audio_out=_FLAC_AUDIO, max_parallel=merge_parallel)
+                               total_duration=clip_span, batch_size=batch_size,
+                               audio_out=_FLAC_AUDIO, max_parallel=merge_parallel,
+                               release_inputs=True)
     finally:
         for sf in seg_files:
             try:
@@ -1237,22 +1249,83 @@ def _disk_full_hint(text) -> str:
     return ""
 
 
+# 合并工作目录的名字前缀：崩溃 / 任务管理器强杀 / 断电会把它连同里面的
+# _batchL*/_<stem>_segN 一起留在系统 temp 或 Merge Scratch Folder 里，而
+# compile_vid 开头的残留清理只看输出目录，永远扫不到它（1080p 成片的最后一层
+# 通常几十 GB）。带上前缀之后，下一次编译就能认出并回收。
+_MERGE_TEMP_PREFIX = 'autocomper-merge-'
+# 与 utils._sweep_stale_download_temps 同量级：只删"够旧"的目录，正在跑的编译
+# （目录里一直在创建/删除文件，mtime 一直新鲜）绝不会被动到。
+_MERGE_TEMP_MAX_AGE_S = 24 * 3600
+# 本进程正在使用的合并工作目录：即使 mtime 因为长时间没有新文件而变旧也不删。
+_ACTIVE_MERGE_DIRS = set()
+
+
+class _MergeTempDir(tempfile.TemporaryDirectory):
+    """带可识别前缀、并登记为"本进程正在使用"的合并工作目录。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _ACTIVE_MERGE_DIRS.add(os.path.abspath(self.name))
+
+    def cleanup(self):
+        _ACTIVE_MERGE_DIRS.discard(os.path.abspath(self.name))
+        super().cleanup()
+
+
+def _sweep_stale_merge_dirs(*locations, max_age=_MERGE_TEMP_MAX_AGE_S):
+    """删掉上次崩溃/强杀留下的合并工作目录（只删我们自己命名的、且够旧的）。
+
+    目录 mtime 在条目创建/删除时刷新，所以"够旧"就等价于"没有活着的编译在写它"；
+    本进程自己正在用的目录（``_ACTIVE_MERGE_DIRS``）额外跳过。整段逻辑只碰
+    ``_MERGE_TEMP_PREFIX`` 开头的目录，用户自己的文件夹不可能被删。
+    """
+    cutoff = time.time() - max_age
+    seen = set()
+    for location in locations:
+        if not location:
+            continue
+        try:
+            root = os.path.abspath(str(location))
+        except (TypeError, ValueError):
+            continue
+        if root in seen:
+            continue
+        seen.add(root)
+        try:
+            names = os.listdir(root)
+        except OSError:                     # 不存在 / 不是目录 / 没有权限
+            continue
+        for name in names:
+            if not name.startswith(_MERGE_TEMP_PREFIX):
+                continue
+            path = os.path.join(root, name)
+            if os.path.abspath(path) in _ACTIVE_MERGE_DIRS:
+                continue
+            try:
+                if not os.path.isdir(path) or os.path.getmtime(path) >= cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def _open_temp_dir(scratch_dir):
     """合并用的临时工作目录。
 
     默认仍是系统临时目录（行为与以前一致）；设置了 Merge Scratch Folder 时改到该目录，
     让合并的中间产物不再落到系统盘。目录不可用就退回系统临时目录并打印一行——绝不因为
-    一个设置项让编译失败。
+    一个设置项让编译失败。目录名统一带 ``_MERGE_TEMP_PREFIX``，供下次编译回收残留。
     """
     requested = str(scratch_dir or "").strip()
     if requested:
         try:
             os.makedirs(requested, exist_ok=True)
-            return tempfile.TemporaryDirectory(dir=requested)
+            return _MergeTempDir(dir=requested, prefix=_MERGE_TEMP_PREFIX)
         except OSError as exc:
             print(f"{Fore.YELLOW}Merge scratch folder unusable ({requested}): "
                   f"{str(exc)[:200]}; using the system temp folder.{Style.RESET_ALL}")
-    return tempfile.TemporaryDirectory()
+    return _MergeTempDir(prefix=_MERGE_TEMP_PREFIX)
 
 
 def _report_merge_space(file_list, temp_dir, output_file, layers_remaining,
@@ -1735,6 +1808,10 @@ def _ffmpeg_concat_audio(file_list, output_file, normalize=False, progress_callb
 # 判为故障的片段用**本地源文件重切一次**（不碰网络），再测一次；仍不合格就保留
 # 并按"未解决"如实计数，让它出现在编译日志里，而不是静默进成片。
 _INTEGRITY_W, _INTEGRITY_H = 320, 180
+# 注意：这个常数同时是 longest_still_run 解码时的**重采样目标**（下面的 `fps=` 滤镜），
+# 所以"帧数 ÷ _INTEGRITY_FPS"在任何源帧率下都是真实秒数：60fps 输出被 fps 滤镜降到
+# 30fps 再计数，实测 2s 全静止片段 60fps 与 30fps 都得 60 帧 → 2.0s。审计里
+# "60fps 输出把冻结时长报成两倍"不成立，不要改成按实际帧率换算（那才会翻倍）。
 _INTEGRITY_FPS = 30.0
 _INTEGRITY_FRAME_DIFF = 1.0        # 低于此值（0-255 灰度）视为"这一帧没动"
 _INTEGRITY_MIN_RUN = 8             # 连续 8 帧(0.27s)没动才算可疑，值得再量源
@@ -1863,6 +1940,11 @@ def clip_quality_problem(clip_file, expected_height, is_source_best=False):
     return delivered < expected * _QUALITY_DOWNSCALE_TOLERANCE, delivered, expected
 
 
+# 音频批次在 "Parallel Clip Writes" 还没有生效时的固定并发（历史行为）。
+# 只在调用方没有给出 clip_parallel（None）时回落到它，正常调用一律听设置值。
+_AUDIO_SOURCE_PARALLEL_DEFAULT = 5
+
+
 def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 res=None, logger=None, normalize=False, is_video=True, padding=None,
                 excluded=None, progress_callback=None, batch_size=6, upscale_sharpen=None,
@@ -1889,7 +1971,11 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
     _PROBE_CACHE.clear()
     _VSTREAM_CACHE.clear()
 
-    # 清理上次崩溃/强杀残留的中间文件（只删我们自己的命名模式，不碰用户文件）
+    # 清理上次崩溃/强杀残留的中间文件（只删我们自己的命名模式，不碰用户文件）。
+    # 合并工作目录不在输出目录里（系统 temp 或 Merge Scratch Folder），下面这段
+    # 输出目录清理永远扫不到它，所以先单独扫一次：崩溃后留在那里的
+    # _batchL*/_<stem>_segN 不会被任何别的清理逻辑回收。
+    _sweep_stale_merge_dirs(str(scratch_dir or "").strip(), tempfile.gettempdir())
     _out_dir = output if os.path.isdir(output) else os.path.dirname(output)
     if _out_dir and os.path.isdir(_out_dir):
         for _stale in os.listdir(_out_dir):
@@ -1918,7 +2004,11 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
         source_parallel = clip_parallel
     else:
         cut_func, concat_func = _ffmpeg_cut_audio, _ffmpeg_concat_audio
-        source_parallel = 5
+        # 音频批次以前硬编码 5 路并发，于是 "Parallel Clip Writes" 在音频模式完全
+        # 失效（设成 1 也照样并发切 5 个源）。现在两种模式听同一个旋钮；5 只作为
+        # 调用方完全没给值（None）时保留的旧默认，不再是覆盖用户设置的常量。
+        source_parallel = (_AUDIO_SOURCE_PARALLEL_DEFAULT if clip_parallel is None
+                           else clip_parallel)
 
     tempfiles = []
     try:
@@ -2126,14 +2216,14 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 if len(tasks) >= 50:
                     print(f"{Fore.CYAN}This can take a while with many clips; "
                           f"thanks for your patience.{Style.RESET_ALL}")
-                verified = re_cut = 0
+                verified = re_cut = unchecked = 0
                 integrity_lock = threading.Lock()
                 integrity_done = {"count": 0}
 
                 def check_one(task):
                     """校验一个片段（必要时重切）。每个任务读自己的文件、写自己的临时
                     输出，互不依赖，所以可以并发；重切走 cut_one（与切片阶段同一套参数）。"""
-                    nonlocal verified, re_cut
+                    nonlocal verified, re_cut, unchecked
                     (_n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur, expected_height,
                      delivered_is_source_best) = task
                     if not os.path.exists(tmp):
@@ -2162,7 +2252,18 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                               f"{Style.RESET_ALL}")
                         return
                     with integrity_lock:
-                        verified += 1
+                        # out_run is None = 这一片段**根本没量到**（ffmpeg 超时/失败、
+                        # 解码帧数 < 2）：它既不是"验证通过"，也不能据此重切。以前它
+                        # 和"量过且干净"一起计入 verified，日志于是把一个冻结检查
+                        # 从未跑过的片段说成已校验；现在单独计一桶（判定逻辑不变）。
+                        if out_run is None:
+                            unchecked += 1
+                        elif src_run is None and out_run >= _INTEGRITY_MIN_RUN:
+                            # 输出量到了、但源那一侧没量到（第二次 ffmpeg 失败/超时）：
+                            # 冻结比对其实从未发生，同样不能算"已校验"。
+                            unchecked += 1
+                        else:
+                            verified += 1
                         integrity_done["count"] += 1
                     if not problem:
                         return
@@ -2203,7 +2304,14 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     print(f"{Fore.YELLOW}  Clip integrity worker failed: "
                           f"{_sanitize_ffmpeg_detail(_error)}{Style.RESET_ALL}")
                 print(f"Clip integrity: {verified} verified, {re_cut} re-cut, "
-                      f"{len(unresolved_clips)} unresolved")
+                      f"{len(unresolved_clips)} unresolved, {unchecked} unchecked")
+                if unchecked:
+                    # 量不到 ≠ 干净：这些片段的冻结检查从未跑过，成片里可能带着
+                    # 一个没人看过的冻结段，只能如实提示而不是算进 verified。
+                    print(f"{Fore.YELLOW}WARNING: {unchecked} clip(s) could not be "
+                          f"measured by the freeze check (ffmpeg failed or timed out), "
+                          f"so they are neither confirmed clean nor reported as frozen."
+                          f"{Style.RESET_ALL}")
                 if unresolved_clips:
                     names = ", ".join(name for name, _, _ in unresolved_clips[:5])
                     more = "" if len(unresolved_clips) <= 5 else \

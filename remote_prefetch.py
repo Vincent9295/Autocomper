@@ -220,13 +220,42 @@ def _scaled_range_attempts(source, base=DEFAULT_RANGE_ATTEMPTS, maximum=12):
     return min(maximum, base + int(hours))
 
 
+def _content_range_total(response_headers):
+    """服务器自报的真实总长（206 和 416 都带它），取不到返回 None。
+
+    416 的 ``Content-Range`` 形如 ``bytes */12345``，206 的形如
+    ``bytes 0-99/12345``：两种都要认，否则"服务器说到此为止"与"下载被截断"
+    就无法区分（两者都会让生成器正常结束）。
+    """
+    content_range = str((response_headers or {}).get("content-range")
+                        or (response_headers or {}).get("Content-Range") or "")
+    m = re.match(r"bytes (?:\d+-\d+|\*)/(\d+)", content_range, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        total = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
 def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_CONCURRENCY,
                      request_func=None, logger=None, progress_callback=None,
                      max_attempts=None,
                      retry_delays=DEFAULT_RETRY_DELAYS, sleep_func=time.sleep,
                      speed_monitor=None, slow_callback=None, start_offset=0,
-                     refresher=None):
-    """Yield a known-size YouTube audio stream in byte order with bounded prefetch."""
+                     refresher=None, stats=None):
+    """Yield a known-size YouTube audio stream in byte order with bounded prefetch.
+
+    ``stats``（可选 dict，原地填写）让调用方能核对完整性：
+      * ``size``：划分 ranges 用的流大小；
+      * ``size_probed``：这个大小是探测到的真实值（而不是元数据里的估计值）；
+      * ``server_total``：服务器在 Content-Range 里自报的真实总长；
+      * ``written``：实际 yield 出去的字节数。
+    服务器提前结束（416 / 空 206）时生成器**正常结束**，所以"下完"和"被截断"
+    只有在调用方按这些数字核对时才分得清（本函数的历史行为必须保持：sound_reader
+    的检测预取依赖"正常结束"来收尾）。
+    """
     try:
         chunk_size = int(chunk_size)
         concurrency = int(concurrency)
@@ -245,10 +274,18 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
     platform = str(getattr(source, "platform", "")).lower()
     request = request_func or _default_request
     headers = dict(getattr(source, "audio_headers", {}) or {})
+    probed_size = None
     if platform == "bilibili":
-        real_size = _probe_real_size(source.audio_url, headers, request_func=request)
-        if real_size is not None and real_size > 0 and real_size != size:
-            size = real_size
+        # 传**原始** request_func，不是包装后的 `request`：_probe_real_size 只在
+        # request_func is None 时走"urlopen + read(1)"的安全路径。传 _default_request
+        # 会让它在**检查状态码之前**就 response.read()——忽略 Range、直接回 200 +
+        # 整个文件的 CDN 会把整段流读进内存（实测 40MB 响应 → 42MB 常驻），
+        # 而这段守卫本来就是为了防它。调用方注入假请求时行为完全不变。
+        real_size = _probe_real_size(source.audio_url, headers, request_func=request_func)
+        if real_size is not None and real_size > 0:
+            probed_size = real_size
+            if real_size != size:
+                size = real_size
 
     try:
         start_offset = int(start_offset)
@@ -256,6 +293,11 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
         raise RangePrefetchError("invalid range resume offset") from exc
     if start_offset < 0 or start_offset > size:
         raise RangePrefetchError("range resume offset is outside the source")
+
+    if stats is not None:
+        stats.clear()
+        stats.update({"size": size, "size_probed": probed_size is not None,
+                      "server_total": None, "written": start_offset})
 
     if max_attempts is None:
         max_attempts = _scaled_range_attempts(source)
@@ -289,6 +331,12 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
                     if int(status) == 416:
                         # 请求区间超出实际流末尾：后续所有块也会 416，直接按
                         # "末尾已到"提前结束，不重试（filesize_approx 虚高场景）。
+                        # 服务器自报的总长只能经 stats 带出去：消费者按 3 元组解包，
+                        # 这里多返回一个值会直接 ValueError（round 48 终检发现）。
+                        if stats is not None:
+                            total = _content_range_total(response_headers)
+                            if total:
+                                stats["server_total"] = total
                         return index, b"", -1
                     raise RangePrefetchError("range server returned a non-partial response")
                 expected_length = end - start + 1

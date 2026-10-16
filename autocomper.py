@@ -67,7 +67,7 @@ from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
 from sound_reader import (RemoteAudioIncompleteError, RemoteAudioStallError,
                           get_timestamps, _detection_cache_args)
-from remote_media import (MediaSource, fetch_audio_cache, fetch_segment,
+from remote_media import (MediaSource, PCM_SCAN_SAMPLE_RATE, fetch_audio_cache, fetch_segment,
                            PlaylistDescriptor, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
                            stable_source_id, SourceResolveError,
@@ -105,6 +105,7 @@ from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
                      run_tracked_progress, check_compile_disk_space,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
+                     set_current_temp_root,
                      unique_download_stem, yt_dlp_version,
                      reset_heartbeat_hint_memory,
                      is_twitch_platform, is_youtube_platform)
@@ -328,6 +329,26 @@ def paginate_sources(sources, page_size=PLAYLIST_PAGE_SIZE):
         raise ValueError("page_size must be positive")
     return [sources[index:index + page_size]
             for index in range(0, len(sources), page_size)]
+
+
+def playlist_cap_notice(descriptor, cap=MAX_PLAYLIST_ENTRIES):
+    """描述符撞上导入上限时的提示串（没撞到返回空串）。
+
+    remote_media 侧的 _descriptor_from_info/_text_descriptor 到 5000 条就静默截断，
+    而 total_count 记的是**截断后**的条数，所以"Page X of Y"看起来是完整的：用户
+    以为导入了整个频道/合集，尾部却被丢掉了。截断发生时 total_count 必然等于上限，
+    这是调用方能读到的唯一信号（恰好 5000 条的正常列表会顺带提示一句，无碍）。
+    """
+    if not isinstance(descriptor, PlaylistDescriptor):
+        return ""
+    try:
+        total = int(getattr(descriptor, "total_count", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if total < int(cap):
+        return ""
+    return (f" Note: this list reached the {cap}-entry import limit, so any "
+            f"entries beyond {cap} were not imported.")
 
 
 def selected_sources(sources, selected_ids):
@@ -867,6 +888,9 @@ def _elide_middle(text: str, max_pixels: int, measure) -> str:
 
 _temp_dir_obj = tempfile.TemporaryDirectory()  # 保持引用防止 GC 立即删除
 TEMP_DIR = _temp_dir_obj.name
+# 告诉 utils 的"硬杀残留根清扫"哪个目录正在用：入口脚本以 __main__ 运行，
+# utils 无法靠模块名找到 TEMP_DIR，必须显式登记，否则守卫失效（round 48 终检）。
+set_current_temp_root(TEMP_DIR)
 
 # 超过该秒数（30 分钟）后，处理某个远程源前会重新解析一次，避免开头一次性
 # 解析的大量 URL 在排到后面时已经过期。
@@ -905,6 +929,8 @@ _REVERIFY_ADJ_GAP = 1.0
 def ensure_temp_dir():
     """Recreate the shared temporary root after a successful run cleans it."""
     os.makedirs(TEMP_DIR, exist_ok=True)
+    # 根被清掉再建时重新登记，保证清扫永远避开正在用的目录。
+    set_current_temp_root(TEMP_DIR)
 
 
 TEMP_CHILD_PREFIXES = ("remote-compile-", "reverify-", "preview-")
@@ -1241,15 +1267,35 @@ def browser_cookie_setting_value(label, cookies_file=""):
 
 
 def remote_detection_input(upload, mode, audio_cache_paths):
-    """Select the detection input without changing the source used for compile."""
+    """Select the detection input without changing the source used for compile.
+
+    返回 None = 这个源取不到检测输入（Audio Cache 的缓存条目已被
+    ``_handle_corrupt_audio_cache`` 弹出、且重下失败）。取不到时绝不能抛
+    KeyError：调用方的 ``input_video_path`` 计算在 per-source try **之外**，
+    裸 KeyError 会冒到外层处理把整批杀掉，其余源连失败报告都拿不到。
+    """
     if not upload.get_is_url():
         return upload.get_path()
     source = upload.get_source()
     if mode == "Audio Cache":
-        return audio_cache_paths[stable_source_id(source)]
+        return audio_cache_paths.get(stable_source_id(source))
     if mode == "Remote Stream":
         return source
     return upload.get_path()
+
+
+def report_missing_detection_input(upload, audio_cache, failures):
+    """记录并报告一个"没有检测输入"的源（见 remote_detection_input）。
+
+    返回失败文案；同时追加到 ``failures`` 并打日志。调用方随后必须 ``return False``
+    跳过该源，而不是拿着 None 继续走检测。
+    """
+    reason = ("cached audio is missing (an earlier re-download failed)"
+              if audio_cache else "no detection input is available")
+    failure = f"{get_source_display_name(upload)}: {reason}"
+    failures.append(failure)
+    print(f"{Fore.YELLOW}Remote VOD skipped: {failure}")
+    return failure
 
 
 def _placement_reference_mode(remote_mode):
@@ -1583,6 +1629,26 @@ def _mark_detection_failure(cache_store, source, precision, block_size, threshol
             *_detection_cache_args(source, model, precision, block_size, threshold, focus_idx),
             {"error": str(reason)[:500], "recorded_at": time.time()},
         )
+    except Exception:
+        pass
+
+
+def _clear_detection_failure(cache_store, source, precision, block_size, threshold,
+                             focus_idx, model):
+    """成功路径：清除 ``_mark_detection_failure`` 写下的失败标记。
+
+    键必须与写入者用**同一个身份**。Audio Cache 模式的检测输入是本地缓存 m4a 路径，
+    而失败标记（``_handle_corrupt_audio_cache`` → ``_mark_detection_failure``）是按
+    MediaSource 写的：以前这里只看 ``input_video_path`` 是不是 MediaSource，本地路径
+    一律跳过，于是标记永远留着——之后每次运行都会把这个源当成"上次失败过"而重新检测
+    一遍（那时还会弹一个 Retry Failed Sources? 对话框；对话框已按用户要求删除，
+    现在只打一行日志）。
+    """
+    if not isinstance(source, MediaSource) or cache_store is None:
+        return
+    try:
+        cache_store.clear_detection_failure(
+            *_detection_cache_args(source, model, precision, block_size, threshold, focus_idx))
     except Exception:
         pass
 
@@ -2969,21 +3035,72 @@ def media_identity_key(value, base_dir=None):
     return os.path.normcase(os.path.normpath(text))
 
 
+def dedupe_new_media_paths(paths, uploaded_videos):
+    """Split ``paths`` into the ones not already in ``uploaded_videos``.
+
+    返回 (fresh, skipped)。同一个本地文件可以加两次（两次 Add Video Files、对同一
+    个文件夹跑两遍 Add Folder、先加文件夹再单独加里面的文件），而下游没有任何
+    按 filename 去重：该源会被完整检测两次（长 VOD 是几个小时），Combine 打开时
+    它的片段还会在成片里出现两次。add_video_url 早有 stable_source_id 去重，
+    import_urls_from_timestamps 用 media_identity_key，本地路径这条路径没有。
+
+    身份规则与 import_urls_from_timestamps 一致（url 和 path 都比），所以
+    Full Download 之后"URL 条目已经指向这个本地文件"也算重复。
+    """
+    existing = set()
+    for upload in uploaded_videos:
+        getter = getattr(upload, "get_url", None)
+        for value in (getter() if callable(getter) else None,
+                      upload.get_path() if hasattr(upload, "get_path") else upload):
+            if value:
+                existing.add(media_identity_key(value))
+    fresh = []
+    skipped = 0
+    for path in paths:
+        key = media_identity_key(path)
+        if key in existing:
+            skipped += 1
+            continue
+        existing.add(key)
+        fresh.append(path)
+    return fresh, skipped
+
+
+_TIMESTAMPS_EMPTY_MARKER = "# no timestamps"
+
+
 def timestamps_txt_headers(txt_path):
     """Section headers of a timestamps txt: the media identity of each block.
 
     Remote sections are written as their source URL and local ones as a file
     path (``get_source_persistence_name``), so this is what makes "queue every
     URL from an old timestamps file" possible without re-adding them by hand.
-    Returns [{"kind": "url"|"local"|"other", "value": str}], deduplicated in
-    file order.
+    Returns [{"kind": "url"|"local"|"other", "value": str, "has_timestamps": bool,
+    "marked_empty": bool}], deduplicated in file order.
+
+    ``marked_empty`` is True only for a section this program wrote with
+    ``_TIMESTAMPS_EMPTY_MARKER`` - i.e. a source that was detected and produced no
+    events, which the import must leave out (adding it back would only buy another
+    resolve/probe pass next run). A section with neither clips nor the marker stays
+    importable: that is a hand-written or older listing whose whole point is to queue
+    those URLs again.
     """
     headers = []
-    seen = set()
+    by_key = {}
+    current = None
     with _read_text_lines(txt_path) as handle:
         for raw_line in handle:
             line = raw_line.strip()
-            if not line or _TIMESTAMPS_CLIP_LINE_RE.match(line):
+            if not line:
+                current = None
+                continue
+            if line == _TIMESTAMPS_EMPTY_MARKER:
+                if current is not None:
+                    current["marked_empty"] = True
+                continue
+            if _TIMESTAMPS_CLIP_LINE_RE.match(line):
+                if current is not None:
+                    current["has_timestamps"] = True
                 continue
             if line.lower().startswith(("http://", "https://")):
                 kind = "url"
@@ -2992,10 +3109,15 @@ def timestamps_txt_headers(txt_path):
             else:
                 kind = "other"
             key = (kind, media_identity_key(line))
-            if key in seen:
+            existing = by_key.get(key)
+            if existing is not None:
+                # 同一个标题出现第二次：后续 clip / 标记仍属于它，指回原字典以免漏标。
+                current = existing
                 continue
-            seen.add(key)
-            headers.append({"kind": kind, "value": line})
+            current = {"kind": kind, "value": line, "has_timestamps": False,
+                       "marked_empty": False}
+            by_key[key] = current
+            headers.append(current)
     return headers
 
 
@@ -3020,12 +3142,19 @@ def uploads_from_timestamps_headers(headers, media_type="video", exists=os.path.
     caller can say so instead of silently dropping entries.
     """
     uploads = []
-    stats = {"url": 0, "local": 0, "skipped": 0}
+    stats = {"url": 0, "local": 0, "skipped": 0, "empty": 0}
     seen = set()
     for header in headers:
         kind = header.get("kind")
         value = str(header.get("value") or "").strip()
         if not value:
+            continue
+        if header.get("marked_empty") is True:
+            # 本程序写入的"检测过但没有任何片段"的条目（_TIMESTAMPS_EMPTY_MARKER）：
+            # 加回列表只会让下次运行为它再走一遍解析/探测，所以不导入，只计数告知。
+            # 注意：没有标记、也没有片段的条目仍然导入 —— 那种文件（手写/旧版导出的
+            # URL 清单）的全部意义就是把 URL 重新排进列表。
+            stats["empty"] += 1
             continue
         key = (kind, media_identity_key(value, base_dir))
         if key in seen:
@@ -3061,6 +3190,11 @@ def _write_timestamps_txt(dict_list, txt_path):
     found_timestamps = False
     for entry in dict_list:
         timestamps_text += f"{get_source_persistence_name(entry['filename'])}\n"
+        if not entry.get('timestamps'):
+            # 空条目（这个源检不出任何声音）照样写名字——它对用户有信息量，但加一行标记，
+            # 解析器和导入侧才知道"这不是一个有片段的条目"，不会把它当成源拖回列表
+            # （见 timestamps_txt_headers / uploads_from_timestamps_headers）。
+            timestamps_text += f"{_TIMESTAMPS_EMPTY_MARKER}\n"
         for ts in entry.get('timestamps', []):
             marker = " [new]" if ts.get('source') == 'new' else ""
             if ts.get('suspect'):
@@ -3086,6 +3220,30 @@ def _write_timestamps_txt(dict_list, txt_path):
         return False
 
 
+def _index_uploads_for_timestamp_match(uploaded_videos):
+    """Index the current list so a loaded timestamps file can be matched back to it.
+
+    Entries that are still URLs are matched by their source URL (that is the title the
+    detection result records for Remote Stream / Audio Cache). Everything else is matched by
+    the basename of its path, which includes an entry that carries a resolved source but has
+    already been downloaded by Full Download: `handle_url_downloads` calls
+    `set_path(...)`/`set_is_url(False)` and keeps the source attached, and the result is then
+    written with the **local path** as its title, so without the basename entry every one of
+    those titles prints "Not in list" and the film is compiled without them (round 47 audit
+    P1-2).
+    """
+    remote_name_map = {}
+    basename_map = {}
+    for video in uploaded_videos:
+        source = video.get_source()
+        if source is not None and video.get_is_url():
+            remote_name_map[source.source_url] = source
+            continue
+        base = os.path.basename(video.get_path())
+        basename_map.setdefault(base, []).append(video.get_path())
+    return remote_name_map, basename_map
+
+
 def _parse_timestamps_txt(txt_path):
     """Parse timestamps.txt -> (with videos, without videos)"""
     with_videos = []
@@ -3102,6 +3260,10 @@ def _parse_timestamps_txt(txt_path):
                     target.append({'filename': current_file, 'timestamps': current_ts})
                 current_file = None
                 current_ts = []
+                continue
+            if line == _TIMESTAMPS_EMPTY_MARKER:
+                # 空条目标记（_write_timestamps_txt 写的）：它不是文件名，跳过即可，
+                # 该条目随后由空行收尾并进入 without_videos。
                 continue
             m = _TIMESTAMPS_CLIP_LINE_RE.match(line)
             if m:
@@ -3177,7 +3339,9 @@ def _scan_reverify_audio(raw, scan_windows, precision, focus_idx, threshold,
     import numpy as _np
     from sound_reader import compute_timestamps as _compute_ts
 
-    sample_rate = 32000
+    # 与写入侧（remote_media.PCM_SCAN_SAMPLE_RATE）共用一个常量：两边不一致会把
+    # 片段位置整体缩放（round 47 审计 P1-1）。
+    sample_rate = PCM_SCAN_SAMPLE_RATE
     checked = dskip = confirmed = rejected = 0
     if logger:
         windows_iter = proglog.default_bar_logger(logger).iter_bar(block=scan_windows)
@@ -3301,19 +3465,38 @@ def _merge_reverify_timestamps(timestamps):
     return [t for t in result if t['end'] - t['start'] > 0.5]
 
 
-def _read_wav_pcm(path):
+def _read_wav_pcm(path, target_rate=None):
+    """Read a 16-bit WAV as mono int16 samples at the scanner's rate.
+
+    The scanner (`_scan_reverify_audio`) maps frame indices to seconds at
+    ``PCM_SCAN_SAMPLE_RATE``, so a file recorded at another rate must be converted here
+    instead of being read as if it were already at that rate: a 48 kHz window read as
+    32 kHz used to place every [new] clip 1.5x too late and scan only the first 6.67 s of
+    each window (round 47 audit P1-1).
+    """
     import wave
     import numpy as _np
 
+    if target_rate is None:
+        target_rate = PCM_SCAN_SAMPLE_RATE
+    target_rate = int(target_rate)
     with wave.open(str(path), 'rb') as audio:
         channels = audio.getnchannels()
         width = audio.getsampwidth()
+        rate = int(audio.getframerate() or target_rate)
         if width != 2:
             raise ValueError(f"remote reverify requires 16-bit WAV, got {width * 8}-bit")
         samples = _np.frombuffer(audio.readframes(audio.getnframes()), dtype=_np.int16)
     if channels > 1:
         samples = samples[:len(samples) - (len(samples) % channels)]
         samples = samples.reshape(-1, channels).mean(axis=1).astype(_np.int16)
+    if rate != target_rate and len(samples) > 1:
+        # 线性重采样足够：调用方只做互相关/模型推理，但**必须**让"第 n 个采样 =
+        # n / target_rate 秒"这句话成立，位置映射才不会整体缩放。
+        count = max(1, int(round(len(samples) * target_rate / float(rate))))
+        source_positions = _np.arange(len(samples), dtype=_np.float64)
+        target_positions = _np.linspace(0.0, float(len(samples) - 1), count)
+        samples = _np.interp(target_positions, source_positions, samples).astype(_np.int16)
     return samples
 
 
@@ -3342,7 +3525,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
         except Exception:
             ort_session = ort.InferenceSession(selected_model, sess_options, providers=['CPUExecutionProvider'])
 
-    sample_rate = 32000
+    sample_rate = PCM_SCAN_SAMPLE_RATE
     checked = dskip = confirmed = rejected = 0
     for entry in dict_list:
         filename = entry['filename']
@@ -4724,6 +4907,16 @@ class VideoProcessorApp:
             "URLs again. Files that no longer exist are skipped.")
 
         def show_menu(event):
+            # widget 级 <Button-1> 绑定在 ttk 的 disabled 判定**之前**触发，所以
+            # disable_objects() 给 add_button 设的 -state 拦不住这个菜单。运行时必须
+            # 自己拒绝：Add Folder 会整体重排 uploaded_videos，而 Full Download 的
+            # 下载循环是**按下标**写回条目的，重排会让下标错位、把某个源的文件写到
+            # 另一个条目上（成片静默用错媒体）。这正是拖放守卫防的同一件事，round 46
+            # 漏了菜单这条路径（round 47 审计 P1-3）。
+            if self.is_thread_active():
+                print(f"{Fore.YELLOW}Ignoring the media menu: a job is running. Add media "
+                      f"once it finishes.{Style.RESET_ALL}")
+                return
             x = self.add_button.winfo_rootx()
             y = self.add_button.winfo_rooty() + self.add_button.winfo_height()
             # menu.post(event.x_root, event.y_root)
@@ -5637,9 +5830,14 @@ class VideoProcessorApp:
         file_names = filedialog.askopenfilenames(
             filetypes=input_formats)
         if file_names:
-            for file in file_names:
+            # 同一文件加两次会被完整检测两次；报告跳过的数量，别静默吞掉。
+            fresh, skipped = dedupe_new_media_paths(file_names, self.uploaded_videos)
+            for file in fresh:
                 self.uploaded_videos.append(MediaUpload(
                     file, 'video' if self.is_video else 'audio'))
+            if skipped:
+                print(f"{Fore.YELLOW}Skipped {skipped} file(s) already in the list."
+                      f"{Style.RESET_ALL}")
             self.update_listbox(scroll_to_bottom=True)
 
     def _on_cookie_selection(self, event=None):
@@ -6066,11 +6264,14 @@ class VideoProcessorApp:
 
         uploads, stats = uploads_from_timestamps_headers(
             headers, media_type, base_dir=base_dir)
+        empty_note = (f"\nLeft out {stats['empty']} entry(ies) that had no timestamps "
+                      f"in that file." if stats["empty"] else "")
         if not uploads:
             messagebox.showinfo(
                 "Import URLs",
                 f"No new usable entries were found in {os.path.basename(path)}."
-                + (f"\nSkipped {stats['skipped']} entry(ies)." if stats["skipped"] else ""),
+                + (f"\nSkipped {stats['skipped']} entry(ies)." if stats["skipped"] else "")
+                + empty_note,
             )
             return
         self.uploaded_videos.extend(uploads)
@@ -6080,6 +6281,13 @@ class VideoProcessorApp:
         if stats["skipped"]:
             summary += f" (skipped {stats['skipped']} unusable entry(ies))"
         print(f"{Fore.GREEN}{summary}.{Style.RESET_ALL}")
+        if stats["empty"]:
+            # 显式说明：这些源在文件里只有名字、没有片段，所以没有导入。想重新检测它们
+            # 就把 URL 单独加进来（或删掉 .txt 里对应条目后重跑）。
+            print(f"{Fore.CYAN}Left out {stats['empty']} entry(ies) from "
+                  f"{os.path.basename(path)} that had no timestamps "
+                  f"({_TIMESTAMPS_EMPTY_MARKER}); add them by URL if you want them "
+                  f"detected again.{Style.RESET_ALL}")
 
     def add_video_url(self):
         # 窗口对象必须固定在局部变量里：以前所有回调都操作 self.entry_window，
@@ -6211,6 +6419,9 @@ class VideoProcessorApp:
                         if duplicates:
                             message += (f" {duplicates} already in the list"
                                         f" ({'was' if duplicates == 1 else 'were'} skipped).")
+                        # 撞上 MAX_PLAYLIST_ENTRIES 时必须说出来：描述符里没有
+                        # 截断标志，"Page X of Y" 也是截断后的总数（见 playlist_cap_notice）。
+                        message += playlist_cap_notice(described)
                         if expansion_stats.get("expanded_parts"):
                             message += f" Expanded {expansion_stats['expanded_parts']} parts."
                         if failures:
@@ -6374,14 +6585,18 @@ class VideoProcessorApp:
                   f"Add them once it finishes.{Style.RESET_ALL}")
             return
         files = self.root.tk.splitlist(event.data)
-        for f in files:
-            video_exts = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')
-            audio_exts = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac')
-            if f.lower().endswith(video_exts + audio_exts):
-                existing = [x.get_path() if hasattr(x, 'get_path') else x for x in self.uploaded_videos]
-                if f not in existing:
-                    mtype = 'video' if f.lower().endswith(video_exts) else 'audio'
-                    self.uploaded_videos.append(MediaUpload(f, mtype))
+        video_exts = ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.ts')
+        audio_exts = ('.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac')
+        candidates = [f for f in files if f.lower().endswith(video_exts + audio_exts)]
+        # 去重规则与 add_video/add_video_folder 一致（原来只比原字符串，路径写法不同
+        # 就漏判；同一文件加两次会被检测两次、Combine 时内容翻倍）。
+        fresh, skipped = dedupe_new_media_paths(candidates, self.uploaded_videos)
+        for f in fresh:
+            mtype = 'video' if f.lower().endswith(video_exts) else 'audio'
+            self.uploaded_videos.append(MediaUpload(f, mtype))
+        if skipped:
+            print(f"{Fore.YELLOW}Ignored {skipped} dropped file(s) already in the list."
+                  f"{Style.RESET_ALL}")
         self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
         self.update_listbox()
 
@@ -6864,16 +7079,22 @@ class VideoProcessorApp:
         if not folder:
             return
         extensions = ('.mp4', '.avi', '.mkv', '.m4v', '.mov') if self.is_video else ('.mp3', '.wav', '.flac')
-        found = 0
+        candidates = []
         for root, _, files in os.walk(folder):
             for f in files:
                 if any(f.lower().endswith(ext) for ext in extensions):
-                    full_path = os.path.join(root, f)
-                    self.uploaded_videos.append(MediaUpload(full_path, 'video' if self.is_video else 'audio'))
-                    found += 1
+                    candidates.append(os.path.join(root, f))
+        # 对同一个文件夹跑两遍（或先加文件夹、再单独加里面的文件）以前会加出重复项。
+        fresh, skipped = dedupe_new_media_paths(candidates, self.uploaded_videos)
+        for full_path in fresh:
+            self.uploaded_videos.append(MediaUpload(full_path, 'video' if self.is_video else 'audio'))
+        found = len(fresh)
         self.uploaded_videos.sort(key=lambda x: _smart_sort_key(x.get_path()))
         self.update_listbox(scroll_to_bottom=True)
         print(f"{Fore.GREEN}Added {found} files from {folder}")
+        if skipped:
+            print(f"{Fore.YELLOW}Skipped {skipped} file(s) already in the list."
+                  f"{Style.RESET_ALL}")
 
 
     def process_videos_multi(self):
@@ -7001,9 +7222,17 @@ class VideoProcessorApp:
             if self.active_thread is not target_thread:
                 return                      # 新一轮已开始：别再碰它
             if not self.is_thread_active():
+                # 旧线程（含 compile 线程池：它退出前会 shutdown(wait=True)）真的结束
+                # 了，取消标志也就完成了使命。留着它，之后所有不在批次里的 ffmpeg
+                # 操作（External Audio 导入、Review 预览）都会立刻报
+                # "Operation cancelled by user"：utils.run_tracked 看见标志就 kill
+                # 子进程并抛 InterruptedError。这里清最安全：token 与线程同一性都已
+                # 校验过（没有新一轮接管），而线程退出意味着它依赖的标志不再需要。
+                cancel_clear()
                 cleanup_temp_children()
                 self.clear_transfer_progress("Cancelled")
                 self.reenable_disabled_objects()
+                self._finish_pending_close()
                 return
             request_cancel()
             elapsed = time.monotonic() - started
@@ -7015,6 +7244,11 @@ class VideoProcessorApp:
                 cleanup_temp_children()
                 self.clear_transfer_progress("Cancelled")
                 self.reenable_disabled_objects()
+                if getattr(self, "_closing_after_shutdown", False):
+                    # 用户已经要求关窗（on_closing）：不再弹第二个确认框，
+                    # 直接走逃生口销毁，进程带着卡住的调用退出即可。
+                    self._finish_pending_close()
+                    return
                 # 不留下死胡同：线程卡在原生调用里时，Process 会一直被守卫拦住，
                 # 唯一出路是重启程序，这里直接问用户。
                 if messagebox.askyesno(
@@ -7027,6 +7261,16 @@ class VideoProcessorApp:
             self.root.after(poll_ms, poll)
 
         self.root.after(poll_ms, poll)
+
+    def _finish_pending_close(self):
+        """收尾轮询替 on_closing 销毁 root（见那里的注释）。"""
+        if not getattr(self, "_closing_after_shutdown", False):
+            return
+        self._closing_after_shutdown = False
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _run_on_main_thread(self, func, timeout=600.0):
         """Run ``func`` on the Tk main thread and return its value.
@@ -7237,7 +7481,16 @@ class VideoProcessorApp:
     def on_closing(self):
         if self.is_thread_active():
             if self.confirm_stop_process():
-                self.root.destroy()
+                # 不能在这里立刻 destroy：destroy() 连 Tcl 解释器一起删掉，
+                # _await_run_shutdown 用 root.after 挂的收尾轮询随之消失——
+                # cleanup_temp_children/reenable_disabled_objects 全部跳过，进程还会
+                # 带着非 daemon 的线程池 worker 无窗口地留在任务管理器里。
+                # 交给收尾轮询在旧线程真的退出后销毁窗口（保留原有 120s 逃生口）。
+                self._closing_after_shutdown = True
+                try:
+                    self.root.withdraw()        # 窗口立刻消失，观感与关闭一致
+                except tk.TclError:
+                    pass
         else:
             self.root.destroy()
 
@@ -7815,6 +8068,16 @@ class VideoProcessorApp:
             # 探测限流器独立于 resolve：CDN 探测是 FFmpeg 请求，可容忍更短
             # 间隔（1s），而 yt-dlp resolve 需要 2s 间隔防 412 限流。
             _probe_limiter = ResolveLimiter(min_interval=1.0)
+
+            def _prepare_remote_source(value):
+                """读前准备：只在检测缓存未命中、确实要读音频时才逐源挑选最快的音频 CDN
+                候选并把 audio_url 钉死在读取前一刻；限流器照旧生效，防大批次触发限流。
+                已有检测结果的源不会走到这里（见 sound_reader.get_timestamps 的
+                prepare_source_func），因此不会再有"什么都不用做却先测一轮 CDN"的浪费。
+                """
+                _probe_limiter.wait()
+                select_audio_candidate(value, log_func=print)
+
             refresh_func = LimitedRefresher(
                 lambda source: refresh_remote_source(
                     source, browser_cookies=browser_cookies
@@ -7967,39 +8230,35 @@ class VideoProcessorApp:
                         except Exception:
                             continue
                     if previously_failed:
-                        retry_choice = messagebox.askyesno(
-                            "Retry Failed Sources",
-                            f"{len(previously_failed)} remote source(s) failed detection in a "
-                            f"previous run and are now resolved again:\n\n"
-                            + "\n".join(f"  - {get_source_display_name(s)}" for s in previously_failed[:8])
-                            + ("\n  ..." if len(previously_failed) > 8 else "")
-                            + "\n\nRe-detect them now? (Yes re-runs detection for these; "
-                              "No skips them this run.)",
-                        )
-                        if retry_choice:
-                            for source in previously_failed:
-                                try:
-                                    cache_store.clear_detection_failure(
-                                        *_detection_cache_args(
-                                            source, selected_model, precision,
-                                            detection_block_size(self.remote_mode.get(), block_size, True),
-                                            threshold, focus_idx,
-                                        )
+                        # 全自动：以前失败过的源本次直接重试，不弹对话框问用户。以前这里问
+                        # "Retry Failed Sources?"（是=重试 / 否=本次跳过），但本程序默认就是
+                        # 全自动跑批，一个要用户当场做选择的模态框会卡住无人值守的批次；
+                        # 而"静默跳过"又是这个标记当初要解决的问题。所以固定为重试：清掉标记
+                        # 并把源名打进日志（用户要求：保留透明度，只是不需要他做选择），
+                        # 成功路径会再清一次（见 _clear_detection_failure），因此同一个源不会
+                        # 每次运行都被反复重试。
+                        for source in previously_failed:
+                            try:
+                                cache_store.clear_detection_failure(
+                                    *_detection_cache_args(
+                                        source, selected_model, precision,
+                                        detection_block_size(self.remote_mode.get(), block_size, True),
+                                        threshold, focus_idx,
                                     )
-                                except Exception:
-                                    pass
-                            print(
-                                f"{Fore.CYAN}Re-detecting {len(previously_failed)} previously "
-                                f"failed remote source(s).")
-                        else:
-                            drop_ids = {stable_source_id(s) for s in previously_failed}
-                            remote_entries = [
-                                (u, s) for u, s in remote_entries
-                                if s is None or stable_source_id(s) not in drop_ids
-                            ]
-                            print(
-                                f"{Fore.YELLOW}Skipping {len(drop_ids)} previously failed "
-                                f"remote source(s) this run.")
+                                )
+                            except Exception:
+                                pass
+                        listed = ", ".join(get_source_display_name(source)
+                                           for source in previously_failed[:8])
+                        more = " ..." if len(previously_failed) > 8 else ""
+                        print(f"{Fore.CYAN}Re-detecting {len(previously_failed)} remote "
+                              f"source(s) that failed detection in a previous run: "
+                              f"{listed}{more}")
+                        print(f"{Fore.CYAN}  A source that failed part way keeps its finished "
+                              f"blocks and continues from there. It is not analysed again; on "
+                              f"the platforms that read one ordered stream its audio is read "
+                              f"again up to that point (Bilibili fetches each block on its own, "
+                              f"so there it is skipped).")
 
 
             res = ()
@@ -8095,15 +8354,11 @@ class VideoProcessorApp:
                     print(f"{Fore.GREEN}Loading timestamps from {txt_path}...")
                     with_videos, _ = _parse_timestamps_txt(txt_path)
 
-                    # Build basename -> [paths] map (handle duplicates)
-                    basename_map = {}
-                    remote_name_map = {}
-                    for v in self.uploaded_videos:
-                        if v.get_source() is not None:
-                            remote_name_map[v.get_source().source_url] = v.get_source()
-                            continue
-                        base = os.path.basename(v.get_path())
-                        basename_map.setdefault(base, []).append(v.get_path())
+                    # Build basename -> [paths] map (handle duplicates), plus the
+                    # source-URL -> source map for entries that are still URLs. A downloaded
+                    # Full Download entry is indexed by its path (see the helper's note).
+                    remote_name_map, basename_map = _index_uploads_for_timestamp_match(
+                        self.uploaded_videos)
 
                     dict_list = []
                     loaded = 0
@@ -8159,11 +8414,11 @@ class VideoProcessorApp:
                         dict_list, self.is_video, padding)
                     if dropped_no_footage:
                         loaded = sum(1 for entry in dict_list if entry.get('timestamps'))
-                    _uploaded_remote = sum(
-                        1 for v in self.uploaded_videos if v.get_is_url())
-                    if _uploaded_remote > loaded:
+                    _list_remote = sum(
+                        1 for v in self.uploaded_videos if v.get_source() is not None)
+                    if _list_remote > loaded:
                         print(
-                            f"{Fore.YELLOW}WARNING: {_uploaded_remote - loaded} remote source(s) "
+                            f"{Fore.YELLOW}WARNING: {_list_remote - loaded} source(s) "
                             f"in the current list have no timestamp data in {txt_path}. "
                             f"They were likely skipped in the earlier run. If you want to recover "
                             f"them, cancel and re-run WITHOUT skipping detection, so the missed "
@@ -8333,6 +8588,12 @@ class VideoProcessorApp:
                     input_video_path = remote_detection_input(
                         upload, self.remote_mode.get(), audio_cache_paths
                     )
+                    if input_video_path is None:
+                        # 缓存条目丢失（损坏重下失败）：报失败并跳过这个源，
+                        # 绝不能拿 None 继续走检测（见 remote_detection_input）。
+                        report_missing_detection_input(
+                            upload, audio_cache, incomplete_failures)
+                        return False
                     current_block_size = detection_block_size(
                         self.remote_mode.get(), block_size,
                         isinstance(input_video_path, MediaSource),
@@ -8355,20 +8616,17 @@ class VideoProcessorApp:
                                     input_video_path.__dict__.update(updated.__dict__)
                             except Exception as exc:
                                 print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
-                        # 逐源选择 audio candidate：只在真正检测该源前探测，
-                        # 保证用的是最新解析的候选池和当时的网络状况，且 audio_url 只在读取前一刻钉死。
-                        # 探测受限流器控制，防止大批次探测触发 CDN 限流。
-                        try:
-                            _probe_limiter.wait()
-                            select_audio_candidate(input_video_path, log_func=print)
-                        except Exception as exc:
-                            print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
+                        # 逐源选择 audio candidate 的探测**不再在这里**无条件执行：它现在
+                        # 由 get_timestamps 在"两个检测缓存都没命中、确实要读音频"时回调
+                        # prepare_source_func，于是已有检测结果的源完全不做这项网络探测
+                        # （见 prepare_source_func 的说明）。限流器仍在回调里生效。
                     try:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
                             use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
                             refresh_func=refresh_func,
                             prefetch_concurrency=self.remote_audio_concurrency.get(),
+                            prepare_source_func=_prepare_remote_source,
                             select_candidate_func=(
                                 lambda source: select_audio_candidate(source, log_func=print)
                                 if isinstance(source, MediaSource) else None
@@ -8474,16 +8732,12 @@ class VideoProcessorApp:
                         if dropped:
                             print(f"{Fore.CYAN}Strict FP filter: dropped {dropped} suspect clip(s).")
                     dict_list.append(timestamps)
-                    if isinstance(input_video_path, MediaSource):
-                        try:
-                            cache_store.clear_detection_failure(
-                                *_detection_cache_args(
-                                    input_video_path, selected_model, precision,
-                                    current_block_size, threshold, focus_idx,
-                                )
-                            )
-                        except Exception:
-                            pass
+                    # 必须用 source_for_result（写入标记时用的同一身份）：Audio Cache
+                    # 检测跑在本地缓存 m4a 上，标记却是按 MediaSource 写的，只看
+                    # input_video_path 永远清不掉（见 _clear_detection_failure）。
+                    _clear_detection_failure(cache_store, source_for_result, precision,
+                                             current_block_size, threshold, focus_idx,
+                                             selected_model)
                     if used_existing_data: print(f"{Fore.GREEN}Using existing timestamp data from previous run.")
                     num_found = len(timestamps['timestamps'])
                     if num_found > 1:

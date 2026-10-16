@@ -1,10 +1,12 @@
 import sys
 import os
+import hashlib
 import json
 import platform
 import shutil
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -293,6 +295,11 @@ def run_tracked(cmd, timeout=None, text=False):
     进程不退出）永久阻塞 ``read``，使 timeout 永远不触发（曾导致 Audio
     Cache 的 CDN 探测卡死整个批次）。
     """
+    # 热路径上顺带回收"上一次被硬杀留下的临时根"（节流到每进程每小时一次，
+    # 见 sweep_stale_temp_roots_once）：这是本进程里第一个必然被调到的、又能代表
+    # "一次真实运行已经开始"的位置，而 autocomper.cleanup_temp_children 只看本次
+    # 会话的 TEMP_DIR，被杀会话的 remote-compile-* 片段谁也清不掉。
+    sweep_stale_temp_roots_once()
     opts = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
     if sys.platform == 'win32':
         opts['creationflags'] = 0x08000000
@@ -926,6 +933,123 @@ def _sweep_stale_download_temps(output_location, max_age=24 * 3600):
             continue
 
 
+# ── 硬杀残留的"整个临时根"回收 ─────────────────────────────────────────
+# autocomper.py 的 TEMP_DIR 是 tempfile.TemporaryDirectory()，名字形如
+# %TEMP%\tmpab12cd34——前缀是 tempfile 的默认 "tmp"，不是本程序专属的名字；
+# 里面装的才是本程序自己的子项（remote-compile-*/reverify-*/preview-/external-audio-）。
+# 硬杀（任务管理器结束进程 / 断电 / 崩溃）会连整个 tmpXXXX 一起留下，而
+# autocomper.cleanup_temp_children 只扫**本次会话**的 TEMP_DIR，永远看不到它们：
+# 于是一个被杀的批次会永久留下几 GB 的 remote-compile-* 片段下载。
+# 这里补上"扫系统临时目录里属于本程序的旧根目录"的那一半，判据两条：
+#   * 必须真的含本程序专属子项（否则可能是别的程序的 tmpXXXX，绝不动它）；
+#   * 必须比 max_age 更旧（正在跑的会话不会被误删，与 _sweep_stale_download_temps
+#     用的是同一个年龄口径）。
+# 根治仍建议 autocomper.py 侧把临时根建成稳定前缀
+# （tempfile.mkdtemp(prefix="autocomper-run-", dir=tempfile.gettempdir())），那时
+# 前缀过滤可以直接收紧成 "autocomper"；在此之前 _APP_TEMP_CHILD_PREFIXES 就是
+# 唯一可靠的指纹。
+_APP_TEMP_CHILD_PREFIXES = ("remote-compile-", "reverify-", "preview-", "external-audio-")
+_STALE_TEMP_ROOT_PREFIXES = ("tmp", "autocomper")
+_STALE_TEMP_ROOT_MAX_AGE = 24 * 3600
+_STALE_TEMP_ROOT_SWEEP_INTERVAL = 3600.0
+_temp_root_sweep_state = {"at": None}
+_temp_root_sweep_lock = threading.Lock()
+
+
+_CURRENT_TEMP_ROOT = None
+
+
+def set_current_temp_root(path):
+    """本次会话的临时根（autocomper 建好自己的 TEMP_DIR 后调用）。
+
+    清扫必须知道"哪个根正在用"，否则可能把本次运行的子项一起删掉。以前这里从
+    ``sys.modules["autocomper"]`` 取，但入口脚本是以 ``__main__`` 运行的
+    （cx_Freeze 亦同），那个模块名根本不存在 —— 守卫等于失效（round 48 终检发现），
+    所以改成由 autocomper 显式登记。
+    """
+    global _CURRENT_TEMP_ROOT
+    _CURRENT_TEMP_ROOT = str(path) if path else None
+
+
+def _current_temp_root():
+    """本次会话自己的临时根；未登记时返回 None（此时只靠年龄门槛保护）。"""
+    return _CURRENT_TEMP_ROOT
+
+
+def looks_like_app_temp_root(path):
+    """判断一个临时目录是不是本程序留下的根。
+
+    必须**至少含一个本程序专属子项**（remote-compile-/reverify-/preview-/
+    external-audio-），否则可能是别的程序的 tmpXXXX，绝不动它；同时**不允许**出现
+    这两类之外的名字 —— 本程序还会在自己的根里再建 tempfile 默认前缀（tmpXXXX）的
+    合并暂存目录，所以 tmp* 一并放行。判据越窄越安全：多留下几 GB 也比删错目录好。
+    """
+    try:
+        names = [str(name) for name in os.listdir(path)]
+    except OSError:
+        return False
+    if not any(name.startswith(_APP_TEMP_CHILD_PREFIXES) for name in names):
+        return False
+    return all(name.startswith(_APP_TEMP_CHILD_PREFIXES) or name.startswith("tmp")
+               for name in names)
+
+
+def sweep_stale_temp_roots(temp_parent=None, max_age=_STALE_TEMP_ROOT_MAX_AGE,
+                           current=None, prefixes=_STALE_TEMP_ROOT_PREFIXES):
+    """删掉被硬杀的上一次运行留下的临时根，返回真正删掉的路径列表。
+
+    只认"名字像 tempfile 的临时目录 + 里面确实有本程序专属子项 + 足够旧"三条
+    同时成立的目录；``current``（本次会话自己的临时根）永不删除。
+    """
+    parent = temp_parent or tempfile.gettempdir()
+    if current is None:
+        current = _current_temp_root()
+    current_path = (os.path.normcase(os.path.abspath(str(current)))
+                    if current else None)
+    cutoff = time.time() - max_age
+    removed = []
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return removed
+    for name in names:
+        if not str(name).startswith(tuple(prefixes)):
+            continue
+        path = os.path.join(parent, name)
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                continue
+            if current_path and os.path.normcase(os.path.abspath(path)) == current_path:
+                continue
+            if os.path.getmtime(path) >= cutoff:
+                continue
+        except OSError:
+            continue
+        if not looks_like_app_temp_root(path):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            removed.append(path)
+    return removed
+
+
+def sweep_stale_temp_roots_once(interval=_STALE_TEMP_ROOT_SWEEP_INTERVAL, **kwargs):
+    """每个进程最多每 ``interval`` 秒扫一次（run_tracked 是热路径）。
+
+    回收残留绝不能影响真正的下载/编译：这里吞掉所有异常。
+    """
+    now = time.monotonic()
+    with _temp_root_sweep_lock:
+        last = _temp_root_sweep_state["at"]
+        if last is not None and now - last < interval:
+            return []
+        _temp_root_sweep_state["at"] = now
+    try:
+        return sweep_stale_temp_roots(**kwargs)
+    except Exception:                                              # noqa: BLE001
+        return []
+
+
 def _download_streams_with_ranges(stem, output_location, streams, logger,
                                   concurrency=None, chunk_size=None,
                                   bilibili_hosts=False):
@@ -1298,9 +1422,76 @@ def yt_dlp_version() -> str:
         return "unknown"
 
 
+# Windows 的经典路径上限（MAX_PATH=260）。yt-dlp 的暂存文件以前是相对 outtmpl
+# （写进进程工作目录），路径天然很短；一旦把 outtmpl 指到真正的下载目录，就必须自己
+# 给"目录 + 文件名主干 + 扩展名 + yt-dlp 的 .part/.f137 后缀"留出余量，否则失败点
+# 会推迟到最后一步 os.rename——那时几 GB 已经下完，用户只看到一个笼统的下载失败。
+_MAX_PATH_LENGTH = 259
+_DOWNLOAD_NAME_RESERVE = 24
+_MIN_DOWNLOAD_STEM = 16
+
+
+def capped_download_stem(output_location, stem, reserve=_DOWNLOAD_NAME_RESERVE):
+    """把下载文件名主干截到 ``output_location`` 下的 MAX_PATH 之内。
+
+    autocomper 传进来的 stem 是标题净化后的结果，长度不受控（长标题 + 深下载
+    目录会超 MAX_PATH）。按输出目录的实际长度算预算，而不是拍一个固定长度。
+    """
+    name = os.path.basename(str(stem or "")) or "download"
+    budget = (_MAX_PATH_LENGTH - len(os.path.abspath(str(output_location))) - 1
+              - int(reserve))
+    budget = max(_MIN_DOWNLOAD_STEM, budget)
+    if len(name) <= budget:
+        return name
+    # 截断后不能再以点/空格结尾：Windows 会静默去掉，名字又变了。
+    # 同时必须保持唯一：两个长标题截到同一前缀时，第二个下载会命中第一个已落盘的文件
+    # （_finalize_staged_download 的同名分支会接受它）→ 静默用错视频。尾部缀上原始名字
+    # 的短哈希：同一个标题每次得到同一个名字，不同标题不会撞（round 48 终检发现）。
+    digest = hashlib.sha1(name.encode("utf-8", "replace")).hexdigest()[:8]
+    keep = max(1, budget - len(digest) - 1)
+    return (name[:keep].rstrip(". ") or "download") + "-" + digest
+
+
+def _discard_staged_download(path):
+    """删掉 yt-dlp 暂存件本体及其 .part/.ytdl 伴生文件（不存在就跳过）。"""
+    if not path:
+        return
+    for candidate in (str(path), f"{path}.part", f"{path}.ytdl"):
+        try:
+            if os.path.isfile(candidate):
+                os.remove(candidate)
+        except OSError:
+            pass
+
+
+def _finalize_staged_download(staged, output_file):
+    """把 yt-dlp 落盘的暂存件交给最终文件名；搬移失败就清掉暂存件再抛。
+
+    两者路径相同时（outtmpl 已经带目标目录，正常情况）只确认文件真的存在——以前
+    ``shutil.move`` 抛的 FileNotFoundError 是"下载其实没产出文件"的唯一信号，
+    同路径不再经过 move，必须在这里补上。真的需要搬移时（yt-dlp 按自己的规则改了
+    名字）失败后绝不能留下整份暂存件：调用方只会重试，而它在工作目录里谁也找不到。
+    """
+    same = (os.path.normcase(os.path.abspath(str(staged)))
+            == os.path.normcase(os.path.abspath(str(output_file))))
+    if same:
+        if not os.path.isfile(output_file):
+            raise DownloadError(f"download finished but {output_file} is missing")
+        return
+    try:
+        shutil.move(staged, output_file)
+    except Exception:
+        _discard_staged_download(staged)
+        raise
+
+
 def download_video(url: str, filename: str, output_location: str, max_quality: str, max_speed: int, logger, n_retries: int = 3, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None) -> Tuple[bool, str]:
     logger.reset_total_progress(100)
     os.makedirs(output_location, exist_ok=True)
+    # 名字主干在这里统一截短：yt-dlp 现在直接下到 output_location（见 outtmpl），
+    # 目录 + 名字 + 扩展名 + yt-dlp 自己的 .part/.f137 后缀必须整体留在 MAX_PATH 内，
+    # 否则"下完几 GB 才在搬移/改名那一步失败"。
+    stem = capped_download_stem(output_location, filename)
 
     max_height = convert_quality_str_to_int(max_quality)
 
@@ -1316,7 +1507,10 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
     with open(os.devnull, 'w', encoding='utf-8', errors='replace') as devnull:
         for cookie_source in _download_cookie_candidates(browser_cookies):
             ydl_opts = {
-                'outtmpl': f"{filename}.%(ext)s",
+                # 暂存目录必须是真正的目标目录：以前是相对路径（落进进程工作目录），
+                # 完整下载完再 shutil.move 过去——工作目录不可写或目标名超 MAX_PATH
+                # 时搬移失败，几 GB 的完整文件留在原地且只报一个笼统的失败。
+                'outtmpl': os.path.join(output_location, f"{stem}.%(ext)s"),
                 'quiet': True,
                 'logger': logger,
                 'progress_hooks': [logger.hook],
@@ -1381,7 +1575,7 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                                               'resumable downloader')
                     else:
                         accelerated = _accelerated_download(
-                            filename, output_location, video_info, logger,
+                            stem, output_location, video_info, logger,
                             concurrency=concurrency, chunk_size=chunk_size,
                             max_speed=max_speed)
                         if accelerated:
@@ -1390,9 +1584,12 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                         info_dict = ydl.extract_info(url, download=True)
 
                     file_ext = info_dict.get('ext', 'mp4')
-                    source_file = f"{filename}.{file_ext}"
-                    output_file = os.path.join(output_location, f"{os.path.basename(filename)}.{file_ext}")
-                    shutil.move(source_file, output_file)
+                    output_file = os.path.join(output_location, f"{stem}.{file_ext}")
+                    # yt-dlp 已按 outtmpl 下到 output_location，正常情况下文件就在最终
+                    # 位置；只有它自己额外改了名（filepath 与预期不同）时才搬一次，且
+                    # 搬移失败会清掉暂存件（见 _finalize_staged_download）。
+                    _finalize_staged_download(
+                        str(info_dict.get('filepath') or output_file), output_file)
                     return True, output_file
                 except InterruptedError:
                     # 用户在并行传输中按了 Stop：当成取消向上抛，不要走重试。
@@ -1412,13 +1609,16 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
     logger.reset_total_progress(100)
 
     os.makedirs(output_location, exist_ok=True)
+    # 同 download_video：名字主干先按 MAX_PATH 截短，yt-dlp 直接下到目标目录。
+    stem = capped_download_stem(output_location, filename)
     last_error = None
     # 同 download_video：devnull 显式 UTF-8 + replace，标题含本地代码页编不了的
     # 字符时不能让 yt-dlp 的输出把整个下载炸掉。
     with open(os.devnull, 'w', encoding='utf-8', errors='replace') as devnull:
         for cookie_source in _download_cookie_candidates(browser_cookies):
             ydl_opts = {
-                'outtmpl': f"{filename}.%(ext)s",
+                # 同 download_video：outtmpl 落到目标目录，不再是进程工作目录。
+                'outtmpl': os.path.join(output_location, f"{stem}.%(ext)s"),
                 'format': 'bestaudio/best',
                 'noplaylist': True,
                 'quiet': True,
@@ -1465,7 +1665,7 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                                                   'resumable downloader')
                         else:
                             accelerated = _accelerated_audio_download(
-                                filename, output_location, metadata, logger, ydl_opts,
+                                stem, output_location, metadata, logger, ydl_opts,
                                 concurrency=concurrency, chunk_size=chunk_size,
                                 max_speed=max_speed)
                             if accelerated:
@@ -1473,9 +1673,9 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                         info_dict = ydl.extract_info(url, download=True)
                         file_ext = ydl.params['postprocessors'][0].get(
                             'preferredcodec', info_dict.get('ext', 'mp3'))
-                        source_file = f"{filename}.{file_ext}"
-                        output_file = os.path.join(output_location, f"{os.path.basename(filename)}.{file_ext}")
-                        shutil.move(source_file, output_file)
+                        output_file = os.path.join(output_location, f"{stem}.{file_ext}")
+                        _finalize_staged_download(
+                            str(info_dict.get('filepath') or output_file), output_file)
                         return True, output_file
                 except InterruptedError:
                     # 同 download_video：并行传输中的 Stop 是取消，不是失败。

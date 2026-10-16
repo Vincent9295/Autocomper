@@ -37,6 +37,16 @@ from progress import format_transfer_progress, format_hls_progress
 #     以前每个片段都会重打一遍，长批次里刷屏）。以前每 60s 无条件打一条，慢线路
 #     下满屏都是心跳；现在正常的（哪怕偏慢但有前进的）下载完全不刷日志。
 _SEGMENT_PROGRESS_STALL_TIMEOUT = 120.0
+# 校验扫描（reverify）用的原始 PCM 采样率。写 WAV 的这一侧必须钉住它：消费侧
+# （autocomper._read_wav_pcm / _scan_reverify_audio）按这个速率把帧序号换算成秒，
+# 双方不一致就会把片段位置整体缩放（48 kHz 源按 32 kHz 读 → 位置晚 1.5 倍、每个
+# 窗口只扫前 6.67 秒）。见 round 47 审计 P1-1。
+PCM_SCAN_SAMPLE_RATE = 32000
+
+
+def _is_raw_pcm(codec) -> bool:
+    """True for the raw PCM codecs whose sample rate has to be pinned for the scanner."""
+    return str(codec or "").strip().lower().startswith("pcm_")
 _SEGMENT_HEARTBEAT_INTERVAL = 60.0
 _SEGMENT_HEARTBEAT_STALL_THRESHOLD = 30.0
 _SEGMENT_HEARTBEAT_HINT = (
@@ -1475,6 +1485,10 @@ def build_local_window_command(window_file, file_start, inner_seek, start, end,
         command.append("-vn")
         if codec:
             command.extend(["-c:a", str(codec)])
+        if _is_raw_pcm(codec):
+            # 消费侧按 32 kHz 单声道解释这些采样，所以这里必须钉死速率（见
+            # PCM_SCAN_SAMPLE_RATE 的注释）。
+            command.extend(["-ar", str(PCM_SCAN_SAMPLE_RATE), "-ac", "1"])
     else:
         command.extend(["-map", "0:v:0"])
         if has_audio:
@@ -1584,6 +1598,9 @@ def build_segment_command(
         command.append("-vn")
         if codec:
             command.extend(["-c:a", str(codec)])
+        if _is_raw_pcm(codec):
+            # 同 build_local_window_command：扫描侧按 32 kHz 单声道解释原始 PCM。
+            command.extend(["-ar", str(PCM_SCAN_SAMPLE_RATE), "-ac", "1"])
     else:
         command.extend(["-map", "0:v:0"])
         if source.audio_url or embedded_audio:

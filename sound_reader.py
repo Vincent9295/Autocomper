@@ -25,12 +25,17 @@ from remote_prefetch import (
     iter_range_bytes,
     supports_range_prefetch,
 )
-from progress import format_block_progress
+from progress import format_block_progress, format_resume_progress
 
 SAMPLE_RATE = 32000
 is_windows = sys.platform.startswith('win')
 
 DEFAULT_STALL_TIMEOUT = 60.0
+# 看门狗按"多少秒没有**字节**到达"计时，所以读取线程要按小块读（read1）：一次
+# read(chunk_size) 会一直等到**整块** PCM 到齐，那样 60 秒的超时实际是在要求一个
+# 600 秒块（约 9.6 MB 压缩音频）在 60 秒内传完，也就是持续 ≥1.3 Mbit/s；慢一点
+# 的线路每一块都会被误判成"URL 过期"而整源跳过（round 47 审计 P1-4）。
+_STALL_READ_CHUNK = 1 << 16
 _BASE_RETRY_ATTEMPTS = 5
 _MAX_RETRY_ATTEMPTS = 12
 _RETRY_BACKOFF = (2, 5, 10, 20, 40)
@@ -217,10 +222,59 @@ def _is_http_input(source) -> bool:
     return str(source).startswith(("http://", "https://"))
 
 
+def _cached_audio_input(file, cache_store) -> bool:
+    """True when the input is AutoComper's own cached audio file.
+
+    Such a file is stable across runs (keyed by source identity + audio format), which is why
+    it is the one local input that can be length-checked and self-healed: a cached audio that
+    decodes short was cut off during download, while a user's own local file must never be
+    deleted by us.
+    """
+    if cache_store is None or isinstance(file, MediaSource):
+        return False
+    try:
+        root = os.path.realpath(str(cache_store.audio_root))
+        path = os.path.realpath(str(file))
+        if not root:
+            return False
+        return os.path.commonpath([root, path]) == root
+    except (OSError, ValueError):
+        return False
+
+
+def can_start_at_block(file) -> bool:
+    """Whether ``load_audio`` can begin at an arbitrary block for this source.
+
+    Only the Bilibili loader fetches every block with its own ranged request, so only it can
+    skip the blocks a resume has already finished. Every other loader consumes one ordered
+    stream and must read from the beginning.
+
+    Measured on a real 3.38 h Bilibili VOD (BV1434y1T77d, 21 blocks of 600 s): reading blocks
+    0..4 in order took 212 s (42 s/block average, Bilibili throttles a single connection),
+    while fetching block 4 directly took 7.3 s - and the two payloads were **byte-identical**
+    (38,399,780 bytes, same sha256), because the resumed block is the very same ranged request
+    either way. So the fast path cannot change the audio; it only stops downloading and
+    discarding the finished blocks (a 34-block resume saved ~24 minutes in that measurement).
+    """
+    if not isinstance(file, MediaSource) or str(file.platform).lower() != "bilibili":
+        return False
+    try:
+        duration = _get_audio_duration(file)
+    except Exception:                                          # noqa: BLE001
+        return False
+    return duration is not None and duration > 0
+
+
 def load_audio(file: str | MediaSource, sr: int, frame_count: int,
                prefetch_chunk_size=DEFAULT_CHUNK_SIZE,
                prefetch_concurrency=DEFAULT_CONCURRENCY, progress_callback=None,
-               refresh_func=None, select_candidate_func=None):
+               refresh_func=None, select_candidate_func=None, start_block=0):
+    """Yield audio blocks for a source.
+
+    ``start_block`` is honoured only by the loader that can seek per block (Bilibili, see
+    ``can_start_at_block``); the stream-based loaders ignore it and always start at 0, so a
+    caller must keep skipping the leading items itself for those.
+    """
     # Bilibili range responses can fail after earlier PCM has already been
     # yielded. Use the restartable direct FFmpeg path for Remote Stream.
     if (isinstance(file, MediaSource)
@@ -249,7 +303,7 @@ def load_audio(file: str | MediaSource, sr: int, frame_count: int,
         if duration is not None and duration > 0:
             yield from _load_audio_bilibili_blocks(
                 file, sr, frame_count, duration, progress_callback, refresh_func,
-                select_candidate_func
+                select_candidate_func, start_block=start_block
             )
             return
     if isinstance(file, MediaSource) and is_twitch_platform(file.platform):
@@ -401,34 +455,57 @@ def _read_audio_plain(process, chunk_size, cmd):
 def _read_audio_with_stall(process, chunk_size, stall_timeout, cmd):
     """Read FFmpeg stdout with a no-data stall watchdog.
 
-    If no bytes arrive within ``stall_timeout`` seconds the process is killed
-    and ``RemoteAudioStallError`` is raised so callers can refresh the (possibly
-    expired) signed URL and retry instead of hanging forever.
+    The watchdog times **bytes arriving from ffmpeg**, so ``stall_timeout`` really means
+    "the connection has been silent for N seconds". Timing completed blocks instead would
+    turn a healthy but slow line into a failure: a block is ``chunk_size = frame_count * 2``
+    bytes (600 s of audio is about 9.6 MB compressed), so 60 s per block demands a sustained
+    ~1.3 Mbit/s, and Bilibili's per-block fetch makes every block pay it (round 47 audit
+    P1-4: sources were skipped with "remote URL likely expired" on slow lines).
 
-    队列**必须有界**：消费者每个 block 要跑一次 527 类模型（实测约 10× 实时），
-    而 ffmpeg 解码本地/远程音频可以快一两个数量级。无界队列会把整条流解码进内存
-    （3 小时 VOD ≈ 690 MB，10 小时 ≈ 2.3 GB）。maxsize=2 时读取线程在消费者落后时
-    自然阻塞，ffmpeg 的 stdout 管道被填满后也随之等待——看门狗语义不变（有积压时
-    ``get(timeout=...)`` 立即返回，只有真的没数据才会超时）。
+    The queue stays **bounded** (maxsize=2): the consumer runs a 527-class model per block
+    (~10x realtime measured) while ffmpeg decodes orders of magnitude faster, so an
+    unbounded queue would decode the whole stream into memory (3 h VOD ~690 MB, 10 h ~2.3 GB).
+    The reader loop is also cancellable, so an abandoned read cannot leave a thread blocked
+    in ``put`` holding two blocks of PCM forever (round 47 audit, the per-cancel leak).
     """
     import queue as _queue
     import threading as _threading
 
     items = _queue.Queue(maxsize=2)
+    stopped = _threading.Event()
+    last_byte_at = [time.monotonic()]
+
+    def put(item):
+        """Enqueue without ever blocking forever, so a cancel always wins."""
+        while not stopped.is_set():
+            try:
+                items.put(item, timeout=0.25)
+                return True
+            except _queue.Full:
+                continue
+        return False
 
     def reader():
+        buffer = bytearray()
         try:
-            while True:
-                chunk = process.stdout.read(chunk_size)
-                if not chunk:
-                    items.put(None)
+            while not stopped.is_set():
+                # read1 returns as soon as *some* bytes are available (a plain read() waits
+                # for the whole chunk), which is what lets the watchdog time byte silence.
+                data = process.stdout.read1(_STALL_READ_CHUNK)
+                if not data:
                     break
-                items.put(chunk)
+                last_byte_at[0] = time.monotonic()
+                buffer.extend(data)
+                while len(buffer) >= chunk_size:
+                    if not put(bytes(buffer[:chunk_size])):
+                        return
+                    del buffer[:chunk_size]
+            if buffer and not stopped.is_set():
+                put(bytes(buffer))
+            put(None)
         except BaseException as exc:  # noqa: BLE001 - surface any read error
-            try:
-                items.put(exc)
-            except BaseException:  # noqa: BLE001 - consumer已经走了
-                pass
+            if not stopped.is_set():
+                put(exc)
 
     thread = _threading.Thread(target=reader, name="audio-reader", daemon=True)
     thread.start()
@@ -436,12 +513,14 @@ def _read_audio_with_stall(process, chunk_size, stall_timeout, cmd):
     try:
         while True:
             try:
-                item = items.get(timeout=stall_timeout)
+                item = items.get(timeout=0.25)
             except _queue.Empty:
-                process.kill()
-                raise RemoteAudioStallError(
-                    f"No audio data for {stall_timeout:g}s; remote URL likely expired "
-                    f"or the connection hung")
+                if time.monotonic() - last_byte_at[0] > stall_timeout:
+                    process.kill()
+                    raise RemoteAudioStallError(
+                        f"No audio bytes for {stall_timeout:g}s; the remote URL may have "
+                        f"expired or the connection hung")
+                continue
             if item is None:
                 break
             if isinstance(item, BaseException):
@@ -449,11 +528,13 @@ def _read_audio_with_stall(process, chunk_size, stall_timeout, cmd):
             yield item
     except GeneratorExit:
         cancelled = True
+        stopped.set()
         process.terminate()
         process.wait()
         thread.join(timeout=1)
         return
     finally:
+        stopped.set()
         if thread.is_alive():
             thread.join(timeout=1)
         try:
@@ -474,15 +555,25 @@ def _exception_in_flight() -> bool:
 
 def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
                                 progress_callback=None, refresh_func=None,
-                                select_candidate_func=None):
+                                select_candidate_func=None, start_block=0):
+    """Fetch one ranged request per block, optionally starting at ``start_block``.
+
+    Each index is its own ffmpeg call with `-ss index * block_duration`, so a resume can begin
+    at the block it stopped at: the finished blocks' requests are simply never issued, and the
+    resumed block's audio is byte-identical to what the sequential read would have produced.
+    """
     block_duration = frame_count / sr
+    # 防御性取整：block_size 正常来自 GUI 的 IntVar，但预设文件/调用方可能给 float，
+    # 而切片和 range() 都要求整数（否则一个 TypeError 会被下面的重试阶梯放大成几十秒）。
+    frame_count = int(frame_count)
     block_count = _duration_block_count(duration, block_duration)
+    start_block = max(0, min(int(start_block or 0), block_count))
     attempts = scaled_retry_attempts(duration)
     # 连续失败达到阈值才切换 CDN（CDN 探测有成本，频繁探测反而触发限流）。
     # 每次失败先 refresh（换签名），连续失败说明不是签名问题而是节点慢。
     cdn_switches = 0
     consecutive_failures = 0
-    for index in range(block_count):
+    for index in range(start_block, block_count):
         start_time = index * block_duration
         segment_duration = min(block_duration, max(0, duration - start_time))
         if segment_duration <= 0:
@@ -497,8 +588,21 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
                     stall_timeout=DEFAULT_STALL_TIMEOUT,
                 ):
                     block.extend(chunk)
-                for chunk_start in range(0, len(block), frame_count * 2):
-                    yield bytes(block[chunk_start:chunk_start + frame_count * 2])
+                if not block:
+                    # A range request that returns nothing means the audio stream ends here.
+                    # Bilibili's metadata duration is routinely a little longer than the real
+                    # audio track, so the last (sometimes the last two) block indices point past
+                    # EOF. That is the end of the stream, not a failure: stop asking for more
+                    # instead of burning the retry ladder on ranges that cannot exist.
+                    print(f"Remote audio ended before block {index + 1}/{block_count}; "
+                          f"continuing with what the stream has.")
+                    return
+                # 一个索引只产出**一个**元素，并且不超过一块的采样数。以前这里按
+                # frame_count 切片（range(0, len(block), frame_count * 2)），一次读多了
+                # 就会产出两个元素：消费方按"一个元素 = 一整块 block_size"推进时间轴，
+                # 于是 UI 显示 "Block: 14 / 13"、后面所有时间戳整体后移一个 block
+                # （Twitch 那条注释警告过的"重复块数 x block_size"家族）。读多了就截断。
+                yield bytes(block[:frame_count * 2])
                 last_error = None
                 consecutive_failures = 0
                 break
@@ -506,6 +610,10 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
                 last_error = exc
                 consecutive_failures += 1
                 if attempt >= attempts - 1:
+                    # 注意：这里**不能**把"最后一块报错"当成流结束。空读是"音频到此为止"
+                    # 的硬证据（ffmpeg 越过 EOF 会写出 0 字节且 rc=0）；而 403/超时/解码
+                    # 失败只说明这一刻没拿到数据，静默当成结束会把真实音频丢掉，甚至让
+                    # 单块源"成功检测出 0 个片段"。报错照旧上抛，让上层按源失败处理。
                     raise
                 time.sleep(retry_backoff(attempt))
                 if refresh_func is not None:
@@ -552,6 +660,10 @@ class _LookaheadBlocks:
         self._error = None
         self._closed = False
         self._started = False
+        # 取消/放弃时用它把卡在 put 上的 worker 放出来：否则线程会带着一整块 PCM
+        # （600 秒块约 106 MB）永久停在那里（round 48 终检发现）。
+        import threading as _threading
+        self._stopped = _threading.Event()
 
     def __len__(self):
         return len(self._blocks)
@@ -567,19 +679,28 @@ class _LookaheadBlocks:
         def worker():
             try:
                 for block in self._blocks:
-                    if self._closed:
+                    if self._closed or self._stopped.is_set():
                         break
-                    self._queue.put(block)            # 队列满就在这里等：读到的块数受 depth 限制
+                    if not self._put(block):
+                        return
             except BaseException as exc:              # noqa: BLE001 - 原样交给消费方
                 self._error = exc
             finally:
-                try:
-                    self._queue.put(None)
-                except BaseException:
-                    pass
+                if not self._stopped.is_set():
+                    self._put(None)
 
         self._thread = _threading.Thread(target=worker, name="audio-lookahead", daemon=True)
         self._thread.start()
+
+    def _put(self, item):
+        """入队但绝不无限等待：消费者放弃/取消后必须能退出（见 _stopped 的注释）。"""
+        while not self._stopped.is_set():
+            try:
+                self._queue.put(item, timeout=0.25)
+                return True
+            except Exception:                         # noqa: BLE001 - queue.Full
+                continue
+        return False
 
     def __iter__(self):
         self._start()
@@ -603,6 +724,9 @@ class _LookaheadBlocks:
         if self._closed:
             return
         self._closed = True
+        # 先放行卡在 put 上的 worker，再关底层生成器并等它退出：
+        # 否则消费方放弃时线程会带着一整块 PCM 永远停在那次 put 上。
+        self._stopped.set()
         closer = getattr(self._blocks, "close", None)
         if callable(closer):
             try:
@@ -860,7 +984,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_gpu=True, cache_store=None, progress_callback=None,
                    refresh_func=None, save_audio_path=None,
-                   select_candidate_func=None, prefetch_concurrency=None):
+                   select_candidate_func=None, prefetch_concurrency=None,
+                   prepare_source_func=None):
     # 必须是"正数"：0 会让 subsample 除零（precision=0 → ZeroDivisionError 卡在
     # 检测中途），block_size=0 会让 frame_count/chunk_size 归零（AudioDecodeError）。
     # GUI 的数字校验只挡非数字，用户手打 0 是可能的。
@@ -902,6 +1027,16 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                         _ + 1, block_count, 0, source_duration=_dur))
         return previous_data, True
 
+    # 读前准备（目前是"逐源挑选最快的音频 CDN 候选"）：只有两个缓存都没命中、确实要读
+    # 音频时才做。以前调用方在调用本函数**之前**就无条件探测，于是每个"已有检测结果"的
+    # 源也要白测一遍候选（每个候选 5 秒超时 + 1 秒限流），几百个源的批次就是十几分钟的
+    # 无用网络活动；失败只记一行日志，加载器会退回默认 URL（与旧行为一致）。
+    if prepare_source_func is not None:
+        try:
+            prepare_source_func(file)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"Audio candidate probe skipped: {type(exc).__name__}")
+
     if ort_session is None:
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -917,14 +1052,6 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                                                providers=['CPUExecutionProvider'])
 
     offset = 0
-    blocks = load_audio(
-        file, SAMPLE_RATE, SAMPLE_RATE * block_size,
-        prefetch_concurrency=(prefetch_concurrency if prefetch_concurrency
-                              else DEFAULT_CONCURRENCY),
-        progress_callback=progress_callback if is_remote else None,
-        refresh_func=refresh_func if is_remote else None,
-        select_candidate_func=select_candidate_func if is_remote else None,
-    )
     _dur = _get_audio_duration(file)
     block_count = 1
     if _dur is not None:
@@ -932,9 +1059,6 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                        if is_remote else max(1, int(_dur / block_size) + 1))
         if is_remote:
             _log_remote_progress(logger, _dur, block_size)
-        blocks = _SizedIterable(blocks, block_count)
-    else:
-        blocks = _SizedIterable(blocks, 1)
 
     info = {'filename': file, 'timestamps': []}
     frame_count = SAMPLE_RATE * block_size
@@ -945,6 +1069,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     # 中断/过期这回事，且每次都会变），并且检查点里的时长必须与本次一致。
     resume_args = None
     resumed_blocks = 0
+    skip_blocks = 0
     if is_remote and cache_store is not None:
         resume_args = _detection_cache_args(file, model, precision, block_size, threshold, focus_idx)
         checkpoint = _load_checkpoint(cache_store, resume_args, _dur, block_size)
@@ -954,8 +1079,40 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                 info['timestamps'] = list(checkpoint["timestamps"])
                 offset = resumed_blocks * block_size
                 processed_blocks = resumed_blocks
+                # B 站按块取流，可以直接从恢复的那一块开始读，不用把已完成的块重下一遍；
+                # 其他平台是单条顺序流，只能读完再用 continue 丢掉（下面循环里那一支）。
+                # 实测（BV1434y1T77d，3.38 h）：顺序读 5 块 212 秒 vs 直取第 5 块 7.3 秒，
+                # 两者音频逐字节相同 —— 因为本来就是同一个 ranged 请求。
+                skip_blocks = resumed_blocks if can_start_at_block(file) else 0
                 print(f"Remote Stream resumed: {resumed_blocks}/{block_count} blocks "
                       f"already done, continuing from block {resumed_blocks + 1}")
+                if skip_blocks:
+                    print(f"  Fast resume: the {skip_blocks} finished block(s) are skipped, "
+                          f"not re-read (this platform fetches every block on its own).")
+                else:
+                    # 明说"会重扫一遍"：已完成的块不重新推理，但音频必须按序再读一遍，
+                    # 对长 VOD 就是几分钟到几十分钟的静默期。以前什么都不说，用户看到
+                    # 的就是"卡在这一步"（测试者实测约 10 分钟）。见 round 47。
+                    reread_hours = (resumed_blocks * block_size) / 3600.0
+                    print(f"  Note: the audio for those {resumed_blocks} finished block(s) "
+                          f"(about {reread_hours:.1f} h) is read again before detection "
+                          f"continues. The model is not re-run and nothing is lost, but this "
+                          f"can take a while on a long VOD; the panel shows "
+                          f"\"Re-scan: re-reading already-detected audio\" with an ETA.")
+
+    blocks = load_audio(
+        file, SAMPLE_RATE, SAMPLE_RATE * block_size,
+        prefetch_concurrency=(prefetch_concurrency if prefetch_concurrency
+                              else DEFAULT_CONCURRENCY),
+        progress_callback=progress_callback if is_remote else None,
+        refresh_func=refresh_func if is_remote else None,
+        select_candidate_func=select_candidate_func if is_remote else None,
+        start_block=skip_blocks,
+    )
+    if _dur is not None:
+        blocks = _SizedIterable(blocks, max(1, block_count - skip_blocks))
+    else:
+        blocks = _SizedIterable(blocks, 1)
 
     if logger:
         bar_logger = default_bar_logger(logger)
@@ -973,8 +1130,17 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     if is_remote and save_audio_path:
         wav_file = _open_wav_writer(save_audio_path)
     try:
-        for block_index, block in enumerate(blocks, 1):
+        for block_index, block in enumerate(blocks, skip_blocks + 1):
             if block_index <= resumed_blocks:
+                # 只有"单条顺序流"的平台会走到这里（B 站已由 start_block 跳过它们）：
+                # 这些块必须按序读出来才能到达恢复点，读出来直接丢掉。
+                if is_remote and progress_callback is not None:
+                    progress_callback(
+                        format_resume_progress(
+                            block_index, resumed_blocks, time.monotonic() - started_at,
+                            source_duration=_dur,
+                        )
+                    )
                 continue          # 已完成的块：音频照读（要按序解码），但不重复推理
             # 任务边界（按块）：暂停在这里等待，取消优先。这一刻没有子进程正在被
             # 读取——音频预读线程最多再往前读一块就会阻塞在有界队列上，所以不会
@@ -1016,14 +1182,45 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
 
 
     if is_remote and _dur is not None:
-        if processed_blocks < block_count:
+        missing = block_count - processed_blocks
+        if missing == 1:
+            # 元数据时长通常比音频流本身略长（Bilibili 的音频轨尤其常见），所以最后一块
+            # 取不到是"流自然结束"，不是损坏。整源按已完成处理：否则这个源每次运行都必然
+            # 被判 incomplete 而跳过，检查点又停在 block_count-1，形成永远撞同一面墙的
+            # 重试循环（见 round 47 的复现测试）。
+            print(f"Remote Stream audio ended one block early "
+                  f"({processed_blocks}/{block_count}); treating the source as complete.")
+        elif missing > 0:
             message = (
                 f"Remote Stream incomplete: processed {processed_blocks}/{block_count} blocks "
                 f"({file.display_name or file.source_id or 'remote source'})"
             )
             print(f"Remote Stream incomplete: processed {processed_blocks}/{block_count} blocks")
             raise RemoteAudioIncompleteError(message)
-        print(f"Remote Stream completed: {processed_blocks}/{block_count} blocks")
+        elif processed_blocks > block_count:
+            print(f"Remote Stream completed: {block_count}/{block_count} blocks "
+                  f"({processed_blocks - block_count} extra tail block(s) past the metadata "
+                  f"duration)")
+        else:
+            print(f"Remote Stream completed: {processed_blocks}/{block_count} blocks")
+    elif _dur is not None and _cached_audio_input(file, cache_store):
+        # 缓存音频过去完全不查长度：截断的 m4a（容器时长照旧报完整、mdat 提前结束）会被
+        # 当成"检测完成"，缺失的那段片段永远不出现，而且坏缓存会被一直复用。本地分支的
+        # block_count 自带 +1 余量（int(dur/block)+1），所以"少 1 块"是正常尾巴，
+        # 少 2 块以上才算截断，抛 AudioDecodeError 走既有的损坏缓存自愈分支。
+        missing = block_count - processed_blocks
+        if missing > 1:
+            raise AudioDecodeError(
+                -1, [str(file)],
+                stderr=(f"cached audio is short: decoded {processed_blocks}/"
+                        f"{block_count} blocks"))
+        if missing == 1:
+            print(f"Cached audio ended one block early ({processed_blocks}/{block_count}); "
+                  f"treating the source as complete.")
+    elif _dur is not None and block_count - processed_blocks > 1:
+        # 用户自己的本地文件：只报告，绝不删除（那不是我们的缓存）。
+        print(f"Audio file is shorter than its container duration: processed "
+              f"{processed_blocks}/{block_count} blocks ({file})")
 
     if is_remote and cache_store is not None:
         cache_result = dict(info)

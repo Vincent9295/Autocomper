@@ -1,5 +1,6 @@
 """Pure transfer-progress formatting and thread-safe UI adaptation helpers."""
 
+import threading
 import time
 
 
@@ -98,8 +99,12 @@ def format_transfer_progress(current, total, elapsed, source_duration=None):
 
 
 def format_block_progress(current, total, elapsed, source_duration=None):
-    current = max(0, int(current or 0))
+    raw_current = max(0, int(current or 0))
     total = max(1, int(total or 1))
+    # 分子是读取器实际产出的块序号，分母是 ceil(时长/块大小)。音频比元数据长一点时
+    # 分子会超出分母（UI 曾经显示 "Block: 14 / 13"），显示层必须夹住；真实值留在
+    # raw_current 里备查。
+    current = min(raw_current, total)
     elapsed = max(0.0, float(elapsed or 0))
     percent = min(100.0, current / total * 100)
     realtime = None
@@ -125,6 +130,43 @@ def format_block_progress(current, total, elapsed, source_duration=None):
         "speed_line": speed_text,
         "eta_line": "ETA: --",
         "text": f"Block: {current} / {total} | Progress: {percent:.0f}% | {speed_text}",
+        "phase": "detecting",
+        "raw_current": raw_current,
+    }
+
+
+def format_resume_progress(current, total, elapsed, source_duration=None):
+    """Progress while a resumed detection re-reads the blocks it already finished.
+
+    The audio has to be consumed in order, so a resume re-streams every finished block
+    without analysing it. That used to be completely silent, which is why a resumed long
+    VOD looked like a hung run (round 47). The sample therefore says what is happening
+    (a re-scan, no model work) and how long it is likely to take: every finished block
+    costs roughly the same, so the time spent so far extrapolates to the remaining ones.
+    """
+    current = max(0, int(current or 0))
+    total = max(1, int(total or 1))
+    current = min(current, total)
+    elapsed = max(0.0, float(elapsed or 0))
+    percent = min(100.0, current / total * 100) if total else 100.0
+    eta = None
+    if 0 < current < total and elapsed > 0:
+        eta = (total - current) * (elapsed / current)
+    return {
+        "current": current,
+        "total": total,
+        "elapsed": elapsed,
+        "percent": percent,
+        "speed_mb_s": None,
+        "eta_seconds": eta,
+        "realtime": None,
+        "stage": "transferring",
+        "title": "Resuming detection",
+        "current_line": f"Re-scan: re-reading already-detected audio {current} / {total}",
+        "percent_line": f"Resuming: {percent:.0f}%",
+        "speed_line": "Re-scan only: the audio is read again, the model is not re-run",
+        "eta_line": f"ETA: {_clock_text(eta)}" if eta is not None else "ETA: --",
+        "text": f"Re-scan: re-reading already-detected audio {current} / {total}",
         "phase": "detecting",
     }
 
@@ -315,16 +357,25 @@ class ProgressWidgetAdapter:
         self.last_submit = None
         self.pending = None
         self.scheduled = False
+        # pending/scheduled 是"worker 线程写、主线程读改写"的共享状态：没有锁时
+        # worker 会在 _flush 已经读过 pending、但还没清 scheduled 的窗口里写入新样本，
+        # 然后因为 scheduled 仍为 True 直接返回——这份样本永远不会被渲染，条/标签
+        # 停在上一份样本（典型就是上一个文件的 100% / ETA 00:00），而末尾样本更是
+        # 再没有下一样本来救。加锁让 submit 与 _flush 的读改写互斥：要么新样本进
+        # pending、由本次 flush 渲染，要么 _flush 先跑完、submit 看到 scheduled=False
+        # 并排下一次 flush。节流语义（interval/force/合并）完全不变。
+        self._lock = threading.Lock()
 
     def submit(self, sample, force=False):
         now = self.clock()
-        if not force and self.last_submit is not None and now - self.last_submit < self.interval:
-            return False
-        self.last_submit = now
-        self.pending = sample
-        if self.scheduled:
-            return True
-        self.scheduled = True
+        with self._lock:
+            if not force and self.last_submit is not None and now - self.last_submit < self.interval:
+                return False
+            self.last_submit = now
+            self.pending = sample
+            if self.scheduled:
+                return True
+            self.scheduled = True
         if self.ui_queue is not None:
             # 后台线程投递到主线程的 UI 队列，由主线程单点轮询执行 _flush
             self.ui_queue.put((self._flush, ()))
@@ -333,23 +384,26 @@ class ProgressWidgetAdapter:
         return True
 
     def _flush(self):
-        sample = self.pending
-        self.pending = None
-        self.scheduled = False
-        if sample is None:
-            return
-        total = sample.get("total")
-        current = sample.get("current", 0)
-        if total:
-            self.bar["value"] = min(100.0, float(current) / float(total) * 100)
-        elif sample.get("stage") == "transferring" and not current:
-            # 起始样本（新文件开跑、文件大小未知，total 为 None）：把条形图
-            # 归零。否则条会保留上一个文件的 100% 满格，看起来像卡死。
-            self.bar["value"] = 0
-        lines = [sample.get("title", ""), sample.get("current_line", ""),
-                 sample.get("percent_line", ""), sample.get("speed_line", ""),
-                 sample.get("eta_line", "")]
-        if any(lines):
-            self.label.set("\n".join(line for line in lines if line))
-        else:
-            self.label.set(sample.get("text", ""))
+        # 渲染也放在锁里：否则 flush#1 清掉 scheduled 后可能被 flush#2 抢先把更新的
+        # 样本画上去，flush#1 再把旧样本画回来（条形图倒退）。
+        with self._lock:
+            sample = self.pending
+            self.pending = None
+            self.scheduled = False
+            if sample is None:
+                return
+            total = sample.get("total")
+            current = sample.get("current", 0)
+            if total:
+                self.bar["value"] = min(100.0, float(current) / float(total) * 100)
+            elif sample.get("stage") == "transferring" and not current:
+                # 起始样本（新文件开跑、文件大小未知，total 为 None）：把条形图
+                # 归零。否则条会保留上一个文件的 100% 满格，看起来像卡死。
+                self.bar["value"] = 0
+            lines = [sample.get("title", ""), sample.get("current_line", ""),
+                     sample.get("percent_line", ""), sample.get("speed_line", ""),
+                     sample.get("eta_line", "")]
+            if any(lines):
+                self.label.set("\n".join(line for line in lines if line))
+            else:
+                self.label.set(sample.get("text", ""))
