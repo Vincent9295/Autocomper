@@ -287,13 +287,17 @@ def check_compile_disk_space(output_location, total_seconds, max_height=None,
                          reserve=reserve)
 
 
-def run_tracked(cmd, timeout=None, text=False):
+def run_tracked(cmd, timeout=None, text=False, creationflags=None):
     """subprocess.run 等价物，注册进程以便取消时统一终止。
 
     输出在 daemon reader 线程上读取，主循环用 ``queue.get(timeout=...)``
-    非阻塞等待——避免 FFmpeg 探测命令在 CDN 半开连接上挂起时（无输出、
+    非阻塞等待，避免 FFmpeg 探测命令在 CDN 半开连接上挂起时（无输出、
     进程不退出）永久阻塞 ``read``，使 timeout 永远不触发（曾导致 Audio
     Cache 的 CDN 探测卡死整个批次）。
+
+    ``creationflags`` 供调用方覆盖默认的 ``CREATE_NO_WINDOW``（Windows）。
+    例如 clip 完整性校验用它加上 ``BELOW_NORMAL_PRIORITY_CLASS``，避免
+    后台解码把前台 UI 抢到无响应。
     """
     # 热路径上顺带回收"上一次被硬杀留下的临时根"（节流到每进程每小时一次，
     # 见 sweep_stale_temp_roots_once）：这是本进程里第一个必然被调到的、又能代表
@@ -302,7 +306,8 @@ def run_tracked(cmd, timeout=None, text=False):
     sweep_stale_temp_roots_once()
     opts = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
     if sys.platform == 'win32':
-        opts['creationflags'] = 0x08000000
+        opts['creationflags'] = (0x08000000 if creationflags is None
+                                 else int(creationflags))
     p = subprocess.Popen(cmd, **opts)
     _ACTIVE_PROCS.add(p)
     started_at = time.monotonic()

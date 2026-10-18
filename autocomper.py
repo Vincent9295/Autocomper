@@ -197,7 +197,8 @@ REMOTE_CONCURRENCY_MIN = 1
 REMOTE_CONCURRENCY_MAX = 16
 REMOTE_AUDIO_CHUNK_TOOLTIP_TEXT = (
     "Audio Cache download chunk size, in MiB. Also used by Full Download's\n"
-    "parallel transfer (Bilibili/YouTube download one connection otherwise).\n"
+    "parallel transfer and by YouTube Remote Stream's audio prefetch\n"
+    "(Bilibili/YouTube download one connection otherwise).\n"
     "Smaller chunks recover faster when a single request hangs; larger chunks\n"
     "make fewer requests. This setting depends heavily on your CDN and network:\n"
     "if your connection is unstable, a large chunk can hang forever and stall the\n"
@@ -1206,6 +1207,23 @@ def source_key(value):
 def remote_mode_actions(mode):
     """Return (resolve_sources, cache_audio, full_download) for a UI mode."""
     return mode != "Full Download", mode == "Audio Cache", mode == "Full Download"
+
+
+def prepare_remote_audio_source(value, limiter, log_func=print):
+    """Pick the fastest audio CDN right before detection actually reads audio.
+
+    ``sound_reader.get_timestamps`` calls this only on a detection-cache miss, for
+    every input type. Audio Cache and Full Download hand it a **local file path**
+    (their detection runs on a cached/downloaded file), and there is nothing to
+    choose for those: probing a non-MediaSource used to raise AttributeError
+    (logged as "Audio candidate probe skipped" once per source) and cost one
+    pointless rate-limiter wait. This guard restores the published 08698a5
+    semantics at the one seam all three modes share.
+    """
+    if not isinstance(value, MediaSource):
+        return None
+    limiter.wait()
+    return select_audio_candidate(value, log_func=log_func)
 
 
 def download_identity(source) -> str:
@@ -8074,9 +8092,10 @@ class VideoProcessorApp:
                 候选并把 audio_url 钉死在读取前一刻；限流器照旧生效，防大批次触发限流。
                 已有检测结果的源不会走到这里（见 sound_reader.get_timestamps 的
                 prepare_source_func），因此不会再有"什么都不用做却先测一轮 CDN"的浪费。
+                Audio Cache / Full Download 的输入是本地路径，直接跳过（见
+                prepare_remote_audio_source 的类型守卫）。
                 """
-                _probe_limiter.wait()
-                select_audio_candidate(value, log_func=print)
+                prepare_remote_audio_source(value, _probe_limiter, log_func=print)
 
             refresh_func = LimitedRefresher(
                 lambda source: refresh_remote_source(
@@ -8200,6 +8219,11 @@ class VideoProcessorApp:
                         _report_cached_audio_alignment(
                             source, audio_cache_paths[stable_source_id(source)],
                             cache_store, _probe_limiter)
+                    except InterruptedError:
+                        # A cancel must stop the whole run, not be recorded as a
+                        # per-source failure (the writer checks cancel_pending
+                        # inside every range).
+                        raise
                     except Exception as exc:
                         message = (
                             f"Could not cache audio for {get_source_display_name(source)}: {exc}"
@@ -8625,6 +8649,7 @@ class VideoProcessorApp:
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
                             use_gpu=use_gpu, ort_session=shared_session, cache_store=cache_store,
                             refresh_func=refresh_func,
+                            prefetch_chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024,
                             prefetch_concurrency=self.remote_audio_concurrency.get(),
                             prepare_source_func=_prepare_remote_source,
                             select_candidate_func=(
@@ -8698,6 +8723,7 @@ class VideoProcessorApp:
                                     threshold, focus_idx, selected_model, self.final_bar,
                                     use_gpu=use_gpu, ort_session=shared_session,
                                     cache_store=cache_store, refresh_func=refresh_func,
+                                    prefetch_chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024,
                                     prefetch_concurrency=self.remote_audio_concurrency.get(),
                                     progress_callback=lambda sample, upload=upload, i=i:
                                         self._queue_transfer_progress(

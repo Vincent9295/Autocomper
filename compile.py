@@ -1829,7 +1829,11 @@ def longest_still_run(video_file, start=None, seconds=None, timeout=300):
     低分辨率（320x180）解码取灰度，逐帧算平均绝对差。这比逐帧时间戳可靠：
     时间戳在冻结时仍然均匀（实测确认），帧间差分才反映"画面真的没动"。
     """
-    command = [FFMPEG_PATH, '-hide_banner', '-v', 'error']
+    # 双线程解码：320x180 的灰度差分不需要多核；两个校验 worker 合计最多 4 个
+    # 解码线程，UI 和系统仍有空闲核心。不要放回默认的自动线程数（2 路 ffmpeg
+    # 会吃满 4C/8T，Tk 主线程饿死，测试者看到的就是整机冻住）。
+    command = [FFMPEG_PATH, '-hide_banner', '-v', 'error',
+               '-threads', '2', '-filter_threads', '1']
     if start is not None:
         command += ['-ss', f'{max(0.0, float(start)):.6f}']
     if seconds is not None:
@@ -1842,7 +1846,10 @@ def longest_still_run(video_file, start=None, seconds=None, timeout=300):
         # 必须 text=False：_run_ffmpeg 走 text=True，会把 rawvideo 按 UTF-8 解码，
         # 像素被替换字符破坏（实测把整段冻结算成 run=1）——那会变成"静默漏报"，
         # 比不检查更糟，所以这里直接调 run_tracked 拿 bytes。
-        result = run_tracked(command, timeout=timeout, text=False)
+        result = run_tracked(
+            command, timeout=timeout, text=False,
+            creationflags=((0x08000000 | 0x00004000) if sys.platform == 'win32'
+                           else None))
     except Exception:
         return None
     if getattr(result, 'returncode', 0) != 0:
@@ -1880,26 +1887,44 @@ def clip_integrity_problem(output_file, source_file, timestamps):
 
     返回 (是否故障, 输出最长静止段, 源最长静止段)。测量不了时返回
     (False, None, None)——宁可漏报也不误报：误报会重切一个本来正常的片段。
+
+    ``output_file`` 是**一个 entry 的所有 clip 拼起来的**文件，``timestamps``
+    是这一 entry 的多个区间。必须**逐个区间**在输出文件里按累计偏移取对应
+    窗口，不能拿 ``max(end) - min(start)`` 当 span：本地影片的 clips 分散在
+    几小时里，那个 span 会把整个源影片解码一遍（实测 10 段分散在 4.5 小时
+    → 单次校验解码 4.5 小时源，最终 timeout/unchecked，整机被拖死）。
     """
     if not timestamps:
         return False, None, None
-    clip_start = max(0.0, min(start for start, _ in timestamps))
-    clip_end = max(end for _, end in timestamps)
-    span = max(clip_end - clip_start, 0.1)
-    out_run = longest_still_run(output_file, 0.0, span)
-    if out_run is None:
-        return False, None, None
-    if out_run < _INTEGRITY_MIN_RUN:
-        return False, out_run, None          # 输出本来就在动，不必再量源
-    src_run = longest_still_run(
-        source_file,
-        max(0.0, clip_start - _INTEGRITY_SOURCE_SLACK_S),
-        span + 2 * _INTEGRITY_SOURCE_SLACK_S)
-    if src_run is None:
-        return False, out_run, None          # 量不到源就不动它
-    problem = (out_run > src_run * _INTEGRITY_FLAG_RATIO
-               and out_run - src_run > _INTEGRITY_FLAG_MARGIN)
-    return problem, out_run, src_run
+    out_offset = 0.0
+    worst_out = None
+    worst_src = None
+    for start, end in timestamps:
+        start = float(start)
+        end = float(end)
+        span = max(end - start, 0.1)
+        out_run = longest_still_run(output_file, out_offset, span)
+        if out_run is None:
+            return False, None, None
+        if worst_out is None or out_run > worst_out:
+            worst_out = out_run
+        if out_run < _INTEGRITY_MIN_RUN:
+            out_offset += span                 # 输出本来就在动，不必再量源
+            continue
+        src_run = longest_still_run(
+            source_file,
+            max(0.0, start - _INTEGRITY_SOURCE_SLACK_S),
+            span + 2 * _INTEGRITY_SOURCE_SLACK_S)
+        if src_run is None:
+            return False, out_run, None        # 量不到源就不动它
+        if worst_src is None or src_run > worst_src:
+            worst_src = src_run
+        problem = (out_run > src_run * _INTEGRITY_FLAG_RATIO
+                   and out_run - src_run > _INTEGRITY_FLAG_MARGIN)
+        if problem:
+            return True, out_run, src_run
+        out_offset += span
+    return False, worst_out, worst_src
 
 
 # ── 片段画质校验：落盘分辨率 vs 源本该交付的清晰度 ─────────────────────
@@ -2211,9 +2236,12 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                 # 切片阶段只逐条打印 "Done writing all clips ..."，之后进入校验会有
                 # 一段没有任何输出的时间（长批次里看着像卡住）。这里明说在干什么，
                 # 并按用户要求补一句"片段多就要等"。
+                # 一个 task 是一个 entry，可能包含几十个 clip；计数和日志必须按 clip，
+                # 否则本地单源 100 段会显示成 "1 clips"，看起来像在校验整个成片。
+                total_clips = sum(len(task[3]) for task in tasks)
                 print(f"{Fore.CYAN}Verifying clip quality and integrity "
-                      f"({len(tasks)} clips)...{Style.RESET_ALL}")
-                if len(tasks) >= 50:
+                      f"({total_clips} clips)...{Style.RESET_ALL}")
+                if total_clips >= 50:
                     print(f"{Fore.CYAN}This can take a while with many clips; "
                           f"thanks for your patience.{Style.RESET_ALL}")
                 verified = re_cut = unchecked = 0
@@ -2226,6 +2254,7 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                     nonlocal verified, re_cut, unchecked
                     (_n, fn, fn_stripped, ts, tmp, _cr, _preserve, _dur, expected_height,
                      delivered_is_source_best) = task
+                    clip_count = len(ts)
                     if not os.path.exists(tmp):
                         return             # 切片失败的片段已经报过了
                     # 画质校验（落盘片段 vs 源本该交付的档位）：降级取回的片段在
@@ -2250,6 +2279,9 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         print(f"{Fore.YELLOW}  Clip integrity check skipped for "
                               f"{fn_stripped}: {_sanitize_ffmpeg_detail(exc)}"
                               f"{Style.RESET_ALL}")
+                        with integrity_lock:
+                            unchecked += clip_count
+                            integrity_done["count"] += clip_count
                         return
                     with integrity_lock:
                         # out_run is None = 这一片段**根本没量到**（ffmpeg 超时/失败、
@@ -2257,14 +2289,14 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                         # 和"量过且干净"一起计入 verified，日志于是把一个冻结检查
                         # 从未跑过的片段说成已校验；现在单独计一桶（判定逻辑不变）。
                         if out_run is None:
-                            unchecked += 1
+                            unchecked += clip_count
                         elif src_run is None and out_run >= _INTEGRITY_MIN_RUN:
                             # 输出量到了、但源那一侧没量到（第二次 ffmpeg 失败/超时）：
                             # 冻结比对其实从未发生，同样不能算"已校验"。
-                            unchecked += 1
+                            unchecked += clip_count
                         else:
-                            verified += 1
-                        integrity_done["count"] += 1
+                            verified += clip_count
+                        integrity_done["count"] += clip_count
                     if not problem:
                         return
                     print(f"{Fore.YELLOW}  {fn_stripped}: the clip held one frame for "
@@ -2290,11 +2322,19 @@ def compile_vid(dict_list, output, merge_clips=True, combine_vids=True,
                               f"re-cutting{Style.RESET_ALL}")
                     else:
                         with integrity_lock:
-                            re_cut += 1
+                            re_cut += clip_count
 
                 # 校验是"只读解码 + 必要时重切"，互相独立；并发数同样按任务数/内存取最小。
+                # 每个校验 ffmpeg 已经限定 2 线程，这里再按逻辑核数封顶：8 线程机器
+                # 最多 2 个，4 线程机器最多 1 个，留给 Tk 主线程和系统其余部分。
+                _cpu_cap = max(1, (os.cpu_count() or 4) // 4)
+                effective_integrity = max(1, min(int(integrity_parallel), _cpu_cap))
+                if effective_integrity != int(integrity_parallel):
+                    print(f"{Fore.CYAN}Integrity check: using {effective_integrity} "
+                          f"parallel task(s) on {os.cpu_count() or 'unknown'} logical "
+                          f"CPU(s).{Style.RESET_ALL}")
                 integrity_failures = _run_parallel(
-                    tasks, check_one, integrity_parallel, _INTEGRITY_MEMORY_PER_WORKER_MB,
+                    tasks, check_one, effective_integrity, _INTEGRITY_MEMORY_PER_WORKER_MB,
                     "clip-integrity",
                     progress_note=lambda: format_compile_progress(
                         0, None, 0,

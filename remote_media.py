@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -16,14 +17,16 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from utils import (FFMPEG_PATH, run_tracked, run_tracked_progress,
+from utils import (FFMPEG_PATH, cancel_pending, run_tracked, run_tracked_progress,
                    is_twitch_platform, register_proc, unregister_proc)
 from remote_prefetch import (
-    SpeedMonitor,
+    CdnTooSlowError,
     _probe_real_size,
     _parse_hls_playlist,
+    _size_from,
+    download_stream_to_file,
     iter_hls_bytes,
-    iter_range_bytes,
+    read_range_bounded,
     supports_hls_prefetch,
     supports_range_prefetch,
 )
@@ -281,20 +284,11 @@ class SegmentFetchError(RemoteMediaError):
     """A requested remote media segment could not be materialized."""
 
 
-class _CdnSwitchSignal(Exception):
-    """Internal signal: an Audio Cache download switched CDN mid-transfer and
-    the caller should resume from the already-written bytes."""
-
-
-# Audio Cache: consecutive slow samples before probing/switching CDN, and the
-# max number of CDN switches per source (avoids infinite re-probing when every
-# CDN host is slow).
-_AUDIO_CACHE_SLOW_STREAK_SWITCH = 3
-_AUDIO_CACHE_MAX_CDN_SWITCHES = 3
-# Candidate probing: bail out of select_audio_candidate after this many
-# consecutive candidate-groups all fail to produce a speed (network/CDN
-# unhealthy) instead of wasting ~5s per probe across all candidates.
-_PROBE_MAX_FAILED_GROUPS = 2
+# Audio Cache: max CDN switches per source (avoids infinite re-probing when every
+# host is slow) and the per-range no-byte watchdog the offset writer uses. A
+# slow-but-steady range is allowed to finish; 45 s of silence is not.
+_AUDIO_CACHE_MAX_CDN_SWITCHES = 6
+_AUDIO_CACHE_STALL_TIMEOUT = 45.0
 
 
 _FFMPEG_DETAIL_MAX = 400
@@ -318,14 +312,28 @@ def _sanitize_ffmpeg_detail(detail):
 _BROWSER_COOKIE_NAMES = ("firefox", "chrome", "edge")
 _COOKIES_FILE_PREFIX = "cookiesfile:"
 _BILIBILI_HOST_MARKERS = ("bilibili.com", "b23.tv")
+# B 站 upos 镜像池。所有候选都只改写 host、保留原签名 path/query，所以只有和
+# 原始链接同一对象族的 bilivideo 镜像能进这里。2026-10-17 用三个真实 VOD 实测：
+# 同一区间从下面每个 host 取回**字节完全一致**（sha256 相同），速度差异可达
+# 数十倍且分钟级波动——所以池子只提供"可替换的候选"，由 select_audio_candidate
+# 用真实字节吞吐 + 字节一致性来决定用谁。
+# **Akamai 不在这里**：把别的 host 的签名链接改写过去会 403/超时（实测；原生
+# 签发的 Akamai 链接仍可用，见 _bilibili_cdn_variants 的原生放行）。
 _BILIBILI_CDN_HOSTS = (
-    "upos-sz-mirrorcos.bilivideo.com",
+    # Order matters: select_audio_candidate probes alternatives in this order and
+    # stops at the first clearly-fast one. aliov/08c/hw were the consistently
+    # faster mirrors across three real VODs (2026-10-17); the rest are fallbacks.
     "upos-sz-mirroraliov.bilivideo.com",
+    "upos-sz-mirror08c.bilivideo.com",
+    "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-mirrorhwb.bilivideo.com",
+    "upos-sz-mirrorali.bilivideo.com",
+    "upos-sz-mirrorcos.bilivideo.com",
+    "upos-sz-mirrorcosb.bilivideo.com",
+    "upos-sz-mirrorcoso1.bilivideo.com",
     "upos-sz-mirroralib.bilivideo.com",
-    # B 站国际 CDN（Akamai 全球网络）：海外用户直连国内 upos 慢时的主力选项；
-    # 探测按实测速度选，国内用户探得慢就不会被选中。
-    "upos-hz-mirrorakam.akamaized.net",
 )
+_BILIBILI_AKAMAI_SUFFIX = ".akamaized.net"
 _REMOTE_SEEK_PAD = 10.0
 # 输入读取窗余量（秒）：覆盖 HLS 分片粒度导致的 seek 落点偏差（实测 ~1s），
 # 保证 trim 终点前的内容一定被读到。余量只扩大下载范围，不改变输出内容。
@@ -567,23 +575,215 @@ class ProbeCooldown:
             self._streak = 0
 
 
+_AUDIO_PROBE_BYTES = 1024 * 1024
+_AUDIO_PROBE_SECONDS = 2.5
+_AUDIO_PROBE_MIN_BYTES = 64 * 1024
+_AUDIO_PROBE_HASH_BYTES = 256 * 1024
+_AUDIO_PROBE_MAX_CANDIDATES = 5
+_AUDIO_MIN_BANDWIDTH = 1.0
+# A mirror must beat the current node by this factor before a transfer is
+# disturbed. Host speed fluctuates on a minutes timescale, so a single probe
+# sample is a veto (dead/very slow), not a precise ranking.
+_AUDIO_SWITCH_GAIN = 1.25
+
+
+class _BilibiliHostHealth:
+    """Per-host failure memory shared by every source in a batch.
+
+    A batch resolves hundreds of signed URLs; without shared memory the same
+    dead mirror is probed again for every source. Two consecutive connection
+    failures put a host on a short cooldown, but the host is never removed
+    outright: a temporary local network problem must not empty the pool.
+    """
+
+    def __init__(self, failure_threshold: int = 2, cooldown_seconds: float = 180.0):
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.cooldown_seconds = float(cooldown_seconds)
+        self._lock = threading.Lock()
+        self._failures: dict[str, int] = {}
+        self._cooldown_until: dict[str, float] = {}
+
+    def report_success(self, host: str) -> None:
+        host = str(host or "").lower()
+        if not host:
+            return
+        with self._lock:
+            self._failures.pop(host, None)
+            self._cooldown_until.pop(host, None)
+
+    def report_failure(self, host: str) -> None:
+        host = str(host or "").lower()
+        if not host:
+            return
+        with self._lock:
+            count = self._failures.get(host, 0) + 1
+            self._failures[host] = count
+            if count >= self.failure_threshold:
+                self._cooldown_until[host] = time.monotonic() + self.cooldown_seconds
+
+    def is_cooling(self, host: str) -> bool:
+        host = str(host or "").lower()
+        if not host:
+            return False
+        with self._lock:
+            until = self._cooldown_until.get(host)
+            if until is None:
+                return False
+            if time.monotonic() >= until:
+                self._cooldown_until.pop(host, None)
+                self._failures.pop(host, None)
+                return False
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures.clear()
+            self._cooldown_until.clear()
+
+
+_HOST_HEALTH = _BilibiliHostHealth()
+
+
+def reset_bilibili_host_health() -> None:
+    """Clear the cross-source host health (tests and a fresh batch)."""
+    _HOST_HEALTH.reset()
+
+
+def _host_of_url(url: str) -> str:
+    try:
+        return urlsplit(str(url or "")).netloc.lower()
+    except ValueError:
+        return ""
+
+
+@dataclass(frozen=True)
+class AudioProbe:
+    """One bounded byte-range sample of an audio candidate."""
+
+    speed: float                      # MB/s (bytes / wall-clock)
+    digest: str = ""                  # sha256 of the first 256 KiB, "" if too short
+    bytes_read: int = 0
+
+
+def probe_audio_candidate_bandwidth(
+    source: MediaSource,
+    candidate: Mapping[str, Any],
+    probe_bytes: int = _AUDIO_PROBE_BYTES,
+    deadline: float = _AUDIO_PROBE_SECONDS,
+    request_func: Callable[..., Any] | None = None,
+    log_func: Callable[[str], Any] | None = None,
+) -> AudioProbe | None:
+    """Measure one audio candidate with the shared bounded byte probe."""
+    url = str(candidate.get("url") or "")
+    if not url:
+        return None
+    headers = candidate.get("http_headers") or source.audio_headers or source.http_headers
+    return _probe_url_bandwidth(
+        url, headers, probe_bytes=probe_bytes, deadline=deadline,
+        request_func=request_func, log_func=log_func)
+
+
+def _probe_url_bandwidth(
+    url: str,
+    headers: Mapping[str, str] | None = None,
+    probe_bytes: int = _AUDIO_PROBE_BYTES,
+    deadline: float = _AUDIO_PROBE_SECONDS,
+    request_func: Callable[..., Any] | None = None,
+    log_func: Callable[[str], Any] | None = None,
+) -> AudioProbe | None:
+    """Measure a signed media URL with a bounded 1 MiB byte-range read.
+
+    The old probe ran ``ffmpeg -t 3`` and read the reported ``speed=``. Three
+    seconds of 318 kbps audio is about 120 KiB, which every host serves out of
+    its initial burst, so a 0.17 MB/s node and an 11 MB/s node both reported
+    ~260-300x (measured side by side). This reads real bytes with a hard
+    deadline, validates the status/Content-Range, and returns MB/s plus a sha256
+    of the first 256 KiB so two hosts can be proven to serve the same object
+    before their ranges are mixed.
+    """
+    url = str(url or "")
+    if not url:
+        return None
+    try:
+        probe_bytes = int(probe_bytes)
+    except (TypeError, ValueError):
+        return None
+    if probe_bytes <= 0:
+        return None
+    minimum = min(probe_bytes, _AUDIO_PROBE_MIN_BYTES)
+    try:
+        data, elapsed, status, content_range = read_range_bounded(
+            url, 0, probe_bytes - 1, headers, deadline=deadline,
+            request_func=request_func)
+    except Exception as exc:                                  # noqa: BLE001
+        if log_func is not None:
+            log_func(f"Audio probe failed ({type(exc).__name__}); skipping candidate")
+        return None
+    if status != 206:
+        if log_func is not None:
+            log_func(f"Audio probe failed (HTTP {status or 'no response'}); "
+                     f"skipping candidate")
+        return None
+    if content_range and not content_range.lower().startswith("bytes 0-"):
+        if log_func is not None:
+            log_func("Audio probe failed (server did not return the requested "
+                     "range); skipping candidate")
+        return None
+    if len(data) < minimum:
+        if log_func is not None:
+            log_func(f"Audio probe failed (only {len(data)} bytes); skipping candidate")
+        return None
+    elapsed = max(float(elapsed), 0.001)
+    digest = (hashlib.sha256(data[:_AUDIO_PROBE_HASH_BYTES]).hexdigest()
+              if len(data) >= _AUDIO_PROBE_HASH_BYTES else "")
+    return AudioProbe(len(data) / elapsed / (1024 * 1024), digest, len(data))
+
+
+def _candidate_groups(candidates: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split a flat (format x cdn-host) candidate list into per-format groups."""
+    groups: list[list[dict[str, Any]]] = []
+    index = 0
+    while index < len(candidates):
+        first = candidates[index]
+        group = [first]
+        index += 1
+        if first.get("cdn_variant_index") is not None:
+            while (index < len(candidates)
+                   and candidates[index].get("format_id") == first.get("format_id")):
+                group.append(candidates[index])
+                index += 1
+        groups.append(group)
+    return groups
+
+
 def select_audio_candidate(
     source: MediaSource,
-    min_realtime_speed: float = 1.0,
+    min_realtime_speed: float | None = None,
     probe_duration: float = 3,
     run_func: Callable[..., Any] | None = None,
     log_func: Callable[[str], Any] | None = None,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
+    *,
+    min_bandwidth: float = _AUDIO_MIN_BANDWIDTH,
+    probe_bytes: int = _AUDIO_PROBE_BYTES,
+    deadline: float = _AUDIO_PROBE_SECONDS,
+    max_candidates: int = _AUDIO_PROBE_MAX_CANDIDATES,
+    probe_func: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Keep the best audio unless a bounded probe shows a slower candidate is needed.
+    """Keep the current audio CDN unless it is measurably worse than a mirror.
 
-    If every candidate probe fails (timeout / 403), the source is left untouched
-    (its resolve-time ``audio_url``) and ``None`` is returned instead of silently
-    re-applying the first candidate — a probe that can't complete tells us nothing
-    about which CDN is usable, and forcing a URL here can pin a stale/rate-limited
-    one for the whole batch. ``stats`` optionally receives probe outcome counts
-    (``groups`` measured, ``failed_groups`` fully failed) for callers that adapt
-    pacing to CDN health.
+    The current URL is measured first; a healthy node is kept without probing
+    anything else (one 1 MiB read per source). Only when it is below
+    ``min_bandwidth`` are alternatives from the *same quality tier* probed, and a
+    switch also requires a 1.25x gain and (when both reads are long enough)
+    identical bytes. This deliberately avoids the old behaviour of chasing a
+    noisy ``speed=`` sample: a host can go from 22 MB/s to unreachable in
+    minutes, so a switch is a veto-based rescue, not a ranking contest.
+
+    ``run_func`` / ``min_realtime_speed`` are the legacy ffmpeg-probe seam used
+    by the old tests; production uses ``probe_func`` (default: the byte probe).
+    ``stats`` receives ``groups``/``failed_groups`` for ``ProbeCooldown`` plus
+    ``probed``/``current_speed``/``chosen`` for diagnostics.
     """
     candidates = list(source.audio_candidates or [])
     if str(source.platform or "").strip().lower() not in {"bilibili", "bilibiliweb"}:
@@ -595,75 +795,158 @@ def select_audio_candidate(
         return None
     if not candidates:
         return None
+    if min_realtime_speed is not None:
+        try:
+            min_bandwidth = float(min_realtime_speed)
+        except (TypeError, ValueError):
+            pass
     try:
-        threshold = float(min_realtime_speed)
+        threshold = float(min_bandwidth)
     except (TypeError, ValueError):
-        threshold = 1.0
-    stats_state = {"groups": 0, "failed_groups": 0}
-    index = 0
-    chose = False
-    chosen_candidate = None
-    probe_fail_groups = 0
-    while index < len(candidates):
-        candidate = candidates[index]
-        group = [candidate]
-        if candidate.get("cdn_variant_index") is not None:
-            index += 1
-            while index < len(candidates) and candidates[index].get("format_id") == candidate.get("format_id"):
-                group.append(candidates[index])
-                index += 1
-        else:
-            index += 1
+        threshold = _AUDIO_MIN_BANDWIDTH
+    stats_state: dict[str, Any] = {
+        "groups": 1, "failed_groups": 0, "probed": 0,
+        "current_speed": None, "chosen": None,
+    }
+    legacy = run_func is not None
 
-        measured = []
-        stats_state["groups"] += 1
-        for candidate in group:
-            speed = probe_audio_candidate(
+    def measure(candidate: Mapping[str, Any], note: str = "") -> AudioProbe | None:
+        if probe_func is not None:
+            raw = probe_func(candidate)
+        elif legacy:
+            raw = probe_audio_candidate(
                 source, candidate, duration=probe_duration, run_func=run_func,
                 log_func=log_func)
-            measured.append((speed, candidate))
-            if log_func is not None:
-                format_id = candidate.get("format_id") or "unknown"
-                abr = candidate.get("abr") or candidate.get("tbr") or "unknown"
-                speed_text = f"{speed:g}x" if speed is not None else "unknown"
-                cdn = candidate.get("cdn_host")
-                suffix = f" cdn={cdn}" if cdn else ""
-                log_func(f"Audio candidate {format_id} abr={abr}{suffix} speed={speed_text}")
-
-        usable = [(speed, candidate) for speed, candidate in measured if speed is not None]
-        if not usable:
-            # 整组候选探测全失败（unknown/timeout/403）：连续失败说明网络或
-            # CDN 不健康，继续测剩余候选只会白等（每个超时 5s，×12 候选/源
-            # 在大批次上累计数小时）。连续 2 组失败即提前放弃探测。
-            probe_fail_groups += 1
-            stats_state["failed_groups"] += 1
-            if probe_fail_groups >= _PROBE_MAX_FAILED_GROUPS:
-                if log_func is not None:
-                    log_func(
-                        "CDN probe failed repeatedly; keeping the default audio "
-                        "URL (download may be slower)"
-                    )
-                break
-            continue
-        probe_fail_groups = 0
-        fastest_speed, fastest_candidate = max(usable, key=lambda item: item[0])
-        if fastest_speed >= threshold:
-            apply_audio_candidate(source, fastest_candidate)
-            chose = True
-            chosen_candidate = fastest_candidate
-            if log_func is not None and len(group) > 1:
-                log_func(
-                    f"Bilibili CDN selected: {fastest_candidate.get('cdn_host')} "
-                    f"speed={fastest_speed:g}x"
-                )
-            break
+        else:
+            raw = probe_audio_candidate_bandwidth(
+                source, candidate, probe_bytes=probe_bytes, deadline=deadline,
+                log_func=log_func)
+        if isinstance(raw, AudioProbe):
+            sample = raw
+        else:
+            try:
+                sample = AudioProbe(float(raw)) if raw is not None else None
+            except (TypeError, ValueError):
+                sample = None
+        stats_state["probed"] += 1
         if log_func is not None:
-            log_func(f"Audio candidate speed below {threshold:.1f}x; trying next candidate")
+            format_id = candidate.get("format_id") or "unknown"
+            abr = candidate.get("abr") or candidate.get("tbr") or "unknown"
+            cdn = candidate.get("cdn_host") or _host_of_url(candidate.get("url", ""))
+            suffix = f" cdn={cdn}" if cdn else ""
+            if sample is None:
+                value = "unavailable"
+            elif legacy:
+                value = f"{sample.speed:g}x"
+            else:
+                value = f"{sample.speed:.2f} MB/s"
+            log_func(f"Audio candidate {format_id} abr={abr}{suffix} "
+                     f"read={value}{note}")
+        return sample
+
+    current_url = str(source.audio_url or "")
+    current_candidate = next(
+        (item for item in candidates if str(item.get("url")) == current_url), None)
+    if current_candidate is None and current_url:
+        current_candidate = {
+            "url": current_url,
+            "http_headers": dict(source.audio_headers or {}),
+            "format_id": None,
+            "cdn_host": _host_of_url(current_url),
+        }
+    groups = _candidate_groups(candidates)
+    current_group = next(
+        (group for group in groups
+         if any(str(item.get("url")) == current_url for item in group)), None)
+
+    current_sample = None
+    if current_candidate is not None:
+        current_sample = measure(current_candidate, " (current)")
+        if current_sample is not None:
+            _HOST_HEALTH.report_success(_host_of_url(current_url))
+            stats_state["current_speed"] = current_sample.speed
+    if current_sample is not None and current_sample.speed >= threshold:
+        if stats is not None:
+            stats.update(stats_state)
+        return None
+
+    # Same quality tier only: a mirror is a different host for the same signed
+    # object, never a reason to drop to a lower bitrate. If the current URL is
+    # not in the candidate list (e.g. it was refreshed), fall back to the highest
+    # tier's group so a dead dispatched node can still be rescued.
+    pool = current_group if current_group is not None else (groups[0] if groups else [])
+    reference_digest = current_sample.digest if current_sample is not None else ""
+    alternatives: list[dict[str, Any]] = []
+    seen_urls = {current_url}
+    seen_hosts = {_host_of_url(current_url)} if current_url else set()
+    for item in pool:
+        url = str(item.get("url") or "")
+        if not url or url in seen_urls:
+            continue
+        host = _host_of_url(url)
+        if host in seen_hosts:
+            continue                       # a re-signed URL for the same node
+        if _HOST_HEALTH.is_cooling(host):
+            continue
+        seen_urls.add(url)
+        seen_hosts.add(host)
+        alternatives.append(item)
+
+    best: tuple[AudioProbe, dict[str, Any]] | None = None
+    probed = 0
+    for candidate in alternatives:
+        if probed >= max(1, int(max_candidates)):
+            break
+        host = _host_of_url(candidate.get("url", ""))
+        probed += 1
+        sample = measure(candidate)
+        if sample is None:
+            _HOST_HEALTH.report_failure(host)
+            continue
+        _HOST_HEALTH.report_success(host)
+        if reference_digest and sample.digest and sample.digest != reference_digest:
+            if log_func is not None:
+                log_func(f"Audio candidate cdn={host} serves different bytes; "
+                         f"not switching")
+            continue
+        if best is None or sample.speed > best[0].speed:
+            best = (sample, candidate)
+        if sample.speed >= threshold * 3:
+            break
+
+    if best is None:
+        if current_sample is None and stats_state["probed"] > 0:
+            stats_state["failed_groups"] = 1
+            if log_func is not None:
+                log_func("CDN probe failed repeatedly; keeping the default audio "
+                         "URL (download may be slower)")
+        elif log_func is not None:
+            log_func("Keeping the current audio CDN: no mirror was clearly faster")
+        if stats is not None:
+            stats.update(stats_state)
+        return None
+
+    best_sample, best_candidate = best
+    gain_ok = (current_sample is None
+               or best_sample.speed >= current_sample.speed * _AUDIO_SWITCH_GAIN)
+    if best_sample.speed < threshold or not gain_ok:
+        if log_func is not None:
+            current_text = (f"{current_sample.speed:.2f} MB/s"
+                            if current_sample is not None else "unavailable")
+            log_func(f"Keeping the current audio CDN ({current_text}; best mirror "
+                     f"{best_sample.speed:.2f} MB/s is not clearly better)")
+        if stats is not None:
+            stats.update(stats_state)
+        return None
+
+    apply_audio_candidate(source, best_candidate)
+    stats_state["chosen"] = _host_of_url(best_candidate.get("url", ""))
+    if log_func is not None:
+        log_func(f"Bilibili CDN selected: {stats_state['chosen']} "
+                 f"read={best_sample.speed:.2f} MB/s")
     if stats is not None:
         stats.update(stats_state)
-    if not chose:
-        return None
-    return chosen_candidate
+    return best_candidate
 
 
 def build_audio_cache_command(source: MediaSource, output_file: str | Path) -> list[str]:
@@ -874,92 +1157,103 @@ def fetch_audio_cache(
                    f"for {cache_label}")
 
     if source.platform in {"youtube", "bilibili"} and supports_range_prefetch(source):
+        prefetch_stats: dict[str, Any] = {}
         try:
             report(f"{platform_label} audio cache prefetch for {cache_label}")
-            speed_monitor = SpeedMonitor()
 
-            slow_streak = [0]
-            cdn_switches = [0]
-
-            def recover_slow_prefetch(stale_source, speed):
-                report(
-                    f"{platform_label} audio cache speed low ({speed:.2f} MB/s); "
-                    "refreshing source before continuing"
-                )
-                # 先尝试刷新签名 URL（URL 过期/限流时刷新可能直接恢复）。
-                if refresh_func is not None:
-                    try:
-                        updated = refresh_func(stale_source)
-                        if isinstance(updated, MediaSource) and updated is not stale_source:
-                            stale_source.__dict__.update(updated.__dict__)
-                    except Exception:
-                        pass
-                # 连续低速达到阈值 → 重新探测候选组并切换 CDN 节点
-                # （bilibili 的 audio_candidates 常含多个 cdn_host）。
-                # 切换成功后抛信号中断当前下载，让外层 resume 从已写字节续传，
-                # 100-500MB 的音频不从头重下。
-                slow_streak[0] += 1
-                if (slow_streak[0] >= _AUDIO_CACHE_SLOW_STREAK_SWITCH
-                        and cdn_switches[0] < _AUDIO_CACHE_MAX_CDN_SWITCHES):
-                    slow_streak[0] = 0
-                    cdn_switches[0] += 1
-                    try:
-                        chosen = select_audio_candidate(
-                            stale_source, min_realtime_speed=1.0,
-                            probe_duration=3, log_func=report)
-                        if chosen is not None:
-                            host = chosen.get("cdn_host") or chosen.get("url", "").split("/")[2] or "?"
-                            report(
-                                f"{platform_label} audio cache switched CDN "
-                                f"({cdn_switches[0]}/{_AUDIO_CACHE_MAX_CDN_SWITCHES}) "
-                                f"to {host}")
-                            raise _CdnSwitchSignal()
-                    except _CdnSwitchSignal:
-                        raise
-                    except Exception as exc:
-                        report(f"CDN switch probe failed: {type(exc).__name__}")
-
-            resume_limit = 5
-            for resume_attempt in range(resume_limit):
-                partial_size = temporary_path.stat().st_size if temporary_path.exists() else 0
+            def refresh_url():
+                """Refresh the signed URL once (called only on 403/expiry)."""
+                if refresh_func is None:
+                    return None
                 try:
-                    with temporary_path.open("ab" if partial_size else "wb") as handle:
-                        for chunk in iter_range_bytes(
-                            source, chunk_size=prefetch_chunk_size,
-                            concurrency=prefetch_concurrency, logger=log,
-                            progress_callback=progress_callback,
-                            speed_monitor=speed_monitor,
-                            slow_callback=recover_slow_prefetch,
-                            start_offset=partial_size,
-                            refresher=refresh_func,
-                        ):
-                            handle.write(chunk)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    break
-                except _CdnSwitchSignal:
-                    # CDN 已切换：续传（不消耗 resume_attempt 次数）
-                    if resume_attempt >= resume_limit - 1:
-                        raise
-                    report(
-                        f"{platform_label} audio cache CDN switched; "
-                        f"resuming at {partial_size} bytes"
-                    )
-                except InterruptedError:
-                    raise
-                except Exception:
-                    if resume_attempt >= resume_limit - 1:
-                        raise
-                    report(
-                        f"{platform_label} audio cache interrupted at {partial_size} bytes; "
-                        f"refreshing and resuming ({resume_attempt + 1}/{resume_limit - 1})"
-                    )
-                    if refresh_func is not None:
-                        updated = refresh_func(source)
-                        if isinstance(updated, MediaSource) and updated is not source:
-                            source.__dict__.update(updated.__dict__)
+                    updated = refresh_func(source)
+                except Exception:                              # noqa: BLE001
+                    return None
+                if isinstance(updated, MediaSource) and updated is not source:
+                    source.__dict__.update(updated.__dict__)
+                return (source.audio_url, dict(source.audio_headers or {}))
+
+            # Mid-transfer switching must not probe: a 1 MiB probe competes with
+            # the running ranges and measures the line's spare bandwidth, not the
+            # mirror's capacity (every mirror read "0.03-0.25 MB/s" while the
+            # transfer itself was 0.24 MB/s). Rotate through same-tier mirrors
+            # instead; the writer verifies the first 256 KiB already on disk
+            # against the new host and only then uses it.
+            rotation: list[dict[str, Any]] = []
+            seen_rotation_hosts: set[str] = set()
+            current_url = str(source.audio_url or "")
+            current_format = next(
+                (item.get("format_id")
+                 for item in (source.audio_candidates or [])
+                 if str(item.get("url")) == current_url), None)
+            for item in source.audio_candidates or []:
+                if str(item.get("url")) == current_url:
+                    continue
+                if (current_format is not None
+                        and item.get("format_id") != current_format):
+                    continue
+                host = _host_of_url(item.get("url", ""))
+                if not host or host in seen_rotation_hosts:
+                    continue
+                seen_rotation_hosts.add(host)
+                rotation.append(item)
+            rotation_index = [0]
+            previous_host = [_host_of_url(current_url)]
+
+            def switch_url():
+                """Rotate to the next mirror; never probe during a transfer."""
+                if str(source.platform or "").lower() not in {"bilibili", "bilibiliweb"}:
+                    return None
+                if not rotation:
+                    # A natively dispatched Akamai URL has no same-family
+                    # mirrors; a fresh resolve is the only safe way off it.
+                    if (_is_native_akamai_host(previous_host[0])
+                            and refresh_func is not None):
+                        refreshed = refresh_url()
+                        if refreshed and refreshed[0] != current_url:
+                            return refreshed
+                    return None
+                for _ in range(len(rotation)):
+                    item = rotation[rotation_index[0] % len(rotation)]
+                    rotation_index[0] += 1
+                    host = _host_of_url(item.get("url", ""))
+                    if _HOST_HEALTH.is_cooling(host):
+                        continue
+                    apply_audio_candidate(source, item)
+                    _HOST_HEALTH.report_failure(previous_host[0])
+                    previous_host[0] = host
+                    return (source.audio_url, dict(source.audio_headers or {}))
+                return None
+
+            def transfer_progress(done, total, elapsed):
+                # The offset writer reports (bytes, size, elapsed); the UI
+                # callback expects the formatted progress sample.
+                if progress_callback is not None:
+                    progress_callback(format_transfer_progress(done, total, elapsed))
+
+            download_stream_to_file(
+                source.audio_url, temporary_path,
+                headers=dict(source.audio_headers or {}),
+                size=_size_from(source),
+                chunk_size=prefetch_chunk_size,
+                concurrency=prefetch_concurrency,
+                logger=log,
+                progress_callback=transfer_progress,
+                stall_timeout=_AUDIO_CACHE_STALL_TIMEOUT,
+                refresh_func=refresh_url if refresh_func is not None else None,
+                switch_func=switch_url,
+                max_switches=_AUDIO_CACHE_MAX_CDN_SWITCHES,
+                stats=prefetch_stats,
+                cancel_check=cancel_pending,
+            )
             if temporary_path.stat().st_size == 0:
-                raise SegmentFetchError(f"{platform_label} audio cache prefetch produced no output")
+                raise SegmentFetchError(
+                    f"{platform_label} audio cache prefetch produced no output")
+            report(
+                f"{platform_label} audio cache prefetch wrote "
+                f"{prefetch_stats.get('written', temporary_path.stat().st_size)} bytes "
+                f"in {prefetch_stats.get('ranges', 0)} range(s)"
+                f"{', 1 host switch' if prefetch_stats.get('switches') else ''}")
             registered = cache_store.save_audio_cache_file(
                 identity, source.audio_url, audio_format, temporary_path,
                 metadata=format_identity,
@@ -972,6 +1266,14 @@ def fetch_audio_cache(
         except InterruptedError:
             temporary_path.unlink(missing_ok=True)
             raise
+        except CdnTooSlowError as exc:
+            # Every mirror stayed hopeless. Falling back to single-connection
+            # FFmpeg would just crawl on the same CDN, so let the caller mark
+            # this source failed and move to the next one.
+            temporary_path.unlink(missing_ok=True)
+            report(f"{platform_label} audio cache aborted: {exc}")
+            raise SegmentFetchError(
+                f"{platform_label} audio cache too slow for {cache_label}: {exc}") from exc
         except Exception as exc:
             last_error = exc
             temporary_path.unlink(missing_ok=True)
@@ -4167,8 +4469,20 @@ def _stream_url(info: Mapping[str, Any], audio: bool) -> str:
     return str(direct_url)
 
 
+def _is_native_akamai_host(host: str) -> bool:
+    return str(host or "").lower().split(":")[0].endswith(_BILIBILI_AKAMAI_SUFFIX)
+
+
 def _bilibili_cdn_variants(url: str) -> list[str]:
-    """Return the original signed URL plus known same-resource CDN hosts."""
+    """Return the original signed URL plus the known bilivideo CDN hosts.
+
+    Akamai is **not** a rewrite target (a bilivideo-signed request rewritten to
+    Akamai returns 403/timeout, measured), so it is absent from
+    ``_BILIBILI_CDN_HOSTS``. A *natively dispatched* Akamai URL may still try the
+    bilivideo mirrors: Bilibili sometimes sends the same signed path there, and
+    every candidate is probe-checked (206 + same 256 KiB digest) before it is
+    used, so a signature that does not work is rejected without harming the file.
+    """
     parsed = urlsplit(str(url or ""))
     if not parsed.scheme or not parsed.netloc:
         return [str(url)] if url else []
@@ -4180,9 +4494,18 @@ def _bilibili_cdn_variants(url: str) -> list[str]:
     return variants
 
 
-# B 站 P2P/边缘慢节点（参考社区共识）：被调度到这些 host 的链接通常远慢于
-# upos 正式节点。黑名单只影响候选排序前的过滤，全部被过滤时保留原列表兜底。
-_BILIBILI_SLOW_CDN_MARKERS = ("mcdn", "pcdn", "szbdyd.com")
+# B 站 P2P/边缘慢节点（参考社区共识与 Bili23-Downloader 2.20 的实测名单）：
+# 被调度到这些 host 的链接通常远慢于 upos 正式节点，mirror14b 甚至是 P2P
+# （HEAD 404、直连 GET 会断）。黑名单只影响候选生成，全部被过滤时保留原列表兜底。
+_BILIBILI_SLOW_CDN_MARKERS = (
+    "mcdn",
+    "pcdn",
+    "szbdyd.com",
+    "mountaintoys.cn",
+    "nexusedgeio.com",
+    "ahdohpiechei.com",
+    "upos-sz-mirror14b.bilivideo.com",
+)
 
 
 def _is_slow_bilibili_cdn_host(host: str) -> bool:
@@ -4224,13 +4547,14 @@ def is_bilibili_cdn_host(host: str) -> bool:
 
 
 def select_fastest_bilibili_url(url, headers=None, size=None, log_func=None,
-                                measure_func=None, cancel_check=None):
-    """Return the fastest reachable mirror for one Bilibili stream URL.
+                                probe_func=None, cancel_check=None):
+    """Return a faster same-object mirror for one Bilibili stream URL.
 
-    All known mirrors serve the same signed path+query, so only the host changes
-    (exactly what the Audio Cache candidate pool does for audio). The assigned
-    node is kept unless it measures clearly slow, so the common case costs one
-    bounded read and no extra requests.
+    Used by Full Download. The dispatched node is kept unless it measures
+    clearly slow; only then are up to 3 mirrors sampled with the same bounded
+    byte probe the audio selector uses, and a switch also requires identical
+    bytes (sha256 of the first 256 KiB), because a mirror is only a different
+    host for the same signed object.
     """
     original = str(url or "")
     parsed = urlsplit(original)
@@ -4248,37 +4572,41 @@ def select_fastest_bilibili_url(url, headers=None, size=None, log_func=None,
                 return original
         except (TypeError, ValueError):
             pass
-    if measure_func is None:
-        from remote_prefetch import measure_stream_throughput as measure_func  # noqa: N813
-    probe_bytes = 4 * 1024 * 1024
-    if size:
-        try:
-            probe_bytes = max(1024 * 1024, min(probe_bytes, int(size) // 64))
-        except (TypeError, ValueError):
-            pass
+    probe = probe_func or _probe_url_bandwidth
     if callable(cancel_check) and cancel_check():
         return original
     try:
-        measured = measure_func(original, dict(headers or {}), probe_bytes=probe_bytes)
-    except Exception:
+        measured = probe(original, dict(headers or {}))
+    except Exception:                                          # noqa: BLE001
+        measured = None
+    original_speed = measured.speed if isinstance(measured, AudioProbe) else None
+    if original_speed is not None and original_speed >= _FAST_HOST_SKIP_SPEED:
         return original
-    if measured is not None and measured >= _FAST_HOST_SKIP_SPEED:
-        return original
+    reference_digest = measured.digest if isinstance(measured, AudioProbe) else ""
     best_url = original
-    best_speed = measured if measured is not None else -1.0
+    best_speed = original_speed if original_speed is not None else -1.0
     for candidate in alternatives[:_FAST_HOST_MAX_CANDIDATES]:
         if callable(cancel_check) and cancel_check():
             break
         try:
-            speed = measure_func(candidate, dict(headers or {}),
-                                 probe_bytes=probe_bytes)
-        except Exception:
-            speed = None
-        if speed is not None and speed > best_speed:
-            best_speed = speed
+            sample = probe(candidate, dict(headers or {}))
+        except Exception:                                      # noqa: BLE001
+            sample = None
+        if not isinstance(sample, AudioProbe):
+            continue
+        if reference_digest and sample.digest and sample.digest != reference_digest:
+            continue
+        if sample.speed > best_speed:
+            best_speed = sample.speed
             best_url = candidate
+    if best_url != original:
+        gain_ok = (original_speed is None
+                   or best_speed >= original_speed * _AUDIO_SWITCH_GAIN)
+        if best_speed < _AUDIO_MIN_BANDWIDTH or not gain_ok:
+            return original
     if best_url != original and log_func is not None:
-        old_speed = f"{measured:.2f} MB/s" if measured is not None else "unmeasurable"
+        old_speed = (f"{original_speed:.2f} MB/s" if original_speed is not None
+                     else "unmeasurable")
         log_func(f"Bilibili CDN: {urlsplit(best_url).netloc} ({best_speed:.2f} MB/s) "
                  f"chosen over {parsed.netloc} ({old_speed})")
     return best_url

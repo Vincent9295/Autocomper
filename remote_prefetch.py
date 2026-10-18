@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
+import os
 import re
 import threading
 import time
@@ -10,7 +11,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from progress import format_transfer_progress, format_hls_progress
-from utils import is_twitch_platform
+from utils import is_twitch_platform, pause_pending, wait_while_paused
 
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
@@ -22,6 +23,15 @@ DEFAULT_RETRY_DELAYS = (2, 5, 10, 20, 40, 60, 60, 60, 60, 60, 60, 60)
 # Twitch HLS 单个分片重试：3 次小退避，防单个片段失败毁掉整个缓存下载。
 _HLS_FRAGMENT_ATTEMPTS = 3
 _HLS_FRAGMENT_BACKOFF = (1, 2, 4)
+# A re-resolve is only worth its 1.5-2 s (plus the shared 2 s limiter) when the
+# URL is actually rejected. Slow-but-working ranges must never trigger one.
+_REFRESH_MIN_INTERVAL = 5.0
+_EXPIRED_ERROR_MARKERS = ("403", "forbidden", "expired", "412", "precondition failed")
+
+
+def _looks_like_expired_error(exc) -> bool:
+    text = str(exc or "").lower()
+    return any(marker in text for marker in _EXPIRED_ERROR_MARKERS)
 
 
 class SpeedMonitor:
@@ -51,6 +61,16 @@ class SpeedMonitor:
 
 class RangePrefetchError(Exception):
     """A range request could not safely provide the compressed stream."""
+
+
+class CdnTooSlowError(RangePrefetchError):
+    """Every mirror stayed below the usable floor; skip the source, do not crawl.
+
+    The caller should record the source as failed and move on (the batch keeps
+    going). It must not silently fall back to the single-connection FFmpeg path:
+    that path would be just as slow on the same CDN and would occupy the run for
+    hours instead of skipping one source.
+    """
 
 
 def _size_from(source):
@@ -99,6 +119,149 @@ def _default_request(url, start, end, headers, timeout):
     with urlopen(request, timeout=timeout) as response:
         response_headers = {str(key): str(value) for key, value in response.headers.items()}
         return response.read(), int(getattr(response, "status", response.getcode())), response_headers
+
+
+# 有界读取的分片大小：每次 read1 拿到多少算多少，绝不 read() 等整包。
+_BOUNDED_READ_CHUNK = 64 * 1024
+
+
+def read_range_bounded(url, start, end, headers=None, deadline=3.0,
+                       socket_timeout=1.0, request_func=None, stall_timeout=None):
+    """Read one HTTP byte range with a hard wall-clock deadline.
+
+    ``_default_request`` uses ``response.read()``, which waits for the whole body
+    and resets the socket timeout on every byte. A CDN that trickles (or a host
+    that accepts the connection and then goes quiet) therefore blocks forever:
+    measured on a real mirror, one 16 MiB range sat for six minutes while other
+    ranges had already completed. This reader takes 64 KiB pieces, uses a 1 s
+    socket timeout, and stops at ``deadline`` even when bytes keep arriving
+    slowly. It returns ``(data, elapsed, status, content_range)``; partial data
+    is returned, the caller decides whether a partial read is useful.
+
+    ``stall_timeout`` switches the bound from "total wall clock" to "no bytes for
+    N seconds": a slow-but-steady range is then allowed to finish (the offset
+    writer uses 45 s), while a silent connection is still abandoned.
+
+    ``request_func`` is the test seam: it must return ``(data, status, headers)``
+    and is trusted to be bounded by the caller.
+    """
+    start = int(start)
+    end = int(end)
+    expected = end - start + 1
+    if expected <= 0:
+        raise RangePrefetchError("range read requires end >= start")
+    if request_func is not None:
+        started = time.monotonic()
+        data, status, response_headers = request_func(
+            url, start, end, dict(headers or {}), deadline)
+        content_range = str((response_headers or {}).get("content-range")
+                            or (response_headers or {}).get("Content-Range") or "")
+        return bytes(data or b""), time.monotonic() - started, int(status), content_range
+
+    request = Request(
+        url, headers={**dict(headers or {}), "Range": f"bytes={start}-{end}"})
+    started = time.monotonic()
+    last_byte = started
+    data = bytearray()
+    status = 0
+    content_range = ""
+    with urlopen(request, timeout=socket_timeout) as response:
+        status = int(getattr(response, "status", response.getcode()))
+        content_range = str(response.headers.get("Content-Range") or "")
+        if status != 206:
+            return b"", time.monotonic() - started, status, content_range
+        while len(data) < expected:
+            now = time.monotonic()
+            if stall_timeout is not None:
+                if now - last_byte > stall_timeout:
+                    break
+            elif now - started >= deadline:
+                break
+            try:
+                piece = response.read1(_BOUNDED_READ_CHUNK)
+            except (TimeoutError, OSError):
+                piece = b""
+            if not piece:
+                if stall_timeout is not None:
+                    if time.monotonic() - last_byte > stall_timeout:
+                        break
+                elif time.monotonic() - started >= deadline:
+                    break
+                continue
+            data.extend(piece)
+            last_byte = time.monotonic()
+    return bytes(data), time.monotonic() - started, status, content_range
+
+
+def read_range_stream(url, start, end, sink, headers=None, stall_timeout=45.0,
+                      socket_timeout=1.0, expected_start=None,
+                      expected_total=None, stop_check=None):
+    """Stream one HTTP range into ``sink`` as the bytes arrive.
+
+    The offset writer needs two things the buffered reader cannot give it:
+    live progress (a 16 MiB range at 100 KiB/s otherwise reports nothing for
+    minutes) and a way to keep the bytes of a range that was cut short. ``sink``
+    is called with each 64 KiB piece, after the status/Content-Range has been
+    validated, so a 403 or a wrong-offset response never reaches the file.
+
+    Returns ``(received, elapsed, status, content_range)``. A trickle that keeps
+    the no-byte watchdog happy (the average stays below ``_RANGE_MIN_RATE_BYTES``
+    after ``_RANGE_MIN_RATE_AFTER`` seconds) is aborted; the writer resumes the
+    range from its own offset.
+    """
+    start = int(start)
+    end = int(end)
+    expected = end - start + 1
+    request = Request(
+        url, headers={**dict(headers or {}), "Range": f"bytes={start}-{end}"})
+    started = time.monotonic()
+    last_byte = started
+    received = 0
+    status = 0
+    content_range = ""
+    with urlopen(request, timeout=socket_timeout) as response:
+        status = int(getattr(response, "status", response.getcode()))
+        content_range = str(response.headers.get("Content-Range") or "")
+        if status != 206:
+            return 0, time.monotonic() - started, status, content_range
+        if content_range:
+            match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
+                             content_range.strip(), re.IGNORECASE)
+            if match:
+                if (expected_start is not None
+                        and int(match.group(1)) != int(expected_start)):
+                    raise RangePrefetchError(
+                        "range response does not start at the requested offset")
+                total = None if match.group(3) == "*" else int(match.group(3))
+                if (expected_total is not None and total is not None
+                        and total != int(expected_total)):
+                    raise RangePrefetchError(
+                        f"stream size changed (server reports {total}, expected "
+                        f"{expected_total}); refusing to mix objects")
+        while received < expected:
+            if stop_check is not None and stop_check():
+                break
+            now = time.monotonic()
+            if now - last_byte > stall_timeout:
+                break
+            if now - started > _RANGE_MIN_RATE_AFTER:
+                rate = received / max(now - started, 0.001)
+                if rate < _RANGE_MIN_RATE_BYTES:
+                    break
+            try:
+                piece = response.read1(_BOUNDED_READ_CHUNK)
+            except (TimeoutError, OSError):
+                piece = b""
+            if not piece:
+                if time.monotonic() - last_byte > stall_timeout:
+                    break
+                continue
+            if len(piece) > expected - received:
+                piece = piece[:expected - received]
+            sink(piece)
+            received += len(piece)
+            last_byte = time.monotonic()
+    return received, time.monotonic() - started, status, content_range
 
 
 def _probe_real_size(url, headers, timeout=15, request_func=None):
@@ -314,13 +477,48 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
               for start in range(start_offset, size, chunk_size)]
     worker_concurrency = max(1, int(concurrency))
     window = max(1, worker_concurrency * 2)
+    refresh_lock = threading.Lock()
+    refresh_last = [0.0]
+
+    def refresh_once(exc):
+        """Refresh the signed URL once per few seconds, only for expiry errors.
+
+        The old code called ``refresher`` from every worker on every exception.
+        ``LimitedRefresher`` serializes calls behind a 2 s limiter and retries
+        three times, so eight failing ranges turned into ~20 s with no download
+        at all, repeated for every slow sample. A slow range is not an expired
+        URL; only 403/412/expired should pay for a re-resolve.
+        """
+        if refresher is None or not _looks_like_expired_error(exc):
+            return False
+        with refresh_lock:
+            now = time.monotonic()
+            if now - refresh_last[0] < _REFRESH_MIN_INTERVAL:
+                return False
+            refresh_last[0] = now
+            try:
+                updated = refresher(source)
+                if updated is not None and updated is not source:
+                    source.__dict__.update(updated.__dict__)
+                headers.clear()
+                headers.update(dict(getattr(source, "audio_headers", {}) or {}))
+                _log(logger, f"{platform_label} range request failed; retrying "
+                             f"with refreshed URL")
+                return True
+            except Exception:                                  # noqa: BLE001
+                return False
 
     def fetch(index, start, end):
         last_error = None
         started_at = time.monotonic()
         for attempt in range(max(1, int(max_attempts))):
             try:
-                result = request(source.audio_url, start, end, dict(headers), DEFAULT_TIMEOUT)
+                # Snapshot per attempt: another worker may refresh the source
+                # while this request is in flight; mixing a new URL with old
+                # headers must not happen.
+                url = str(getattr(source, "audio_url", "") or "")
+                request_headers = dict(headers)
+                result = request(url, start, end, request_headers, DEFAULT_TIMEOUT)
                 response_headers = {}
                 if not isinstance(result, tuple) or len(result) not in (2, 3):
                     raise RangePrefetchError("invalid range response")
@@ -362,17 +560,7 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
                 if attempt + 1 < max(1, int(max_attempts)):
                     # 签名 URL 过期（403）是 YouTube 批量检测失败的常见原因：
                     # 先刷新 source（重新解析出新的 audio_url/audio_headers）再重试。
-                    if refresher is not None:
-                        try:
-                            updated = refresher(source)
-                            if updated is not None and updated is not source:
-                                source.__dict__.update(updated.__dict__)
-                            nonlocal_headers = dict(getattr(source, "audio_headers", {}) or {})
-                            headers.clear()
-                            headers.update(nonlocal_headers)
-                            _log(logger, f"{platform_label} range request failed; retrying with refreshed URL")
-                        except Exception:
-                            pass
+                    refresh_once(exc)
                     delay = retry_delays[min(attempt, len(retry_delays) - 1)] if retry_delays else 0
                     if delay:
                         sleep_func(delay)
@@ -422,25 +610,61 @@ def iter_range_bytes(source, chunk_size=DEFAULT_CHUNK_SIZE, concurrency=DEFAULT_
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _bounded_default_request(url, start, end, headers, timeout):
+    """Production range request: bounded pieces + no-byte stall watchdog."""
+    data, _elapsed, status, content_range = read_range_bounded(
+        url, start, end, headers, deadline=timeout, socket_timeout=1.0,
+        stall_timeout=timeout)
+    return data, status, {"content-range": content_range}
+
+
+_SWITCH_VERIFY_BYTES = 256 * 1024
+_SWITCH_VERIFY_MIN_BYTES = 64 * 1024
+# Aggregate throughput below this for two consecutive windows means the host is
+# not merely fluctuating: try a mirror switch (never on a single noisy sample).
+_WRITER_MIN_MBPS = 0.35
+_WRITER_WATCHDOG_SECONDS = 10.0
+_WRITER_HOPELESS_MBPS = 0.08
+_WRITER_HOPELESS_WINDOWS = 6
+# A connection that keeps trickling a byte every few seconds defeats the no-byte
+# watchdog. After this long, require at least this average rate or abort the
+# range (the writer then resumes it, possibly on another host).
+_RANGE_MIN_RATE_BYTES = 32 * 1024
+_RANGE_MIN_RATE_AFTER = 30.0
+_RANGE_REPORT_SECONDS = 0.5
+
+
 def download_stream_to_file(url, destination, headers=None, size=None,
                             chunk_size=DEFAULT_CHUNK_SIZE,
                             concurrency=DEFAULT_CONCURRENCY, request_func=None,
                             logger=None, progress_callback=None, max_attempts=None,
                             retry_delays=DEFAULT_RETRY_DELAYS, sleep_func=time.sleep,
-                            cancel_check=None):
+                            cancel_check=None, stall_timeout=None,
+                            refresh_func=None, switch_func=None, max_switches=2,
+                            stats=None, abort_on_hopeless=False):
     """Write one http(s) stream to ``destination`` with parallel Range requests.
 
     Full Download used to be plain yt-dlp: for Bilibili/YouTube the chosen
     formats are ``protocol=https`` with no fragments, so yt-dlp transfers them on
     ONE connection and Bilibili's per-connection throttle caps it around
     1 MB/s (measured 0.9-1.8 MB/s single vs 20-23 MB/s with four range requests
-    on the same URL). This is the transfer the Audio Cache already had; the
-    function is deliberately transport-only so a caller can fall back to the
-    normal resumable downloader if anything here is unsupported.
+    on the same URL). This is the transfer the Audio Cache already had.
 
-    Returns the number of bytes written. Raises ``RangePrefetchError`` when the
-    stream size cannot be established, the server does not answer 206, or one
-    range keeps failing - the caller then re-downloads with yt-dlp.
+    Every range is written at its own offset, with a per-range byte count (the
+    file grows with the committed ranges and is truncated to ``size`` only after
+    every range is verified; it is not preallocated). That is what makes a slow
+    range harmless: the other ranges keep committing and progress keeps moving
+    (the old ordered reader froze the whole file behind one slow range and
+    buffered up to ``window x chunk`` in RAM). A range is resumed from its own
+    offset after a
+    short read, and the transfer is only accepted when **every** range is full:
+    the old code truncated to the total byte count, which could leave a zero hole
+    and lose the tail while returning success.
+
+    ``refresh_func``/``switch_func`` take no arguments and return
+    ``(url, headers)`` (or None). A switch verifies that the new URL serves the
+    same first 256 KiB that are already on disk before it is accepted, because
+    different mirrors of one VOD are byte-identical but a wrong object is not.
     """
     try:
         chunk_size = int(chunk_size)
@@ -449,7 +673,6 @@ def download_stream_to_file(url, destination, headers=None, size=None,
         raise RangePrefetchError("invalid parallel download parameters") from exc
     if chunk_size <= 0 or concurrency <= 0:
         raise RangePrefetchError("parallel download requires positive chunk size and concurrency")
-    request = request_func or _default_request
     header_map = dict(headers or {})
     # 总是先探测真实大小：① 顺带确认服务端真的支持 Range（不回 206 就直接
     # 放弃，交回 yt-dlp）；② yt-dlp 的 filesize_approx 对 Bilibili 可能偏大或
@@ -471,80 +694,346 @@ def download_stream_to_file(url, destination, headers=None, size=None,
     chunk_size = min(chunk_size, 64 * 1024 * 1024)
     ranges = [(start, min(size - 1, start + chunk_size - 1))
               for start in range(0, size, chunk_size)]
+    lengths = [end - start + 1 for start, end in ranges]
     if max_attempts is None:
         max_attempts = DEFAULT_RANGE_ATTEMPTS
     max_attempts = max(1, int(max_attempts))
     retry_delays = tuple(retry_delays or ())
+    stall_timeout = float(stall_timeout or 45.0)
 
     _log(logger, f"Parallel transfer: {max(1, int(concurrency))} connections, "
                  f"{chunk_size // (1024 * 1024)}MiB chunks, "
                  f"{size / (1024 * 1024):.1f}MB total")
-    with open(destination, "wb") as handle:
-        handle.truncate(size)
 
-    progress_lock = threading.Lock()
-    written = [0]
+    request = request_func or _bounded_default_request
+    state_lock = threading.Lock()
+    refresh_lock = threading.Lock()
+    switch_lock = threading.Lock()
+    url_holder = [str(url)]
+    headers_holder = [dict(header_map or {})]
+    done = [0] * len(ranges)
+    written_total = [0]
+    refreshed_at = [0.0]
+    switches = [0]
+    abort_event = threading.Event()
+    abort_reason = [""]
     started_at = time.monotonic()
+    last_report_at = [0.0]
 
-    def report():
+    # No preallocation: the file grows with the highest committed offset and is
+    # truncated to the exact size only after every range is verified. NTFS
+    # sparse-extends a file on truncate anyway, so preallocation did not reserve
+    # space reliably but did make Explorer show the full size from the first
+    # second (read as "already finished" by the user). Random-offset writes extend
+    # the file on demand.
+    handle = open(destination, "w+b")
+
+    def report(force=False):
         if progress_callback is None:
             return
-        with progress_lock:
-            done = written[0]
-        progress_callback(done, size, time.monotonic() - started_at)
+        now = time.monotonic()
+        if not force and now - last_report_at[0] < _RANGE_REPORT_SECONDS:
+            return
+        last_report_at[0] = now
+        with state_lock:
+            done_bytes = written_total[0]
+        progress_callback(done_bytes, size, now - started_at)
+
+    def _apply_update(candidate):
+        if not candidate:
+            return False
+        new_url, new_headers = candidate
+        if not new_url or str(new_url) == url_holder[0]:
+            return False
+        url_holder[0] = str(new_url)
+        headers_holder[0] = dict(new_headers or {})
+        return True
+
+    def refresh_once(exc):
+        if refresh_func is None or not _looks_like_expired_error(exc):
+            return False
+        with refresh_lock:
+            now = time.monotonic()
+            if now - refreshed_at[0] < _REFRESH_MIN_INTERVAL:
+                return False
+            refreshed_at[0] = now
+            try:
+                updated = _apply_update(refresh_func())
+            except Exception:                                  # noqa: BLE001
+                return False
+            if updated:
+                _log(logger, "Range request failed; retrying with a refreshed URL")
+            return updated
+
+    def _switch_serves_the_same_prefix(new_url, new_headers, n):
+        """Compare the first n bytes already on disk with the new mirror."""
+        if n <= 0:
+            return True
+        try:
+            with state_lock:
+                handle.flush()
+            with open(destination, "rb") as disk:
+                prefix = disk.read(n)
+            if len(prefix) < n:
+                return True                 # nothing committed at offset 0 yet
+            if request_func is not None:
+                data, status, _response_headers = request(
+                    new_url, 0, n - 1, dict(new_headers or {}), stall_timeout)
+            else:
+                data, _elapsed, status, _crange = read_range_bounded(
+                    new_url, 0, n - 1, new_headers, deadline=stall_timeout,
+                    socket_timeout=1.0, stall_timeout=stall_timeout)
+            return int(status) == 206 and bytes(data)[:n] == prefix
+        except Exception:                                      # noqa: BLE001
+            return False
+
+    def switch_once():
+        if switch_func is None:
+            return False
+        with switch_lock:
+            if switches[0] >= max(0, int(max_switches)):
+                return False
+            try:
+                candidate = switch_func()
+            except Exception:                                  # noqa: BLE001
+                return False
+            if not candidate:
+                return False
+            new_url, new_headers = candidate
+            if str(new_url) == url_holder[0]:
+                return False
+            with state_lock:
+                committed = done[0] if done else 0
+            verify_bytes = min(_SWITCH_VERIFY_BYTES, committed)
+            if verify_bytes >= _SWITCH_VERIFY_MIN_BYTES and not _switch_serves_the_same_prefix(
+                    str(new_url), new_headers, verify_bytes):
+                _log(logger, "Mirror serves different bytes; keeping the current host")
+                return False
+            switches[0] += 1
+            url_holder[0] = str(new_url)
+            headers_holder[0] = dict(new_headers or {})
+            _log(logger, f"Switched range host after {switches[0]} switch(es)")
+            return True
 
     def fetch(index, start, end):
+        length = lengths[index]
+        attempts = 0
+        rounds = 0
+        max_rounds = max(8, max_attempts * 8)
         last_error = None
-        for attempt in range(max_attempts):
+        while rounds < max_rounds:
+            rounds += 1
+            if abort_event.is_set():
+                raise CdnTooSlowError(abort_reason[0])
             if callable(cancel_check) and cancel_check():
-                raise InterruptedError("Full Download cancelled by user.")
-            try:
-                result = request(url, start, end, dict(header_map), DEFAULT_TIMEOUT)
-                if not isinstance(result, tuple) or len(result) not in (2, 3):
-                    raise RangePrefetchError("invalid range response")
-                data, status = result[:2]
-                response_headers = {}
-                if len(result) == 3 and result[2]:
-                    response_headers = {str(key).lower(): str(value)
-                                        for key, value in result[2].items()}
-                if int(status) == 416:
-                    # 请求区间已经越过实际末尾：说明 size（预估）偏大，和
-                    # iter_range_bytes 一样按"末尾已到"优雅收尾，而不是硬错误重试
-                    # 5 次（37 秒）后把整段传输丢掉、退回单连接重下。
-                    if start > 0:
-                        return index, 0, None
-                    raise RangePrefetchError("range server rejected the first range")
-                if int(status) != 206:
-                    raise RangePrefetchError("range server returned a non-partial response")
-                expected = end - start + 1
-                content_range = str(response_headers.get("content-range", "")).lower()
-                cr_matches = content_range.startswith(
-                    f"bytes {start}-{start + len(data) - 1}/")
-                if len(data) != expected and not cr_matches:
-                    raise RangePrefetchError("range response length mismatch")
-                if not data:
-                    # 实际末尾已收完（与 iter_range_bytes 相同语义）
-                    return index, 0, None
-                with open(destination, "r+b") as handle:
-                    handle.seek(start)
-                    handle.write(data)
-                with progress_lock:
-                    written[0] += len(data)
-                report()
+                raise InterruptedError("Parallel transfer cancelled by user.")
+            if pause_pending():
+                if not wait_while_paused(cancel_check=cancel_check):
+                    raise InterruptedError("Parallel transfer cancelled by user.")
+            with state_lock:
+                offset_in_range = done[index]
+            if offset_in_range >= length:
                 return index
+            offset = start + offset_in_range
+            before = offset_in_range
+            try:
+                if request_func is None:
+                    # Production path: commit each 64 KiB piece as it arrives, so
+                    # the UI moves during a slow range and a cut-off range keeps
+                    # everything it already received.
+                    def commit(piece):
+                        with state_lock:
+                            handle.seek(start + done[index])
+                            handle.write(piece)
+                            handle.flush()
+                            done[index] += len(piece)
+                            written_total[0] += len(piece)
+                        report()
+
+                    received, status, content_range = read_range_stream(
+                        url_holder[0], offset, end, commit,
+                        headers=dict(headers_holder[0]),
+                        stall_timeout=stall_timeout,
+                        expected_start=offset, expected_total=size,
+                        stop_check=lambda: (abort_event.is_set()
+                                            or pause_pending()
+                                            or (callable(cancel_check)
+                                                and cancel_check())))
+                    if int(status) == 416:
+                        # The requested offset is past the real end. If a real
+                        # prefix of this range is on disk, the stream ended there.
+                        if done[index] > 0:
+                            with state_lock:
+                                done[index] = length
+                            report(force=True)
+                            return index
+                        raise RangePrefetchError("range server rejected the first range")
+                    if int(status) != 206:
+                        raise RangePrefetchError(
+                            "range server returned a non-partial response")
+                    if callable(cancel_check) and cancel_check():
+                        raise InterruptedError("Parallel transfer cancelled by user.")
+                    if pause_pending():
+                        # The range was cut at a piece boundary; the next loop
+                        # iteration blocks in wait_while_paused and resumes from
+                        # the committed offset when the user continues.
+                        attempts = 0
+                        continue
+                    if received <= 0:
+                        raise RangePrefetchError("empty range response")
+                    if abort_event.is_set():
+                        raise CdnTooSlowError(abort_reason[0])
+                    if done[index] >= length:
+                        report(force=True)
+                        return index
+                    attempts = 0
+                else:
+                    data, status, response_headers = request(
+                        url_holder[0], offset, end, dict(headers_holder[0]),
+                        stall_timeout)
+                    if not isinstance(data, (bytes, bytearray)):
+                        raise RangePrefetchError("invalid range response")
+                    data = bytes(data)
+                    if int(status) == 416:
+                        # The requested offset is past the real end. If a real prefix
+                        # of this range is already on disk, the stream ended there.
+                        if offset_in_range > 0:
+                            with state_lock:
+                                done[index] = length
+                            report(force=True)
+                            return index
+                        raise RangePrefetchError("range server rejected the first range")
+                    if int(status) != 206:
+                        raise RangePrefetchError("range server returned a non-partial response")
+                    response_headers = {str(key).lower(): str(value)
+                                        for key, value in (response_headers or {}).items()}
+                    content_range = str(response_headers.get("content-range", "")).lower()
+                    if content_range:
+                        if not content_range.startswith(f"bytes {offset}-"):
+                            raise RangePrefetchError(
+                                "range response does not start at the requested offset")
+                        total = _content_range_total(response_headers)
+                        if total is not None and total != size:
+                            raise RangePrefetchError(
+                                f"stream size changed (server reports {total}, "
+                                f"expected {size}); refusing to mix objects")
+                    remaining = length - offset_in_range
+                    if len(data) > remaining:
+                        data = data[:remaining]
+                    if not data:
+                        raise RangePrefetchError("empty range response")
+                    with state_lock:
+                        handle.seek(offset)
+                        handle.write(data)
+                        # Flush per committed range: a crash leaves the bytes on
+                        # disk, and progress can be read back by another handle.
+                        handle.flush()
+                        done[index] = offset_in_range + len(data)
+                        written_total[0] += len(data)
+                    report()
+                    if done[index] >= length:
+                        report(force=True)
+                        return index
+                    # Progress but not complete: resume this range immediately.
+                    attempts = 0
             except InterruptedError:
                 raise
-            except Exception as exc:
+            except CdnTooSlowError:
+                raise
+            except Exception as exc:                           # noqa: BLE001
                 last_error = exc
-                if attempt + 1 < max_attempts and retry_delays:
-                    sleep_func(retry_delays[min(attempt, len(retry_delays) - 1)])
+                with state_lock:
+                    progressed = done[index] > before
+                if progressed:
+                    attempts = 0
+                    continue
+                attempts += 1
+                refreshed = refresh_once(exc)
+                if attempts >= max_attempts:
+                    if switch_once():
+                        attempts = 0
+                        continue
+                    raise RangePrefetchError(
+                        f"range {start}-{end} failed after {max_attempts} "
+                        f"attempts without progress") from exc
+                if not refreshed and retry_delays:
+                    sleep_func(retry_delays[min(attempts - 1, len(retry_delays) - 1)])
         raise RangePrefetchError(
-            f"range {start}-{end} failed after {max_attempts} attempts") from last_error
+            f"range {start}-{end} did not finish ({done[index]}/{length} bytes)") from last_error
 
     executor = ThreadPoolExecutor(max_workers=max(1, int(concurrency)))
     futures = {}
     window = max(1, int(concurrency)) * 2
     next_index = 0
+    watchdog_stop = threading.Event()
+    last_sample = [time.monotonic(), 0]
+    low_windows = [0]
+    hopeless_windows = [0]
+    failed_switch_rounds = [0]
+
+    def speed_watchdog():
+        """Switch hosts, or abort a hopeless transfer, on aggregate throughput.
+
+        Per-range samples are noisy and a single slow connection is normal; two
+        consecutive 10 s windows under ``_WRITER_MIN_MBPS`` trigger one switch
+        probe. If mirrors do not help and the rate stays under
+        ``_WRITER_HOPELESS_MBPS`` for ``_WRITER_HOPELESS_WINDOWS`` windows, the
+        transfer is abandoned with ``CdnTooSlowError`` so the batch can skip the
+        source instead of crawling for hours.
+        """
+        while not watchdog_stop.wait(_WRITER_WATCHDOG_SECONDS):
+            now = time.monotonic()
+            with state_lock:
+                written = written_total[0]
+            if written >= size or abort_event.is_set():
+                return
+            if pause_pending():
+                # No bytes arriving while paused is not a slow host: reset the
+                # windows so a pause never triggers a mirror switch.
+                last_sample[0] = time.monotonic()
+                last_sample[1] = written
+                low_windows[0] = hopeless_windows[0] = failed_switch_rounds[0] = 0
+                continue
+            elapsed = max(now - last_sample[0], 0.001)
+            rate = (written - last_sample[1]) / elapsed / (1024 * 1024)
+            last_sample[0] = now
+            last_sample[1] = written
+            if elapsed < _WRITER_WATCHDOG_SECONDS - 1.0:
+                continue
+            hopeless_windows[0] = (hopeless_windows[0] + 1
+                                   if rate < _WRITER_HOPELESS_MBPS else 0)
+            low_windows[0] = (low_windows[0] + 1
+                              if rate < _WRITER_MIN_MBPS else 0)
+            if rate >= _WRITER_MIN_MBPS:
+                failed_switch_rounds[0] = 0
+            if low_windows[0] >= 2:
+                low_windows[0] = 0
+                if switch_once():
+                    last_sample[0] = time.monotonic()
+                    last_sample[1] = written
+                    hopeless_windows[0] = 0
+                    failed_switch_rounds[0] = 0
+                    continue
+                failed_switch_rounds[0] += 1
+            # Two consecutive rescue rounds that could not find a faster mirror,
+            # while the current transfer is still under the usable floor. By
+            # default the writer NEVER aborts on slowness (the user wants every
+            # source downloaded, however slow); callers that opt in get
+            # ``CdnTooSlowError`` so they can park the source and retry later.
+            if abort_on_hopeless and (
+                    hopeless_windows[0] >= _WRITER_HOPELESS_WINDOWS
+                    or (failed_switch_rounds[0] >= 2
+                        and rate < _WRITER_MIN_MBPS)):
+                abort_reason[0] = (
+                    f"CDN throughput stayed at {rate:.2f} MB/s "
+                    f"(no mirror reached {_WRITER_MIN_MBPS:g} MB/s; "
+                    f"{failed_switch_rounds[0]} rescue round(s) failed)")
+                abort_event.set()
+                return
+
+    watchdog = threading.Thread(target=speed_watchdog, name="range-speed-watchdog",
+                                daemon=True)
+    watchdog.start()
     try:
         while next_index < len(ranges) and len(futures) < window:
             start, end = ranges[next_index]
@@ -565,23 +1054,33 @@ def download_stream_to_file(url, destination, headers=None, size=None,
     except Exception as exc:
         for future in futures:
             future.cancel()
+        if isinstance(exc, CdnTooSlowError):
+            raise
         raise RangePrefetchError("parallel transfer failed") from exc
     finally:
+        watchdog_stop.set()
+        if watchdog.is_alive():
+            watchdog.join(timeout=2)
         executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            handle.flush()
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+        handle.close()
 
     report()
-    with progress_lock:
-        total_written = written[0]
-    # 区间可能少写（末尾 416 / 实际末尾提前到达）：文件开头已经 truncate 到 size，
-    # 必须按实际写入量裁掉尾部，否则会留下"空洞 + 旧长度"的坏文件。
-    if total_written < size:
-        try:
-            with open(destination, "r+b") as handle:
-                handle.truncate(total_written)
-        except OSError as exc:
-            raise RangePrefetchError(
-                f"could not trim the partial transfer: {exc}") from exc
-    if total_written > size:
+    with state_lock:
+        total_written = written_total[0]
+    incomplete = [index for index, length in enumerate(lengths)
+                  if done[index] < length]
+    if incomplete:
+        # A hole is never acceptable: hand the caller a failure so it can retry
+        # or fall back, instead of truncating and calling a broken file done.
+        raise RangePrefetchError(
+            f"parallel transfer left {len(incomplete)} incomplete range(s) "
+            f"({total_written} of {size} bytes)")
+    if total_written != size:
         raise RangePrefetchError(
             f"parallel transfer wrote {total_written} of {size} bytes")
     if not size_verified and total_written != declared_size:
@@ -592,6 +1091,18 @@ def download_stream_to_file(url, destination, headers=None, size=None,
         raise RangePrefetchError(
             f"parallel transfer wrote {total_written} of the estimated "
             f"{declared_size} bytes; the size could not be verified")
+    # Every range is on disk; make the final size exact (a no-op when the last
+    # range already extended the file to `size`).
+    try:
+        with open(destination, "r+b") as exact:
+            exact.truncate(size)
+    except OSError as exc:
+        raise RangePrefetchError(
+            f"could not finalize the transfer size: {exc}") from exc
+    if stats is not None:
+        stats.update({"size": size, "written": total_written,
+                      "ranges": len(ranges), "incomplete": 0,
+                      "switches": switches[0], "size_probed": size_verified})
     return total_written
 
 
@@ -610,40 +1121,15 @@ def measure_stream_throughput(url, headers=None, probe_bytes=4 * 1024 * 1024,
         return None
     if probe_bytes <= 0:
         return None
-    started = time.monotonic()
-    if request_func is not None:
-        try:
-            result = request_func(url, 0, probe_bytes - 1, dict(headers or {}), deadline)
-        except Exception:
-            return None
-        if not isinstance(result, tuple) or len(result) < 2:
-            return None
-        try:
-            if int(result[1]) != 206:
-                return None
-        except (TypeError, ValueError):
-            return None
-        received = len(bytes(result[0] or b""))
-    else:
-        request = Request(url, headers={**dict(headers or {}),
-                                        "Range": f"bytes=0-{probe_bytes - 1}"})
-        received = 0
-        try:
-            with urlopen(request, timeout=deadline) as response:
-                if int(getattr(response, "status", response.getcode())) != 206:
-                    return None
-                while received < probe_bytes and time.monotonic() - started < deadline:
-                    block = response.read(min(262144, probe_bytes - received))
-                    if not block:
-                        break
-                    received += len(block)
-        except Exception:
-            if received <= 0:
-                return None
-    elapsed = max(time.monotonic() - started, 0.001)
-    if received <= 0:
+    try:
+        data, elapsed, status, _content_range = read_range_bounded(
+            url, 0, probe_bytes - 1, headers, deadline=deadline,
+            request_func=request_func)
+    except Exception:                                          # noqa: BLE001
         return None
-    return received / elapsed / (1024 * 1024)
+    if int(status) != 206 or not data:
+        return None
+    return len(data) / max(elapsed, 0.001) / (1024 * 1024)
 
 
 def _hls_attribute(line, name):

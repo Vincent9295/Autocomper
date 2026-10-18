@@ -985,7 +985,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                    use_gpu=True, cache_store=None, progress_callback=None,
                    refresh_func=None, save_audio_path=None,
                    select_candidate_func=None, prefetch_concurrency=None,
-                   prepare_source_func=None):
+                   prefetch_chunk_size=None, prepare_source_func=None):
     # 必须是"正数"：0 会让 subsample 除零（precision=0 → ZeroDivisionError 卡在
     # 检测中途），block_size=0 会让 frame_count/chunk_size 归零（AudioDecodeError）。
     # GUI 的数字校验只挡非数字，用户手打 0 是可能的。
@@ -1102,6 +1102,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
 
     blocks = load_audio(
         file, SAMPLE_RATE, SAMPLE_RATE * block_size,
+        prefetch_chunk_size=(prefetch_chunk_size if prefetch_chunk_size
+                             else DEFAULT_CHUNK_SIZE),
         prefetch_concurrency=(prefetch_concurrency if prefetch_concurrency
                               else DEFAULT_CONCURRENCY),
         progress_callback=progress_callback if is_remote else None,
