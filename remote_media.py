@@ -4242,9 +4242,26 @@ def _looks_like_auth_required_error(exc: Exception) -> bool:
     return any(marker in detail for marker in _AUTH_REQUIRED_ERROR_MARKERS)
 
 
+_YT_CLIENT_REGRESSION_MARKERS = (
+    # yt-dlp #17389: tv_downgraded broke for cookie-authenticated requests.
+    "page needs to be reloaded",
+    # yt-dlp 2026.10.21 made tv_samsung a default client; with browser cookies the
+    # cookie client set can come back without a usable format selector match
+    # ("Requested format is not available"). Same class of client regression, and the
+    # anonymous retry resolves it (measured on a public VOD).
+    "requested format is not available",
+)
+
+
 def _is_yt_page_reload_error(exc: Exception) -> bool:
     """yt-dlp #17389：带 cookie 时 tv_downgraded 客户端已坏的标志性错误。"""
     return "page needs to be reloaded" in str(exc).lower()
+
+
+def _is_youtube_client_regression_error(exc: Exception) -> bool:
+    """True for a YouTube failure class where an anonymous retry is known to help."""
+    detail = str(exc).lower()
+    return any(marker in detail for marker in _YT_CLIENT_REGRESSION_MARKERS)
 
 
 def _should_auto_use_cookies(url: str, exc: Exception) -> bool:
@@ -4274,6 +4291,10 @@ def classify_resolve_failure(exc: Exception) -> tuple[str, str]:
                 "(e.g. twitch.tv/videos/<id>).")
     if "page needs to be reloaded" in lowered:
         return ("youtube page-reload error (yt-dlp client regression)",
+                "Update AutoComper: this is fixed by the bundled yt-dlp "
+                "(the tester build must be the latest package).")
+    if "requested format is not available" in lowered:
+        return ("youtube format unavailable (yt-dlp client regression)",
                 "Update AutoComper: this is fixed by the bundled yt-dlp "
                 "(the tester build must be the latest package).")
     if is_throttling_error(exc):
@@ -4315,6 +4336,8 @@ def _classify_hydration_error(exc: Exception) -> str:
         return "sign-in required"
     if _is_yt_page_reload_error(exc):
         return "youtube page reload error"
+    if "requested format is not available" in lowered:
+        return "youtube format unavailable"
     if _is_http_412_error(exc) or "429" in lowered or "too many requests" in lowered:
         return "rate limited"
     if "timed out" in lowered or "timeout" in lowered:
@@ -4360,10 +4383,11 @@ def _extract_with_cookie_policy(
             return _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat,
                                  resolve_timeout=resolve_timeout)
         except SourceResolveError as exc:
-            # yt-dlp #17389：YouTube 带 cookie 时 tv_downgraded 客户端对部分
-            # 用户已坏。公开视频匿名解析正常（issue 原报告证实）——回退匿名
-            # 重试一次；仍失败则抛原始错误（原因更明确）。
-            if _is_youtube_url(url) and _is_yt_page_reload_error(exc):
+            # YouTube 带 cookie 的解析被客户端改坏时（yt-dlp #17389 的 page-reload，
+            # 以及 2026.10.21 起 tv_samsung 默认客户端给出的 "format not available"），
+            # 公开视频匿名解析正常——回退匿名重试一次；仍失败则抛原始错误
+            # （cookie 那条失败原因更具体）。
+            if _is_youtube_url(url) and _is_youtube_client_regression_error(exc):
                 try:
                     return _extract_info(url, ydl_factory, None, extract_flat=extract_flat,
                                          resolve_timeout=resolve_timeout)

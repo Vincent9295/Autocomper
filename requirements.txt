@@ -1,6 +1,6 @@
 altgraph==0.17.4
 Brotli==1.1.0
-certifi==2024.2.2
+certifi==2026.10.19
 charset-normalizer==3.3.0
 colorama==0.4.6
 coloredlogs==15.0.1
@@ -31,5 +31,6 @@ sv-ttk==2.6.0
 sympy==1.12
 tqdm==4.66.1
 urllib3==2.2.0
-websockets==12.0
-yt-dlp==2026.8.19
+websockets==17.0.1
+yt-dlp==2026.10.21
+yt-dlp-ejs==0.8.0

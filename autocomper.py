@@ -66,7 +66,8 @@ from compile import (_get_video_duration, compile_vid, get_video_codec,
 from config import VERSION, REPO_URL
 from custom_tooltip import CustomHovertip
 from sound_reader import (RemoteAudioIncompleteError, RemoteAudioStallError,
-                          get_timestamps, _detection_cache_args)
+                          RetainedAudioBudget, RetainedHitAudio, get_timestamps,
+                          _detection_cache_args)
 from remote_media import (MediaSource, PCM_SCAN_SAMPLE_RATE, fetch_audio_cache, fetch_segment,
                            PlaylistDescriptor, describe_input,
                            expand_input, resolve_source, select_audio_candidate,
@@ -3085,6 +3086,7 @@ def dedupe_new_media_paths(paths, uploaded_videos):
 
 
 _TIMESTAMPS_EMPTY_MARKER = "# no timestamps"
+_QUEUE_TXT_HEADER = "# AutoComper media list"
 
 
 def timestamps_txt_headers(txt_path):
@@ -3115,6 +3117,10 @@ def timestamps_txt_headers(txt_path):
             if line == _TIMESTAMPS_EMPTY_MARKER:
                 if current is not None:
                     current["marked_empty"] = True
+                continue
+            if line.startswith("#"):
+                # 注释行：导出队列文件写的头部，以及手写备注。既不是媒体身份，也不结束
+                # 当前 section（"# no timestamps" 已在上面处理）。
                 continue
             if _TIMESTAMPS_CLIP_LINE_RE.match(line):
                 if current is not None:
@@ -3238,6 +3244,55 @@ def _write_timestamps_txt(dict_list, txt_path):
         return False
 
 
+def queue_source_lines(uploaded_videos):
+    """The queued sources as txt lines, in list order and without duplicates.
+
+    A remote entry is exported as its **URL** - that is what the user picked, and what a
+    later run should resolve again (an entry downloaded by Full Download still carries its
+    URL). A local file is exported as its full path. Picking VODs out of a long channel or
+    playlist takes a long time, so the list must survive closing the program.
+    """
+    lines = []
+    seen = set()
+    for upload in uploaded_videos or ():
+        getter = getattr(upload, "get_url", None)
+        url = getter() if callable(getter) else None
+        if url:
+            value = str(url).strip()
+        else:
+            getter = getattr(upload, "get_path", None)
+            value = str(getter() if callable(getter) else upload or "").strip()
+        if not value:
+            continue
+        key = media_identity_key(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(value)
+    return lines
+
+
+def write_queue_txt(lines, txt_path):
+    """Write queued sources so they can be queued again after a restart.
+
+    The format is exactly what **Import URLs from Timestamps .txt** already reads: one
+    media identity per line. The comment header is for the human reader, and both
+    importers skip comment lines.
+    Returns ``(ok, error_message)``.
+    """
+    try:
+        with open(txt_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(_QUEUE_TXT_HEADER + "\n")
+            handle.write("# Re-add these sources with Add Media > "
+                         "Import URLs from Timestamps .txt\n")
+            handle.write("\n")
+            for line in lines:
+                handle.write(str(line) + "\n")
+        return True, None
+    except OSError as exc:
+        return False, str(exc)
+
+
 def _index_uploads_for_timestamp_match(uploaded_videos):
     """Index the current list so a loaded timestamps file can be matched back to it.
 
@@ -3282,6 +3337,9 @@ def _parse_timestamps_txt(txt_path):
             if line == _TIMESTAMPS_EMPTY_MARKER:
                 # 空条目标记（_write_timestamps_txt 写的）：它不是文件名，跳过即可，
                 # 该条目随后由空行收尾并进入 without_videos。
+                continue
+            if line.startswith("#"):
+                # 注释行（导出队列文件的头部 / 手写备注）：不是标题，也不结束当前 section。
                 continue
             m = _TIMESTAMPS_CLIP_LINE_RE.match(line)
             if m:
@@ -3518,13 +3576,56 @@ def _read_wav_pcm(path, target_rate=None):
     return samples
 
 
+def _dispose_retained_audio(retainer):
+    """Drop one source's retained detection audio (None-safe and repeat-safe)."""
+    if retainer is None:
+        return
+    try:
+        retainer.close()
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
 def _verify_and_expand(dict_list, selected_model, window=5.0,
                        precision=100, block_size=600, logger=None,
                        focus_idx=58, threshold=0.30, ort_session=None,
                        verify_block_size=10, direct_accept=0.75,
                        use_gpu=True, cache_store=None, refresh_func=None,
-                       audio_cache_paths=None, progress_callback=None):
-    """Reverify local files and remote sources without downloading remote video."""
+                       audio_cache_paths=None, progress_callback=None,
+                       retained_audio=None):
+    """Reverify local files and remote sources without downloading remote video.
+
+    ``retained_audio`` maps a source id to the ``sound_reader.RetainedHitAudio`` that
+    detection filled while it was already reading that source's audio. A scan window that
+    is fully covered by it is scanned from that PCM instead of being downloaded again;
+    anything not covered (cached detection result from an earlier run, a resumed block, a
+    window that runs past the end of the stream) falls back to the normal fetch.
+    """
+    retained_audio = retained_audio or {}
+    try:
+        return _verify_and_expand_impl(
+            dict_list, selected_model, window=window, precision=precision,
+            block_size=block_size, logger=logger, focus_idx=focus_idx,
+            threshold=threshold, ort_session=ort_session,
+            verify_block_size=verify_block_size, direct_accept=direct_accept,
+            use_gpu=use_gpu, cache_store=cache_store, refresh_func=refresh_func,
+            audio_cache_paths=audio_cache_paths, progress_callback=progress_callback,
+            retained_audio=retained_audio,
+        )
+    finally:
+        # 检测音频只在本次 re-verify 期间有用：扫描一结束就删，别把几小时的临时音频留在盘上。
+        for retainer in list(retained_audio.values()):
+            _dispose_retained_audio(retainer)
+        retained_audio.clear()
+
+
+def _verify_and_expand_impl(dict_list, selected_model, window=5.0,
+                            precision=100, block_size=600, logger=None,
+                            focus_idx=58, threshold=0.30, ort_session=None,
+                            verify_block_size=10, direct_accept=0.75,
+                            use_gpu=True, cache_store=None, refresh_func=None,
+                            audio_cache_paths=None, progress_callback=None,
+                            retained_audio=None):
     if not dict_list:
         return dict_list
     ensure_temp_dir()
@@ -3545,6 +3646,7 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
     sample_rate = PCM_SCAN_SAMPLE_RATE
     checked = dskip = confirmed = rejected = 0
+    reused_windows = 0
     for entry in dict_list:
         filename = entry['filename']
         cached_audio = None
@@ -3578,10 +3680,53 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
 
                 new_timestamps = []
                 window_total = len(scan_windows)
+                retained = retained_audio.get(stable_source_id(filename))
+                if retained is not None and retained.window_count:
+                    print(
+                        f"{Fore.CYAN}Verification: {retained.describe()} of this source's "
+                        f"audio are already kept from detection and will not be downloaded "
+                        f"again.{Style.RESET_ALL}")
                 for window_index, (ws, we) in enumerate(scan_windows):
                     # 任务边界（每个校验窗口取音频之前）：暂停在这里等待，取消优先。
                     if pause_or_cancel(cancel_pending):
                         raise InterruptedError("Verify cancelled by user.")
+                    # 检测刚读过这段音频（RetainedHitAudio）：能整窗覆盖就用它扫描，
+                    # 省掉一次小窗口下载。覆盖不全时（旧缓存结果/边界/流提前结束）
+                    # 照旧走下载，绝不用拼接出来的音频冒充原时间轴。
+                    retained_pcm = (retained.read(ws, we)
+                                    if retained is not None else None)
+                    if retained_pcm is not None:
+                        duration = len(retained_pcm) / sample_rate
+                        found, scans, skipped, accepted, refused = _scan_reverify_audio(
+                            retained_pcm, [(0.0, duration)], precision, focus_idx,
+                            scan_threshold, ort_session, verify_block_size,
+                            direct_accept, logger, timestamp_offset=ws)
+                        new_timestamps.extend(found)
+                        checked += scans
+                        dskip += skipped
+                        confirmed += accepted
+                        rejected += refused
+                        reused_windows += 1
+                        print(
+                            f"{Fore.CYAN}Verification: reusing detected audio "
+                            f"[{window_index + 1}/{window_total}] ({ws:g}-{we:g}s) for "
+                            f"{get_source_display_name(filename)} "
+                            f"(no download){Style.RESET_ALL}")
+                        if progress_callback is not None:
+                            progress_callback({
+                                "title": "Verification",
+                                "current_line": (
+                                    f"Scanning audio already read "
+                                    f"[{window_index + 1}/{window_total}]"
+                                ),
+                                "percent_line": (
+                                    f"Progress: "
+                                    f"{int((window_index + 1) / window_total * 100)}%"
+                                ),
+                                "speed_line": "Speed: --",
+                                "eta_line": "ETA: --",
+                            })
+                        continue
                     print(
                         f"{Fore.CYAN}Verification: fetching audio "
                         f"[{window_index + 1}/{window_total}] "
@@ -3775,7 +3920,9 @@ def _verify_and_expand(dict_list, selected_model, window=5.0,
                 print(f"{Fore.YELLOW}  Verify scan failed for {os.path.basename(filename)}: {exc}")
 
     if checked > 0:
-        print(f"{Fore.CYAN}Verification: scanned {checked} window(s), "
+        reused_note = (f" ({reused_windows} scanned from the audio detection already read, "
+                       f"not downloaded again)" if reused_windows else "")
+        print(f"{Fore.CYAN}Verification: scanned {checked} window(s){reused_note}, "
               f"confirmed {confirmed} new, DRC-skip {dskip}, rejected {rejected}.")
     return dict_list
 
@@ -4922,7 +5069,9 @@ class VideoProcessorApp:
             "Import URLs from Timestamps .txt queues every URL listed in an\n"
             "existing timestamps file: each section title in that file is the\n"
             "source of one video, so a batch can be rebuilt without pasting\n"
-            "URLs again. Files that no longer exist are skipped.")
+            "URLs again. Files that no longer exist are skipped.\n\n"
+            "Export Queued Sources to .txt writes the current list in the same\n"
+            "format, so a long selection survives closing the program.")
 
         def show_menu(event):
             # widget 级 <Button-1> 绑定在 ttk 的 disabled 判定**之前**触发，所以
@@ -5553,7 +5702,7 @@ class VideoProcessorApp:
             self.verify_checkbox,
             'After AI detection, scan near each clip with a lower threshold to find clips the AI may have missed.\n\n'
             'Note: any remote source is detected by downloading its full audio first.\n'
-            'With Re-verify enabled, Remote Stream mode re-downloads the small window around each clip for the scan.\n'
+            'With Re-verify enabled, Remote Stream mode keeps the small window of audio it already read around each clip and scans that (temporary, deleted after the scan) instead of downloading it again.\n'
             'Audio Cache mode keeps the stored audio and reuses it for the scan, so nothing extra is downloaded.')
         review_tooltip = CustomHovertip(
             self.review_checkbox,
@@ -5776,6 +5925,10 @@ class VideoProcessorApp:
         self.media_menu.add_command(
             label=" Timestamps File Preference… ",
             command=self.choose_timestamps_preference)
+        self.media_menu.add_separator()
+        self.media_menu.add_command(
+            label=" Export Queued Sources to .txt ",
+            command=self.export_queue_to_txt)
 
     def clear_output(self):
         self.output_video_path.set("No location selected!")
@@ -6306,6 +6459,40 @@ class VideoProcessorApp:
                   f"{os.path.basename(path)} that had no timestamps "
                   f"({_TIMESTAMPS_EMPTY_MARKER}); add them by URL if you want them "
                   f"detected again.{Style.RESET_ALL}")
+
+    def export_queue_to_txt(self):
+        """Save the queued sources to a .txt so the list survives closing the program.
+
+        导出内容是"用户挑中的那些源"（URL 优先，本地文件写完整路径），格式与
+        Import URLs from Timestamps .txt 读的完全一致 —— 所以同一个文件就能把列表
+        原样排回来，不需要第二种导入方式。
+        """
+        lines = queue_source_lines(self.uploaded_videos)
+        if not lines:
+            messagebox.showinfo(
+                "Export Queued Sources",
+                "The media list is empty; there is nothing to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export the queued sources",
+            defaultextension=".txt",
+            initialfile="queue.txt",
+            filetypes=[("Text file", "*.txt"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        ok, error = write_queue_txt(lines, path)
+        if not ok:
+            messagebox.showerror(
+                "Export Queued Sources",
+                f"Could not write that file:\n{error}")
+            return
+        print(f"{Fore.GREEN}Exported {len(lines)} queued source(s) to {path}."
+              f"{Style.RESET_ALL}")
+        messagebox.showinfo(
+            "Export Queued Sources",
+            f"Exported {len(lines)} source(s) to\n{path}\n\n"
+            f"Re-add them with Add Media > Import URLs from Timestamps .txt.")
 
     def add_video_url(self):
         # 窗口对象必须固定在局部变量里：以前所有回调都操作 self.entry_window，
@@ -8106,6 +8293,11 @@ class VideoProcessorApp:
                 logger=print,
             )
             audio_cache_paths = {}
+            # Remote Stream 模式的 re-verify 音频保留：检测读过的窗口音频留到 re-verify 用完
+            # （键 = stable_source_id，见 RetainedHitAudio）。仅 Remote Stream，因为另外两种
+            # 模式的检测输入本来就是本地文件/缓存，re-verify 直接复用那个文件。
+            retained_audio = {}
+            retained_audio_budget = RetainedAudioBudget()
             resolved_local_entries = []
             remote_entries = []
             remote_failures = []
@@ -8463,6 +8655,7 @@ class VideoProcessorApp:
                             use_gpu=use_gpu, ort_session=shared_session,
                             cache_store=cache_store, refresh_func=refresh_func,
                             audio_cache_paths=audio_cache_paths,
+                            retained_audio=retained_audio,
                             progress_callback=self._queue_transfer_progress)
                     # auto-deselect originals fully covered by new reverify clips
                     for entry in dict_list:
@@ -8644,6 +8837,31 @@ class VideoProcessorApp:
                         # 由 get_timestamps 在"两个检测缓存都没命中、确实要读音频"时回调
                         # prepare_source_func，于是已有检测结果的源完全不做这项网络探测
                         # （见 prepare_source_func 的说明）。限流器仍在回调里生效。
+                    retain_hits = None
+                    if (self.use_verify.get()
+                            and self.remote_mode.get() == "Remote Stream"
+                            and isinstance(input_video_path, MediaSource)):
+                        # 检测本来就要把整条音轨读一遍；顺手留下 re-verify 稍后要扫的那几个
+                        # 小窗口，收尾时就不用为每个 clip 再下载一次。
+                        retain_key = stable_source_id(input_video_path)
+                        _dispose_retained_audio(retained_audio.pop(retain_key, None))
+                        try:
+                            retain_window = float(self.verify_window_var.get())
+                        except Exception:                       # noqa: BLE001
+                            retain_window = 5.0
+                        ensure_temp_dir()
+                        try:
+                            retain_hits = RetainedHitAudio(
+                                TEMP_DIR, retain_window,
+                                budget=retained_audio_budget)
+                        except OSError as exc:
+                            # 保不住音频不是错误：re-verify 会照旧下载那几个窗口。
+                            print(f"{Fore.YELLOW}  Could not keep the detection audio for "
+                                  f"re-verify ({exc}); those windows will be downloaded "
+                                  f"again.{Style.RESET_ALL}")
+                            retain_hits = None
+                        if retain_hits is not None:
+                            retained_audio[retain_key] = retain_hits
                     try:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
@@ -8662,6 +8880,7 @@ class VideoProcessorApp:
                                     f"Remote Stream [{i + 1}/{len(processing_uploads)}] "
                                     f"{get_source_display_name(upload)}",
                                 ),
+                            retain_audio=retain_hits,
                         )
                     except RemoteAudioIncompleteError as exc:
                         failure = f"{get_source_display_name(input_video_path)}: {exc}"
@@ -8894,6 +9113,7 @@ class VideoProcessorApp:
                         use_gpu=use_gpu, ort_session=shared_session,
                         cache_store=cache_store, refresh_func=refresh_func,
                         audio_cache_paths=audio_cache_paths,
+                        retained_audio=retained_audio,
                         progress_callback=self._queue_transfer_progress)
                 # auto-deselect originals fully covered by new reverify clips
                 for entry in dict_list:
