@@ -32,6 +32,7 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Merge Scratch Folder** | Chooses the drive used for a merge's intermediate files (default: the system temp folder). Point it at the same fast drive as your output when the system drive is small or slow. The folder is only used while a compilation runs, and each layer's files are deleted as soon as the next layer has been written. |
 | **Merge Disk Headroom** | Before every merge layer, AutoComper checks the free space the remaining layers still need and stops with a clear message instead of filling the drive. Releasing each layer's inputs keeps peak usage at two layers instead of every intermediate at once, which is what makes compilations of several thousand clips fit on a normal drive. |
 | **Import URLs from Timestamps .txt** | The **Add Media** menu can queue every URL listed in an existing timestamps file. Each section title in that file is the source of one video, so a batch can be rebuilt without pasting URLs again. Titles that are neither a URL nor a media file path, files that no longer exist, and entries already in the list are skipped (and counted in the log). A section this program itself marked `# no timestamps` (a source that was detected but had no events) is left out as well, with a count, so loading a results file cannot drag those silent sources back into the list. |
+| **Export Queued Sources to .txt** | **Add Media → Export Queued Sources to .txt** writes the current media list (URLs, or full paths for local files, in list order) so a long selection survives closing the program. Picking hundreds of VODs out of a channel takes a long time, and this file can be queued again with the entry above — the exported file uses exactly the format that importer reads. |
 | **Automatic Retry of Failed Sources** | Sources that failed detection in an earlier run are re-detected automatically on the next run, and the log names them. Nothing asks you to confirm, so a batch can run unattended. |
 | **Rate-Limit Pause and Retry** | If the platform rate-limits source resolving (YouTube bot check, HTTP 429, Bilibili 412), AutoComper offers to wait 5/15/30 minutes and then retries **only** the sources that failed. The countdown is shown in the progress panel and can be cancelled with Stop. |
 | **Shorter-Clip Warnings** | Clips that end up shorter than requested are no longer silent: a remote segment that arrives short is fetched again under the normal retry policy, and a remaining shortfall (or padding clipped by a clip next to it) is reported in a summary line. |
@@ -120,7 +121,7 @@ If CUDA isn't installed, the app falls back to CPU automatically.
 
 ## 📖 Usage
 
-1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist. To rebuild a batch you have processed before, use **Add Media → Import URLs from Timestamps .txt** and pick one of its timestamps files: every URL in that file is queued again.
+1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist. To rebuild a batch you have processed before, use **Add Media → Import URLs from Timestamps .txt** and pick one of its timestamps files: every URL in that file is queued again. If you are only partway through a long selection, **Add Media → Export Queued Sources to .txt** saves the current list so you can close the program and queue it again later.
 2. **Configure** — set Precision / Block Size / Threshold. Use tooltips for guidance.
 3. **Choose Remote Processing** for URL inputs:
    - **Remote Stream** reads remote audio directly and fetches video only for previews/selected clips.
@@ -342,7 +343,7 @@ During **Preparing clips**, a clip that makes no progress for 30 seconds prints 
 - **Remote Browser Cookies** affect source access and available formats; they do not speed up ONNX inference.
 - **Use GPU (CUDA)** controls ONNX inference only. It does not control CDN download speed, remote audio decoding, or FFmpeg encoding.
 - **Remote Stream** and **Audio Cache** need the full remote audio timeline for detection, even though they avoid downloading the full video.
-- Remote **Re-verify** downloads only audio windows around detected candidates, reuses the same ONNX/DRC logic, and maps new timestamps back to the original VOD timeline.
+- Remote **Re-verify** reuses the audio detection already read around each detected candidate (and falls back to a small window download only for audio it does not hold), applies the same ONNX/DRC logic, and maps new timestamps back to the original VOD timeline.
 
 Active live streams, DRM-protected media, and every private or region-restricted source are not guaranteed to work.
 
@@ -365,7 +366,7 @@ Re-verify uses DRC (Dynamic Range Compression) to boost quiet sounds near detect
 
 Any remote source must download its full audio timeline before detection can run — this is true for both **Remote Stream** and **Audio Cache**, even though neither downloads the video. What happens during **Re-verify** depends on the mode:
 
-- **Remote Stream** keeps no stored audio, so the re-verify scan re-downloads only the small window around each detected clip (no full re-download).
+- **Remote Stream** keeps no stored audio, but detection keeps the small window of audio it already read around each detected clip (±5 s, in temporary files that are deleted when the scan ends), so the re-verify scan reuses that PCM instead of downloading the windows again. Only a window that was not kept — a detection result loaded from an earlier run, a resumed block, or a window that runs past the end of the stream — is downloaded as before, and the log says which windows were reused.
 - **Audio Cache** keeps the stored audio and reuses it directly for the re-verify scan, so nothing extra is downloaded.
 
 ### Timestamps Format

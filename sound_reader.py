@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -980,12 +981,306 @@ def _clear_checkpoint(cache_store, args):
         pass
 
 
+# --- re-verify audio retention -------------------------------------------------
+#
+# Detection already streams the whole audio timeline at SAMPLE_RATE and then drops every
+# block. Re-verify (`autocomper._verify_and_expand`) needs the audio of a small window
+# around each detected clip, and in Remote Stream mode it would otherwise fetch every one
+# of those windows from the same stream again (that mode stores no audio). This keeps
+# a piece per detected clip while the blocks pass by: the PCM the detection already has,
+# a short tail of the previous block for a clip near a block start, and a margin past the
+# window's end (a nearby hit makes the scan merge both windows, and that audio is in this
+# block only).
+#
+# The retained bytes are the PCM detection ran on, which is the timeline re-verify scans
+# in Remote Stream mode ("stream" placement reference), so the scan sees the same audio it
+# would have downloaded - only without the download.
+
+RETAINED_AUDIO_PREFIX = "reverify-keep-"
+RETAINED_AUDIO_MAX_BYTES = 128 * 1024 * 1024
+RETAINED_AUDIO_TOTAL_BYTES = 1024 * 1024 * 1024
+_RETAIN_TAIL_SECONDS = 2.0    # extra audio kept from the previous block / past a window
+
+
+class RetainedAudioBudget:
+    """Disk the whole detection stage may spend on retained re-verify audio.
+
+    One instance per run, shared by every source's ``RetainedHitAudio``. A large batch
+    would otherwise pile up one per-source cap per source in the temp folder, and the
+    compile step needs that space right after re-verify.
+    """
+
+    def __init__(self, total_bytes=RETAINED_AUDIO_TOTAL_BYTES, log_func=print):
+        self.total = max(0, int(total_bytes))
+        self.reserved = 0
+        self._log = log_func
+        self._lock = threading.Lock()
+        self._exhausted = False
+
+    def reserve(self, size):
+        size = max(0, int(size))
+        with self._lock:
+            if self.reserved + size > self.total:
+                if not self._exhausted:
+                    self._exhausted = True
+                    self._log(
+                        f"Re-verify audio retention reached its "
+                        f"{self.total // (1024 * 1024)} MB batch limit; the remaining "
+                        f"scan windows are downloaded again.")
+                return False
+            self.reserved += size
+            return True
+
+    def release(self, size):
+        with self._lock:
+            self.reserved = max(0, self.reserved - max(0, int(size)))
+
+
+class _RetainedWindow:
+    """One retained piece; the bytes on disk cover ``[start, written)``."""
+
+    __slots__ = ("start", "end", "path", "handle", "written", "reserved")
+
+    def __init__(self, start, end, path, reserved=0):
+        self.start = float(start)
+        self.end = float(end)
+        self.path = path
+        self.handle = open(path, "wb")
+        self.written = float(start)
+        self.reserved = int(reserved)
+
+
+class RetainedHitAudio:
+    """Keep the audio re-verify will scan while detection is already reading it.
+
+    One instance per source. ``note_block`` is fed every decoded detection block (raw
+    s16le mono at ``sample_rate``) together with the hits found in it; ``read`` then hands
+    back the exact PCM of a requested window, or ``None`` when the window is not fully
+    retained (the caller falls back to its normal fetch, because two sources of audio
+    cannot be spliced without changing what the scan hears).
+
+    One piece is kept per detected clip (the pieces overlap where the scan merges windows
+    anyway; ``read`` stitches them). Disk use is bounded by ``max_bytes`` per source and by
+    the shared ``budget`` for the whole run; once a limit is reached the remaining windows
+    are simply not kept.
+    """
+
+    def __init__(self, root, window, sample_rate=SAMPLE_RATE,
+                 max_bytes=RETAINED_AUDIO_MAX_BYTES, budget=None, log_func=print):
+        self.sample_rate = int(sample_rate)
+        self.window = max(0.0, float(window))
+        self.max_bytes = max(0, int(max_bytes))
+        self.budget = budget
+        self._log = log_func
+        self._dir = tempfile.mkdtemp(prefix=RETAINED_AUDIO_PREFIX,
+                                     dir=str(root) if root else None)
+        self._tail = b""
+        self._tail_end = 0.0
+        self._tail_seconds = self.window + _RETAIN_TAIL_SECONDS
+        self._windows = []
+        self._written_bytes = 0
+        self._planned_bytes = 0
+        self._reserved_bytes = 0
+        self._skipped_windows = 0
+        self._full_notice = False
+        self._finished = False
+        self._closed = False
+
+    # ---- feeding ---------------------------------------------------------
+    def note_block(self, block, block_start, timestamps=()):
+        """Feed one decoded block (raw s16le mono) and the hits found in it."""
+        if self._closed or self._finished or not block:
+            return
+        rate = self.sample_rate
+        block_start = max(0.0, float(block_start))
+        block_end = block_start + (len(block) / 2.0) / rate
+        for ts in timestamps or ():
+            try:
+                start = float(ts["start"])
+                end = float(ts["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._add_piece(max(0.0, start - self.window), end + self.window,
+                            block_start)
+        # A piece is written slightly past its logical end: a nearby hit would make the
+        # scan merge both windows, and that audio is in this block only.
+        margin = self.window + _RETAIN_TAIL_SECONDS
+        for window in self._windows:
+            target = min(window.end + margin, block_end)
+            if window.written >= target - 1e-6:
+                continue
+            low = max(window.written, block_start)
+            if target <= low:
+                continue
+            self._append_block(window, block, block_start, low, target)
+        keep = int(round(self._tail_seconds * rate)) * 2
+        self._tail = bytes(block[-keep:]) if keep > 0 else b""
+        self._tail_end = block_end
+
+    def _add_piece(self, start, end, block_start):
+        if end <= start:
+            return
+        tail_start = self._tail_end - (len(self._tail) / 2.0) / self.sample_rate
+        if self._tail and start < tail_start:
+            # The window begins before the audio we still hold: keep what we can, and
+            # read() will refuse the full window so the caller fetches it instead.
+            start = tail_start
+        margin = self.window + _RETAIN_TAIL_SECONDS
+        needed = int(round((end + margin - start) * self.sample_rate)) * 2
+        if self._planned_bytes + needed > self.max_bytes:
+            self._skip_one()
+            return
+        if self.budget is not None and not self.budget.reserve(needed):
+            self._skipped_windows += 1
+            return
+        name = f"window-{len(self._windows):04d}-{int(round(start * 1000))}.pcm"
+        window = _RetainedWindow(start, end, os.path.join(self._dir, name),
+                                 reserved=needed)
+        self._windows.append(window)
+        self._planned_bytes += needed
+        self._reserved_bytes += needed
+        if self._tail and start < block_start:
+            low = max(start, tail_start)
+            if block_start > low:
+                self._append_block(window, self._tail, tail_start, low, block_start)
+
+    def _skip_one(self):
+        self._skipped_windows += 1
+        if not self._full_notice:
+            self._full_notice = True
+            self._log(f"Re-verify audio retention reached its "
+                      f"{self.max_bytes // (1024 * 1024)} MB per-source limit; the "
+                      f"remaining windows are downloaded again during the scan.")
+
+    def _append_block(self, window, block, block_start, low, high):
+        rate = self.sample_rate
+        low = max(low, window.written)
+        i0 = int(round((low - block_start) * rate)) * 2
+        i1 = int(round((high - block_start) * rate)) * 2
+        i0 = max(0, min(i0, len(block)))
+        i1 = max(i0, min(i1, len(block)))
+        self._append(window, block[i0:i1])
+
+    def _append(self, window, data):
+        if not data:
+            return
+        if window.handle is None:
+            window.handle = open(window.path, "ab")
+        window.handle.write(data)
+        window.written += (len(data) / 2.0) / self.sample_rate
+        self._written_bytes += len(data)
+
+    def finish(self):
+        """Stop accepting blocks and close every file (the data stays readable)."""
+        if self._finished:
+            return
+        self._finished = True
+        self._tail = b""
+        self._close_handles()
+
+    # ---- reading ---------------------------------------------------------
+    def read(self, start, end, target_rate=None):
+        """Return ``[start, end]`` as int16 PCM, or None when it is not fully retained."""
+        rate = int(target_rate or self.sample_rate)
+        if self._closed or rate != self.sample_rate:
+            return None
+        start = float(start)
+        end = float(end)
+        need = int(round((end - start) * rate))
+        if need <= 0 or end <= start:
+            return None
+        out = np.empty(need, dtype=np.int16)
+        cursor = start
+        for window in sorted(self._windows, key=lambda item: item.start):
+            if window.written <= cursor + 1e-6:
+                continue
+            if window.start > cursor + 1e-6:
+                return None                       # a hole: this window starts too late
+            samples = self._load(window)
+            if samples is None or len(samples) == 0:
+                continue
+            if window.start > cursor + 1e-6:
+                return None
+            offset = int(round((cursor - window.start) * rate))
+            if offset < 0:
+                offset = 0
+            position = int(round((cursor - start) * rate))
+            if position >= need:
+                break
+            take = min(len(samples) - offset, need - position)
+            if take <= 0:
+                continue
+            out[position:position + take] = samples[offset:offset + take]
+            cursor += take / float(rate)
+            if cursor >= end - 1e-6:
+                break
+        if cursor < end - 1e-3:
+            return None
+        return out
+
+    def _load(self, window):
+        if window.handle is not None:
+            try:
+                window.handle.flush()
+            except OSError:
+                return None
+        try:
+            return np.fromfile(window.path, dtype="<i2")
+        except OSError:
+            return None
+
+    # ---- reporting / cleanup --------------------------------------------
+    @property
+    def window_count(self):
+        return len(self._windows)
+
+    @property
+    def retained_bytes(self):
+        return self._written_bytes
+
+    @property
+    def skipped_windows(self):
+        return self._skipped_windows
+
+    def spans(self):
+        """``[(start, end)]`` of what is actually on disk (for logs and tests)."""
+        return [(window.start, window.written) for window in self._windows
+                if window.written > window.start]
+
+    def describe(self):
+        return (f"{self.window_count} window(s), "
+                f"{self._written_bytes / (1024 * 1024):.1f} MB")
+
+    def _close_handles(self):
+        for window in self._windows:
+            if window.handle is not None:
+                try:
+                    window.handle.close()
+                except OSError:
+                    pass
+                window.handle = None
+
+    def close(self):
+        """Close every file and remove the retained audio (idempotent)."""
+        if self._closed:
+            return
+        self.finish()
+        self._closed = True
+        self._close_handles()
+        shutil.rmtree(self._dir, ignore_errors=True)
+        if self.budget is not None and self._reserved_bytes:
+            self.budget.release(self._reserved_bytes)
+            self._reserved_bytes = 0
+        self._windows = []
+
+
 def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_idx=58,
                    model="bdetectionmodel_05_01_23", logger=None, ort_session=None,
                    use_gpu=True, cache_store=None, progress_callback=None,
                    refresh_func=None, save_audio_path=None,
                    select_candidate_func=None, prefetch_concurrency=None,
-                   prefetch_chunk_size=None, prepare_source_func=None):
+                   prefetch_chunk_size=None, prepare_source_func=None,
+                   retain_audio=None):
     # 必须是"正数"：0 会让 subsample 除零（precision=0 → ZeroDivisionError 卡在
     # 检测中途），block_size=0 会让 frame_count/chunk_size 归零（AudioDecodeError）。
     # GUI 的数字校验只挡非数字，用户手打 0 是可能的。
@@ -1169,7 +1464,12 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
             ort_inputs = {"input": samples}
             framewise_output = ort_session.run(["output"], ort_inputs)[0]
             preds = framewise_output[0]
-            info["timestamps"].extend(compute_timestamps(preds, precision, threshold, focus_idx, offset))
+            block_hits = compute_timestamps(preds, precision, threshold, focus_idx, offset)
+            info["timestamps"].extend(block_hits)
+            # 检测已经把这几十秒音频读进来了：顺手把 re-verify 稍后要扫的那一小段留下，
+            # 否则 Remote Stream 模式还得为每个 clip 附近再下载一次（见 RetainedHitAudio）。
+            if retain_audio is not None:
+                retain_audio.note_block(block, offset, block_hits)
             offset += block_size
             # 每完成一块就落一次检查点：中途失败（URL 过期、网络抖动）时前面的推理
             # 成果不会丢，重跑从这一块之后继续。
@@ -1177,6 +1477,9 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                 _save_checkpoint(cache_store, resume_args, block_index,
                                  info["timestamps"], _dur, block_size)
     finally:
+        if retain_audio is not None:
+            # 检测结束时把还没写完的窗口收尾（下一块永远不会来了）。
+            retain_audio.finish()
         if wav_file is not None:
             _finalize_wav(wav_file, wav_data_size)
         if lookahead is not None:
