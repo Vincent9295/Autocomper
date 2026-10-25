@@ -574,6 +574,9 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
     # 每次失败先 refresh（换签名），连续失败说明不是签名问题而是节点慢。
     cdn_switches = 0
     consecutive_failures = 0
+    # 慢节点也可能每秒都正常返回数据：旧的"连续 3 次失败才换"对它永远不触发。
+    # 用每块实际耗时判断（正常节点读一块远快于实时），连续两块都慢就重新探测。
+    slow_blocks = 0
     for index in range(start_block, block_count):
         start_time = index * block_duration
         segment_duration = min(block_duration, max(0, duration - start_time))
@@ -583,12 +586,14 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
         for attempt in range(attempts):
             try:
                 block = bytearray()
+                block_started = time.monotonic()
                 for chunk in _load_audio_direct(
                     source, sr, frame_count,
                     start_time=start_time, duration=segment_duration,
                     stall_timeout=DEFAULT_STALL_TIMEOUT,
                 ):
                     block.extend(chunk)
+                fetch_elapsed = time.monotonic() - block_started
                 if not block:
                     # A range request that returns nothing means the audio stream ends here.
                     # Bilibili's metadata duration is routinely a little longer than the real
@@ -598,6 +603,26 @@ def _load_audio_bilibili_blocks(source, sr, frame_count, duration,
                     print(f"Remote audio ended before block {index + 1}/{block_count}; "
                           f"continuing with what the stream has.")
                     return
+                # 一块音频正常应在远小于实时的时间内读完（网络 100x、解码也远快于
+                # 实时）。超过 segment_duration/20 就是明显慢；连续两块都慢说明
+                # 当前 CDN 节点已被限速，重新探测候选（探测在块之间进行，不抢
+                # 正在传输的带宽）。
+                slow = fetch_elapsed > max(2.0, segment_duration / 20.0)
+                if slow:
+                    slow_blocks += 1
+                else:
+                    slow_blocks = 0
+                if (slow_blocks >= 2 and select_candidate_func is not None
+                        and cdn_switches < 2):
+                    cdn_switches += 1
+                    slow_blocks = 0
+                    print(f"Remote audio is slow ({fetch_elapsed:.1f}s for "
+                          f"{segment_duration:.0f}s of audio); re-probing the audio CDN.")
+                    try:
+                        select_candidate_func(source)
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "Block CDN slow-switch probe failed: %s", str(exc))
                 # 一个索引只产出**一个**元素，并且不超过一块的采样数。以前这里按
                 # frame_count 切片（range(0, len(block), frame_count * 2)），一次读多了
                 # 就会产出两个元素：消费方按"一个元素 = 一整块 block_size"推进时间轴，
@@ -890,7 +915,8 @@ class _SizedIterable:
 MAX_CACHE_SIZE = 20
 timestamps_dict: 'OrderedDict[Tuple[str, int, int, float, str], Dict[str, Any]]' = OrderedDict()
 
-def _detection_cache_args(source, model, precision, block_size, threshold, focus_idx):
+def _detection_cache_args(source, model, precision, block_size, threshold, focus_idx,
+                          relevant_flags=None):
     """检测缓存与 .failed.json 的键。
 
     这里**故意**用裸 ``source.source_id``（不是 stable_source_id）：键同时决定磁盘上
@@ -906,8 +932,64 @@ def _detection_cache_args(source, model, precision, block_size, threshold, focus
         block_size,
         threshold,
         focus_idx,
-        {},
+        dict(relevant_flags or {}),
     )
+
+
+def _local_detection_cache_args(source, input_kind, model, precision, block_size,
+                                threshold, focus_idx):
+    """Key for a detection run over a local file (Audio Cache / Full Download).
+
+    ``input_kind`` keeps the two modes apart (their audio provenance differs) and keeps
+    both away from the Remote Stream key above. ``stable_source_id`` is used here, not
+    bare ``source_id``: generic sites may not have an id, and two different URLs on the
+    same extractor must not share a checkpoint.
+    """
+    return (
+        source.platform,
+        stable_source_id(source),
+        model,
+        str(precision),
+        block_size,
+        threshold,
+        focus_idx,
+        {"input_kind": str(input_kind or "local")},
+    )
+
+
+def _local_file_signature(path):
+    """Cheap identity of the local input: the checkpoint is void when it changes."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return {
+        "path": os.path.normcase(os.path.abspath(str(path))),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _cache_key_display(args):
+    """Human-readable form of a cache key (never used for hashing)."""
+    flags = args[7] if len(args) > 7 and isinstance(args[7], dict) else {}
+    return {
+        "input_kind": flags.get("input_kind", "stream"),
+        "platform": args[0],
+        "source_id": args[1],
+        "model": args[2],
+        "precision": args[3],
+        "block_size": args[4],
+        "threshold": args[5],
+        "focus_idx": args[6],
+    }
+
+
+def _print_cache_key(args, reason):
+    key = _cache_key_display(args)
+    print(f"Detection cache key ({reason}):")
+    for name, value in key.items():
+        print(f"  {name:<12}: {value}")
 
 
 _CHECKPOINT_VERSION = 1
@@ -919,7 +1001,8 @@ def _checkpoint_path(cache_store, args):
     return cache_store.get_detection_cache_path(*args).with_suffix(_CHECKPOINT_SUFFIX)
 
 
-def _save_checkpoint(cache_store, args, blocks_done, timestamps, duration, block_size):
+def _save_checkpoint(cache_store, args, blocks_done, timestamps, duration, block_size,
+                     file_signature=None):
     """把一个源已完成的块原子落盘，供中断后续跑。
 
     以前只有整源跑完才写结果（`save_detection_result`），所以一个 6 小时源在中途失败
@@ -935,6 +1018,10 @@ def _save_checkpoint(cache_store, args, blocks_done, timestamps, duration, block
         "duration": (round(float(duration), 3) if duration else None),
         "blocks_done": int(blocks_done),
         "timestamps": list(timestamps),
+        # 自描述字段：打开文件就能看懂这份检查点属于哪个源/哪套设置（只用于展示，
+        # 不参与哈希）。
+        "key": _cache_key_display(args),
+        "file_signature": file_signature,
     }
     try:
         cache_store.save_json(_checkpoint_path(cache_store, args), payload)
@@ -943,10 +1030,11 @@ def _save_checkpoint(cache_store, args, blocks_done, timestamps, duration, block
         pass
 
 
-def _load_checkpoint(cache_store, args, duration, block_size):
+def _load_checkpoint(cache_store, args, duration, block_size, file_signature=None):
     """读回可用的检查点；不可用/不匹配返回 None。
 
     时长不匹配就丢弃：源换了或长度变了，块边界不再对应同一段音频，硬续会错位。
+    本地文件还要求 path/size/mtime 完全一致：重新下载或替换过的文件不能沿用旧块。
     """
     if cache_store is None:
         return None
@@ -957,6 +1045,8 @@ def _load_checkpoint(cache_store, args, duration, block_size):
     if not isinstance(data, dict) or data.get("version") != _CHECKPOINT_VERSION:
         return None
     if data.get("source_id") != args[1] or int(data.get("block_size") or 0) != int(block_size):
+        return None
+    if file_signature is not None and data.get("file_signature") != file_signature:
         return None
     if duration is None:
         return None                        # 没有时长就没法确认块边界，宁可不续
@@ -1280,7 +1370,7 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                    refresh_func=None, save_audio_path=None,
                    select_candidate_func=None, prefetch_concurrency=None,
                    prefetch_chunk_size=None, prepare_source_func=None,
-                   retain_audio=None):
+                   retain_audio=None, cache_identity=None, cache_kind=None):
     # 必须是"正数"：0 会让 subsample 除零（precision=0 → ZeroDivisionError 卡在
     # 检测中途），block_size=0 会让 frame_count/chunk_size 归零（AudioDecodeError）。
     # GUI 的数字校验只挡非数字，用户手打 0 是可能的。
@@ -1292,15 +1382,32 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         raise Exception("Block size must be a positive number!")
 
     is_remote = isinstance(file, MediaSource)
+    # Local inputs (Audio Cache's cached audio and a Full Download's downloaded file) are
+    # the same kind of long detection job as a remote source, so they get the same
+    # per-block checkpoint and result cache. Their cache key carries ``input_kind`` so the
+    # two modes never collide, and the file signature (path/size/mtime) makes a changed
+    # or re-downloaded file start a fresh detection.
+    file_signature = None if is_remote else _local_file_signature(file)
+    cache_args = None
     if is_remote:
         cache_key = (stable_source_id(file), precision, block_size, threshold, model, focus_idx)
         if cache_store is not None:
-            cached = cache_store.load_detection_result(
-                *_detection_cache_args(file, model, precision, block_size, threshold, focus_idx)
-            )
+            cache_args = _detection_cache_args(file, model, precision, block_size, threshold, focus_idx)
+            cached = cache_store.load_detection_result(*cache_args)
             if cached is not None:
                 cached['filename'] = file
                 return cached, True
+    elif cache_identity is not None and cache_store is not None:
+        cache_args = _local_detection_cache_args(
+            cache_identity, cache_kind, model, precision, block_size, threshold, focus_idx)
+        cache_key = (stable_source_id(cache_identity), str(cache_kind or "local"),
+                     precision, block_size, threshold, model, focus_idx)
+        cached = cache_store.load_detection_result(*cache_args)
+        if (cached is not None and file_signature is not None
+                and cached.get("file_signature") == file_signature):
+            cached['filename'] = file
+            _print_cache_key(cache_args, "cached result reused")
+            return cached, True
     else:
         file_hash = hash_file(file)
         cache_key = (file_hash, precision, block_size, threshold, model, focus_idx)
@@ -1360,14 +1467,16 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
     processed_blocks = 0
     started_at = time.monotonic()
 
-    # 续跑：上次中断前已完成的块直接复用，不重复推理。只对远端源做（本地文件没有
-    # 中断/过期这回事，且每次都会变），并且检查点里的时长必须与本次一致。
+    # 续跑：上次中断前已完成的块直接复用，不重复推理。本地输入（Audio Cache /
+    # Full Download）与远端源走同一套检查点，但 key 带 input_kind，且校验
+    # path/size/mtime；文件被重下/替换后自动失效。
     resume_args = None
     resumed_blocks = 0
     skip_blocks = 0
-    if is_remote and cache_store is not None:
-        resume_args = _detection_cache_args(file, model, precision, block_size, threshold, focus_idx)
-        checkpoint = _load_checkpoint(cache_store, resume_args, _dur, block_size)
+    if cache_args is not None and cache_store is not None:
+        resume_args = cache_args
+        checkpoint = _load_checkpoint(cache_store, resume_args, _dur, block_size,
+                                      file_signature=file_signature)
         if checkpoint is not None:
             resumed_blocks = min(checkpoint["blocks_done"], max(0, block_count - 1))
             if resumed_blocks > 0:
@@ -1379,12 +1488,22 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
                 # 实测（BV1434y1T77d，3.38 h）：顺序读 5 块 212 秒 vs 直取第 5 块 7.3 秒，
                 # 两者音频逐字节相同 —— 因为本来就是同一个 ranged 请求。
                 skip_blocks = resumed_blocks if can_start_at_block(file) else 0
-                print(f"Remote Stream resumed: {resumed_blocks}/{block_count} blocks "
-                      f"already done, continuing from block {resumed_blocks + 1}")
+                if is_remote:
+                    print(f"Remote Stream resumed: {resumed_blocks}/{block_count} blocks "
+                          f"already done, continuing from block {resumed_blocks + 1}")
+                else:
+                    kind = _cache_key_display(resume_args)["input_kind"]
+                    label = "Full Download" if kind == "download" else "Audio Cache"
+                    _print_cache_key(resume_args, "resumed")
+                    print(f"{label} detection resumed: {resumed_blocks}/{block_count} "
+                          f"blocks already done, continuing from block "
+                          f"{resumed_blocks + 1}")
+                    print(f"  The model is not re-run for those blocks; the local audio is "
+                          f"read again from the start to reach the resume point.")
                 if skip_blocks:
                     print(f"  Fast resume: the {skip_blocks} finished block(s) are skipped, "
                           f"not re-read (this platform fetches every block on its own).")
-                else:
+                elif is_remote:
                     # 明说"会重扫一遍"：已完成的块不重新推理，但音频必须按序再读一遍，
                     # 对长 VOD 就是几分钟到几十分钟的静默期。以前什么都不说，用户看到
                     # 的就是"卡在这一步"（测试者实测约 10 分钟）。见 round 47。
@@ -1448,14 +1567,13 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
             if wav_file is not None:
                 wav_file.write(block)
                 wav_data_size += len(block)
-            if is_remote:
-                if progress_callback is not None:
-                    progress_callback(
-                        format_block_progress(
-                            block_index, block_count, time.monotonic() - started_at,
-                            source_duration=_dur,
-                        )
+            if progress_callback is not None:
+                progress_callback(
+                    format_block_progress(
+                        block_index, block_count, time.monotonic() - started_at,
+                        source_duration=_dur,
                     )
+                )
             samples = np.frombuffer(block, dtype=np.int16)
             samples = pad_array_if_needed(samples, frame_count)
             samples = samples.reshape(1, -1)
@@ -1475,7 +1593,8 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
             # 成果不会丢，重跑从这一块之后继续。
             if resume_args is not None:
                 _save_checkpoint(cache_store, resume_args, block_index,
-                                 info["timestamps"], _dur, block_size)
+                                 info["timestamps"], _dur, block_size,
+                                 file_signature=file_signature)
     finally:
         if retain_audio is not None:
             # 检测结束时把还没写完的窗口收尾（下一块永远不会来了）。
@@ -1527,13 +1646,12 @@ def get_timestamps(file, precision=100, block_size=600, threshold=0.90, focus_id
         print(f"Audio file is shorter than its container duration: processed "
               f"{processed_blocks}/{block_count} blocks ({file})")
 
-    if is_remote and cache_store is not None:
+    if cache_args is not None and cache_store is not None:
         cache_result = dict(info)
-        cache_result['filename'] = file.source_url
-        cache_store.save_detection_result(
-            *_detection_cache_args(file, model, precision, block_size, threshold, focus_idx),
-            cache_result,
-        )
+        cache_result['filename'] = file.source_url if is_remote else str(file)
+        cache_result['key'] = _cache_key_display(cache_args)
+        cache_result['file_signature'] = file_signature
+        cache_store.save_detection_result(*cache_args, cache_result)
         if resume_args is not None:
             _clear_checkpoint(cache_store, resume_args)   # 整源结果已落盘，检查点作废
 

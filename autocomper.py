@@ -73,6 +73,8 @@ from remote_media import (MediaSource, PCM_SCAN_SAMPLE_RATE, fetch_audio_cache, 
                            expand_input, resolve_source, select_audio_candidate,
                            stable_source_id, SourceResolveError,
                            LiveBroadcastError,
+                           source_is_generic, source_display_platform,
+                           is_known_platform,
                            apply_video_quality_limit,
                            resolve_cached_audio,
                            source_from_hydrated_entry,
@@ -101,8 +103,9 @@ from utils import (AUDIO_SUFFIXES, DOWNLOAD_QUALITY_OPTIONS, FFMPEG_PATH,
                      cancel_clear, cancel_pending, convert_quality_str_to_int,
                      download_audio, download_video, get_bundle_filepath,
                      kill_tracked_procs, request_cancel, run_tracked,
+                     PauseRequested,
                      pause_clear, pause_or_cancel, pause_pending, paused_now,
-                     request_pause, request_resume,
+                     request_pause, request_resume, wait_while_paused,
                      run_tracked_progress, check_compile_disk_space,
                      lookup_downloaded_file, media_file_for_stem,
                      register_download, sanitize_download_name,
@@ -172,7 +175,10 @@ PLAYLIST_PAGE_SIZE = 30
 REMOTE_MODE_TOOLTIP_TEXT = (
     "Remote Stream: read remote audio directly and fetch video only when needed.\n"
     "Audio Cache: download compressed audio once, then detect from the local cache.\n"
-    "Full Download: use the complete remote-video download workflow."
+    "Full Download: use the complete remote-video download workflow.\n\n"
+    "Remote Stream and Audio Cache support Bilibili, YouTube and Twitch only.\n"
+    "Add Media > Add Any URL (yt-dlp) downloads sites outside those three, but only\n"
+    "with Full Download selected."
 )
 REMOTE_BROWSER_COOKIES_TOOLTIP_TEXT = (
     "Auto: try direct access first, then browser cookies when the site requires them.\n"
@@ -1210,6 +1216,35 @@ def remote_mode_actions(mode):
     return mode != "Full Download", mode == "Audio Cache", mode == "Full Download"
 
 
+GENERIC_MODE_REJECTION = (
+    "Outside the three supported platforms: {urls}. "
+    "Remote Stream and Audio Cache only support Bilibili, YouTube and Twitch; "
+    "switch Remote Processing to Full Download to process these sources.")
+# Generic-site playlists are experimental: flat metadata from a random extractor is often
+# incomplete and a huge list would resolve hundreds of pages one by one.
+GENERIC_PLAYLIST_LIMIT = 300
+
+
+def generic_sources_in_unsupported_mode(uploaded_videos, remote_mode):
+    """URLs whose platform only Full Download supports, when another mode is selected.
+
+    Generic yt-dlp sites are downloaded as complete files and then detected locally, so
+    only Full Download can handle them. Refusing the whole run (instead of silently
+    skipping) makes the limitation explicit instead of losing the user's sources.
+    """
+    if str(remote_mode) == "Full Download":
+        return []
+    values = []
+    for upload in uploaded_videos or ():
+        if not upload.get_is_url():
+            # Already downloaded: the pipeline works on the local file in any mode.
+            continue
+        source = upload.get_source()
+        if source_is_generic(source):
+            values.append(upload.get_url() or upload.get_path() or "")
+    return values
+
+
 def prepare_remote_audio_source(value, limiter, log_func=print):
     """Pick the fastest audio CDN right before detection actually reads audio.
 
@@ -1224,7 +1259,10 @@ def prepare_remote_audio_source(value, limiter, log_func=print):
     if not isinstance(value, MediaSource):
         return None
     limiter.wait()
-    return select_audio_candidate(value, log_func=log_func)
+    # A sustained sample is required here: Bilibili's dispatched node may serve a fast
+    # burst for a few seconds and then settle at 0.2-0.9 MB/s, which a 1 MiB probe
+    # cannot see (measured 2026-10-25).
+    return select_audio_candidate(value, log_func=log_func, sustained=True)
 
 
 def download_identity(source) -> str:
@@ -1711,7 +1749,7 @@ def _retry_audio_cache_detection(upload, audio_cache_paths, cache_store,
     source_id = stable_source_id(source)
     # 重新选择 audio candidate，确保用最新解析的候选池和当时的网络状况。
     try:
-        select_audio_candidate(source, log_func=print)
+        select_audio_candidate(source, log_func=print, sustained=True)
     except Exception as exc:
         print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
     new_cache = fetch_audio_cache(
@@ -4981,6 +5019,14 @@ class VideoProcessorApp:
 
         # Create a list to store uploaded video file paths
         self.uploaded_videos = []
+        # Full Download failures keyed by source identity: the entry stays in the list
+        # (a .part file can be resumed), detection skips it this run, and the next run
+        # retries it instead of forcing the user to re-add the URL.
+        self._download_failures = {}
+        # Human-readable stage used while a cancel is in flight. Cancellation is
+        # cooperative, so this tells the user which call is still finishing instead of
+        # a generic "still shutting down".
+        self._processing_stage = ""
         self.sort_ascending = False  # first click → ascending
 
         self.filelist_frame = ttk.Frame(self.left_frame)
@@ -5061,6 +5107,19 @@ class VideoProcessorApp:
             root, tearoff=0, font=(None, 11, "bold"),
             bg="#333333", fg="#ffffff", activebackground="#555555", activeforeground="#ffffff"
         )
+        # While a run is active the full Add Media menu is unsafe (adding/reordering
+        # entries shifts the indexes the download loop writes back to), but exporting the
+        # current list is read-only and was exactly what a tester needed while a cancel was
+        # still finishing. This menu keeps that one action reachable.
+        self.running_media_menu = tk.Menu(
+            root, tearoff=0, font=(None, 11, "bold"),
+            bg="#333333", fg="#ffffff", activebackground="#555555", activeforeground="#ffffff"
+        )
+        self.running_media_menu.add_command(
+            label=" Export Queued Sources to .txt ", command=self.export_queue_to_txt)
+        self.running_media_menu.add_separator()
+        self.running_media_menu.add_command(
+            label=" Add media after the job finishes ", state="disabled")
         self.populate_add_button()
         # 提示只挂一次：populate_add_button 在 Video/Audio 切换时会重跑，
         # 每次新建 CustomHovertip 会在同一控件上叠加多份 <Enter> 绑定。
@@ -5080,12 +5139,13 @@ class VideoProcessorApp:
             # 下载循环是**按下标**写回条目的，重排会让下标错位、把某个源的文件写到
             # 另一个条目上（成片静默用错媒体）。这正是拖放守卫防的同一件事，round 46
             # 漏了菜单这条路径（round 47 审计 P1-3）。
-            if self.is_thread_active():
-                print(f"{Fore.YELLOW}Ignoring the media menu: a job is running. Add media "
-                      f"once it finishes.{Style.RESET_ALL}")
-                return
             x = self.add_button.winfo_rootx()
             y = self.add_button.winfo_rooty() + self.add_button.winfo_height()
+            if self.is_thread_active():
+                print(f"{Fore.YELLOW}A job is running. Export Queued Sources is available; "
+                      f"adding media is disabled until it finishes.{Style.RESET_ALL}")
+                self.running_media_menu.post(x, y)
+                return
             # menu.post(event.x_root, event.y_root)
             self.media_menu.post(x, y)
 
@@ -5918,6 +5978,8 @@ class VideoProcessorApp:
                 label=" Add URL ", command=self.add_video_url)
             self.media_menu.add_command(
                 label=" Add Folder ", command=self.add_video_folder)
+        self.media_menu.add_command(
+            label=" Add Any URL (yt-dlp)… ", command=self.add_any_url)
         self.media_menu.add_separator()
         self.media_menu.add_command(
             label=" Import URLs from Timestamps .txt ",
@@ -6494,7 +6556,27 @@ class VideoProcessorApp:
             f"Exported {len(lines)} source(s) to\n{path}\n\n"
             f"Re-add them with Add Media > Import URLs from Timestamps .txt.")
 
-    def add_video_url(self):
+    def add_any_url(self):
+        """Generic yt-dlp sites: any URL, but only through Full Download.
+
+        The rest of the pipeline is unchanged (download the whole file, then detect and
+        compile locally); the other two modes are platform-specific and refuse these
+        sources, so ask for the mode switch here instead of failing later.
+        """
+        if self.remote_mode.get() != "Full Download":
+            switch = messagebox.askyesno(
+                "Add Any URL (yt-dlp)",
+                "This adds a URL from any site supported by the bundled yt-dlp.\n\n"
+                "The whole file is downloaded first, then detection and compile run on "
+                "that local file. This only works in Full Download mode: Remote Stream "
+                "and Audio Cache support Bilibili, YouTube and Twitch only.\n\n"
+                "Switch Remote Processing to Full Download and continue?")
+            if not switch:
+                return
+            self.remote_mode.set("Full Download")
+        self.add_video_url(generic=True)
+
+    def add_video_url(self, generic=False):
         # 窗口对象必须固定在局部变量里：以前所有回调都操作 self.entry_window，
         # 而 self.entry_window 会被**下一次**打开覆盖。第二次打开这个对话框时，
         # 第一个窗口的回调会去关闭已经销毁的第二个窗口（no-op），第一个窗口就再也
@@ -6513,20 +6595,36 @@ class VideoProcessorApp:
         self.entry_window = win
         x = self.root.winfo_x() + 15
         y = self.root.winfo_y() + 15
-        win.geometry(f"400x130+{x}+{y}")
-        win.title("Enter URL")
+        # Size is computed from the packed content below: the generic-site note is longer
+        # than the old fixed 470 px window, and clipping its left/right edge made the text
+        # unreadable (especially with high-DPI font scaling).
+        win.title("Add Any URL (yt-dlp)" if generic else "Enter URL")
         win.resizable(False, False)
         win.transient(self.root)
 
         entry_label = ttk.Label(
-            win, font=(None, 12, "bold"), text="Enter a URL and Press Enter:")
+            win, font=(None, 13, "bold"),
+            text=("Enter a URL from any yt-dlp-supported site:"
+                  if generic else "Enter a URL and Press Enter:"))
         entry_label.pack(pady=10)
 
         entry_label = ttk.Label(
             win, font=(None, 10), text="Please be patient when submitting playlists")
         entry_label.pack(pady=(5, 0))
 
-        url_entry = ttk.Entry(win, width=50)
+        note = None
+        if generic:
+            note = ttk.Label(
+                win, justify="left", font=(None, 10),
+                text=("Experimental: Full Download only. The whole file is downloaded, "
+                      "then detection and compile run on it.\n"
+                      "Single videos work best; playlists are best-effort "
+                      f"(first {GENERIC_PLAYLIST_LIMIT} entries).\n"
+                      "Login-only sites need Remote Browser Cookies; live streams and "
+                      "DRM are not supported."))
+            note.pack(pady=(6, 0))
+
+        url_entry = ttk.Entry(win, width=56 if generic else 50)
         url_entry.pack(pady=5)
 
         self.thread_active = False
@@ -6568,6 +6666,20 @@ class VideoProcessorApp:
                     self.thread_active = False
                     return
                 if isinstance(described, PlaylistDescriptor):
+                    generic_playlist = not is_known_platform(described.platform)
+                    if ((generic or generic_playlist)
+                            and described.total_count > GENERIC_PLAYLIST_LIMIT):
+                        proceed = messagebox.askyesno(
+                            "Large Playlist",
+                            f"This playlist has {described.total_count} entries. "
+                            f"Generic (non-Bilibili/YouTube/Twitch) playlists are "
+                            f"experimental and limited to the first "
+                            f"{GENERIC_PLAYLIST_LIMIT} entries.\n\n"
+                            f"Continue with the first {GENERIC_PLAYLIST_LIMIT}?")
+                        if not proceed:
+                            close_add_url(force=True)
+                            return
+                        described.limit_entries(GENERIC_PLAYLIST_LIMIT)
                     selected_entries = self._pick_playlist_sources(described)
                 else:
                     selected_entries = [described]
@@ -6614,6 +6726,24 @@ class VideoProcessorApp:
                                 continue
                             existing_ids.add(source_id)
                             fresh_sources.append(source)
+                        generic_sources = [source for source in fresh_sources
+                                           if source_is_generic(source)]
+                        if generic_sources and self.remote_mode.get() != "Full Download":
+                            platforms = ", ".join(sorted({
+                                source_display_platform(source)
+                                for source in generic_sources}))
+                            switch = messagebox.askyesno(
+                                "Generic site",
+                                f"{len(generic_sources)} source(s) are from sites outside "
+                                f"Bilibili/YouTube/Twitch ({platforms}).\n\n"
+                                f"Full Download can still process them, but Remote Stream "
+                                f"and Audio Cache cannot.\n\n"
+                                f"Switch Remote Processing to Full Download and add them?")
+                            if switch:
+                                self.remote_mode.set("Full Download")
+                            else:
+                                fresh_sources = [source for source in fresh_sources
+                                                 if not source_is_generic(source)]
                         for media_obj in media_uploads_for_sources(
                             fresh_sources, "video" if self.is_video else "audio"
                         ):
@@ -6680,6 +6810,21 @@ class VideoProcessorApp:
         url_entry.bind("<Escape>", close_add_url)
         url_entry.focus_set()
 
+        # Let Tk report the size the content actually needs, then center it on screen.
+        # Wrapping is only a last-resort fallback for a screen narrower than the note;
+        # on a normal display the three sentences keep their original single-line layout.
+        win.update_idletasks()
+        width = max(win.winfo_reqwidth(), 560 if generic else 400)
+        max_width = max(360, win.winfo_screenwidth() - 80)
+        if width > max_width:
+            width = max_width
+            if note is not None:
+                note.configure(wraplength=max(320, width - 40))
+                win.update_idletasks()
+        height = win.winfo_reqheight()
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.minsize(width, height)
+
         install_modal_grab(win)
         try:
             url_entry.focus_set()
@@ -6709,8 +6854,11 @@ class VideoProcessorApp:
             video_path = video.get_path()
             item_number = len(self.video_listbox.get_children())
             if video.get_is_url():
+                label = str(video_path)
+                if self._download_key(video) in getattr(self, "_download_failures", {}):
+                    label = f"{label}  [download failed]"
                 self.video_listbox.insert("", "end", item_number, values=(
-                    str(video_path),))
+                    label,))
             else:
                 self.video_listbox.insert("", "end", item_number, values=(
                     self._display_name(video_path),))
@@ -7420,8 +7568,10 @@ class VideoProcessorApp:
         self._shutdown_poll_token = getattr(self, "_shutdown_poll_token", 0) + 1
         token = self._shutdown_poll_token
         target_thread = self.active_thread
+        slow_notice_printed = False
 
         def poll():
+            nonlocal slow_notice_printed
             if token != getattr(self, "_shutdown_poll_token", 0):
                 return                      # 已被更新的取消链取代
             if self.active_thread is not target_thread:
@@ -7441,11 +7591,21 @@ class VideoProcessorApp:
                 return
             request_cancel()
             elapsed = time.monotonic() - started
+            stage = getattr(self, "_processing_stage", "") or "the current step"
+            if not slow_notice_printed and elapsed >= 20.0:
+                slow_notice_printed = True
+                hint = (" The audio block currently being read has to finish or reach "
+                        "its stall timeout." if stage == "Detection" else "")
+                print(f"{Fore.YELLOW}Cancelling: still waiting for {stage} "
+                      f"({elapsed:.0f}s).{hint} You can export the queued sources "
+                      f"from Add Media > Export Queued Sources while this finishes."
+                      f"{Style.RESET_ALL}")
             if elapsed > grace_seconds:
                 print(
-                    f"{Fore.YELLOW}Previous run is still shutting down after "
-                    f"{grace_seconds:.0f}s; it is stuck in a call that cannot be "
-                    f"interrupted.{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}Cancellation is taking longer than expected: still "
+                    f"waiting for {stage} after {elapsed:.0f}s. The current call cannot "
+                    f"be interrupted. Export the queued sources if you need them, or "
+                    f"close the program to stop now.{Style.RESET_ALL}")
                 cleanup_temp_children()
                 self.clear_transfer_progress("Cancelled")
                 self.reenable_disabled_objects()
@@ -7457,10 +7617,13 @@ class VideoProcessorApp:
                 # 不留下死胡同：线程卡在原生调用里时，Process 会一直被守卫拦住，
                 # 唯一出路是重启程序，这里直接问用户。
                 if messagebox.askyesno(
-                        "Previous run is stuck",
-                        "The previous run cannot be stopped (it is blocked inside "
-                        "a native call).\n\nClose AutoComper now? Unsaved progress "
-                        "of the running job is lost either way."):
+                        "Cancellation is taking longer than expected",
+                        f"The previous run is still finishing {stage} after "
+                        f"{elapsed:.0f}s and cannot be interrupted.\n\n"
+                        "You can export the queued sources from Add Media > "
+                        "Export Queued Sources once this dialog closes.\n\n"
+                        "Close AutoComper now? Unsaved progress of the running job "
+                        "is lost either way."):
                     self.root.destroy()
                 return
             self.root.after(poll_ms, poll)
@@ -8000,6 +8163,25 @@ class VideoProcessorApp:
         install_modal_grab(modal)
         self.root.wait_window(modal)
 
+    def _set_processing_stage(self, stage):
+        """Record what the worker is doing, for the cancel-wait messages."""
+        self._processing_stage = str(stage or "")
+
+    def _download_key(self, upload):
+        """Identity used for the per-run Full Download failure bookkeeping."""
+        source = upload.get_source()
+        if isinstance(source, MediaSource):
+            return stable_source_id(source)
+        return media_identity_key(upload.get_url() or upload.get_path() or "")
+
+    def _mark_download_failure(self, upload, reason):
+        self._download_failures[self._download_key(upload)] = str(reason)
+        print(f"{Fore.YELLOW}Full Download failed for {upload.get_path()}: "
+              f"{reason}{Style.RESET_ALL}")
+
+    def _clear_download_failure(self, upload):
+        self._download_failures.pop(self._download_key(upload), None)
+
     def handle_url_downloads(self):
         keep_downloaded_vids = self.keep_downloaded_vids.get()
         download_path = self.download_video_path.get()
@@ -8071,6 +8253,7 @@ class VideoProcessorApp:
                         f"Could not resolve remote source {media_url}: {detail}") from exc
 
             source = video.get_source()
+            generic = source_is_generic(source)
             identity = download_identity(source)
             # 1) 真重复：下载索引里已有同一 source（BV 号/视频 ID）且**同为视频/音频**
             #    的文件 → 直接复用。同名不同片（up 主常用同一个标题）不会被误判，
@@ -8079,6 +8262,7 @@ class VideoProcessorApp:
             if recorded:
                 self.uploaded_videos[i].set_path(recorded)
                 self.uploaded_videos[i].set_is_url(False)
+                self._clear_download_failure(video)
                 print(f"{Fore.GREEN}Already downloaded (same source): {recorded}"
                       f"{Style.RESET_ALL}")
                 continue
@@ -8096,10 +8280,17 @@ class VideoProcessorApp:
                                       duration=getattr(source, "duration", None))
                     self.uploaded_videos[i].set_path(existing)
                     self.uploaded_videos[i].set_is_url(False)
+                    self._clear_download_failure(video)
                     print(f"{Fore.GREEN}Existing file matches this source "
                           f"(same duration); reusing: {existing}{Style.RESET_ALL}")
                     continue
-                if same is None:
+                if same is None and generic:
+                    # Generic sites are often unattended batches; a modal question would
+                    # block the whole run. Keep both files (the existing one is not ours
+                    # to overwrite) and use the next free name.
+                    print(f"{Fore.CYAN}Existing file has no download record; saving this "
+                          f"source under a new name.{Style.RESET_ALL}")
+                elif same is None:
                     # 老文件（本功能之前下载的）没有索引记录、时长也测不出来：
                     # 交给用户决定，绝不静默覆盖或静默复用。弹窗必须在主线程
                     # （worker 线程直接碰 Tk 会和主线程轮询抢 Tcl 锁）。
@@ -8125,6 +8316,7 @@ class VideoProcessorApp:
                                           duration=getattr(source, "duration", None))
                         self.uploaded_videos[i].set_path(existing)
                         self.uploaded_videos[i].set_is_url(False)
+                        self._clear_download_failure(video)
                         print(f"{Fore.GREEN}Using existing download: {existing}"
                               f"{Style.RESET_ALL}")
                         continue
@@ -8137,19 +8329,34 @@ class VideoProcessorApp:
                     media_url, stem, download_path, self.max_quality.get(), self.max_download_speed.get(), self.final_bar,
                     browser_cookies=browser_cookies,
                     concurrency=self.remote_audio_concurrency.get(),
-                    chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024)
+                    chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024,
+                    # Generic sites keep yt-dlp's resumable downloader: our parallel
+                    # range transport cannot resume across attempts, which matters for
+                    # multi-GB films.
+                    allow_parallel=not generic)
                 if success:
                     if result:
                         self.uploaded_videos[i].set_path(result)
                         self.uploaded_videos[i].set_is_url(False)
+                        self._clear_download_failure(video)
                         register_download(download_path, identity,
                                           os.path.basename(result),
                                           media_type=media_type,
                                           title=str(media_path),
                                           duration=getattr(source, "duration", None))
+                    elif generic:
+                        self._mark_download_failure(
+                            video, "no video track (this source is audio-only; "
+                                   "use Audio mode) to process it")
+                        print(f"{Fore.YELLOW}No video found; skipped for this run "
+                              f"(try Audio mode).{Style.RESET_ALL}")
                     else:
                         indices_to_delete.append(i)
                         print(f"{Fore.YELLOW}No video found, skipping")
+                elif generic:
+                    self._mark_download_failure(video, result)
+                    print(f"{Fore.YELLOW}Skipped this source for this run; the next "
+                          f"Process retries it from its partial file.{Style.RESET_ALL}")
                 else:
                     raise Exception(
                         f"Failed to download {media_path}: {result}\nPress 'Process' again and it should start from where you left off.")
@@ -8158,18 +8365,27 @@ class VideoProcessorApp:
                     media_url, stem, download_path, self.max_download_speed.get(), self.final_bar,
                     browser_cookies=browser_cookies,
                     concurrency=self.remote_audio_concurrency.get(),
-                    chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024)
+                    chunk_size=self.remote_audio_chunk_size.get() * 1024 * 1024,
+                    allow_parallel=not generic)
                 if success and result:
                     self.uploaded_videos[i].set_path(result)
                     self.uploaded_videos[i].set_is_url(False)
+                    self._clear_download_failure(video)
                     register_download(download_path, identity,
                                       os.path.basename(result),
                                       media_type=media_type,
                                       title=str(media_path),
                                       duration=getattr(source, "duration", None))
+                elif success and generic:
+                    self._mark_download_failure(video, "no audio track")
+                    print(f"{Fore.YELLOW}No audio found; skipped for this run.")
                 elif success:
                     indices_to_delete.append(i)
                     print(f"{Fore.YELLOW}No audio found, skipping")
+                elif generic:
+                    self._mark_download_failure(video, result)
+                    print(f"{Fore.YELLOW}Skipped this source for this run; the next "
+                          f"Process retries it from its partial file.{Style.RESET_ALL}")
                 else:
                     raise Exception(
                         f"Failed to download {media_path}: {result}\nPress 'Process' again and it should start from where you left off.")
@@ -8178,11 +8394,16 @@ class VideoProcessorApp:
 
         for idx in reversed(indices_to_delete):
             del self.uploaded_videos[idx]
+        if self._download_failures:
+            print(f"{Fore.YELLOW}Full Download: {len(self._download_failures)} source(s) "
+                  f"failed and stayed in the list; the next Process retries them "
+                  f"(partial files are kept).{Style.RESET_ALL}")
         self.update_listbox()
 
     def process_videos(self):
         self.clear_transfer_progress()
         self.disable_objects()
+        self._set_processing_stage("Starting")
         self.final_bar.reset_total_progress(1)
         cleanup_temp_children()
 
@@ -8258,6 +8479,13 @@ class VideoProcessorApp:
                             raise (Exception("Operation cancelled."))
 
             resolve_remote, audio_cache, full_download = remote_mode_actions(self.remote_mode.get())
+            unsupported_generic = generic_sources_in_unsupported_mode(
+                self.uploaded_videos, self.remote_mode.get())
+            if unsupported_generic:
+                listed = ", ".join(unsupported_generic[:5])
+                if len(unsupported_generic) > 5:
+                    listed += f" (+{len(unsupported_generic) - 5} more)"
+                raise Exception(GENERIC_MODE_REJECTION.format(urls=listed))
             detection_size = detection_block_size(self.remote_mode.get(), block_size)
             if self.remote_mode.get() == "Remote Stream":
                 print(f"Remote Stream block size: {detection_size}s")
@@ -8302,8 +8530,19 @@ class VideoProcessorApp:
             remote_entries = []
             remote_failures = []
             if any(x.get_is_url() for x in self.uploaded_videos) and full_download:
-                self.handle_url_downloads()
+                self._set_processing_stage("Full Download")
+                # 下载中的 Pause 会中止当前传输（.part 保留）而不是等到文件结束。
+                # 等 Resume 后重新进入 handle_url_downloads：已完成的条目走下载索引，
+                # 当前条目从 .part 续传；Cancel 仍然优先。
+                while True:
+                    try:
+                        self.handle_url_downloads()
+                        break
+                    except PauseRequested:
+                        if not wait_while_paused():
+                            raise InterruptedError("Operation cancelled by user.")
             elif resolve_remote and not audio_cache:
+                self._set_processing_stage("Resolving sources")
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
@@ -8312,6 +8551,7 @@ class VideoProcessorApp:
                     cancel_check=cancel_pending,
                 )
             elif audio_cache:
+                self._set_processing_stage("Resolving sources")
                 resolved_local_entries, remote_entries = resolve_remote_uploads(
                     self.uploaded_videos, browser_cookies=browser_cookies,
                     max_height=max_height, limiter=_resolve_limiter, logger=print,
@@ -8333,6 +8573,7 @@ class VideoProcessorApp:
                     retries=3,
                     logger=print,
                 )
+                self._set_processing_stage("Audio Cache download")
                 for cache_index, (upload, source) in enumerate(remote_entries):
                     try:
                         # 音频已缓存时不再逐个探测 CDN 候选：Audio Cache 大批次
@@ -8387,7 +8628,8 @@ class VideoProcessorApp:
                             _probe_stats = {}
                             _probe_limiter.wait()
                             select_audio_candidate(source, log_func=print,
-                                                   stats=_probe_stats)
+                                                   stats=_probe_stats,
+                                                   sustained=True)
                         except Exception as exc:
                             print(f"{Fore.YELLOW}  Audio candidate probe skipped: {type(exc).__name__}")
                             _probe_stats = {}
@@ -8645,6 +8887,7 @@ class VideoProcessorApp:
 
                     print(f"Compiling and writing to {output_video_path.split('/')[-1]}...")
                     if self.use_verify.get():
+                        self._set_processing_stage("Verification")
                         print(f"{Fore.CYAN}Running verification scan...")
                         dict_list = _verify_and_expand(
                             dict_list, selected_model,
@@ -8683,6 +8926,7 @@ class VideoProcessorApp:
                     pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                                   for e in dict_list}
                     if self.use_review.get():
+                        self._set_processing_stage("Review")
                         dlg = ReviewDialog(self.root, dict_list, padding,
                                           output_video_path,
                                           use_verify=self.use_verify.get(),
@@ -8723,6 +8967,7 @@ class VideoProcessorApp:
                         dict_list, refresh_func,
                         label="VODs" if self.is_video else "Videos")
                     try:
+                        self._set_processing_stage("Preparing clips")
                         self.clear_transfer_progress("Preparing remote clips...")
                         remote_failure_records = []
                         compile_entries = []
@@ -8760,6 +9005,7 @@ class VideoProcessorApp:
                         if not compile_entries:
                             raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
                         self.clear_transfer_progress("Starting compile...")
+                        self._set_processing_stage("Compile")
                         compile_vid(compile_entries, output_video_path, merge_clips,
                                     combine, res, self.final_bar, normalize,
                                     self.is_video, None, excluded=excluded,
@@ -8793,11 +9039,22 @@ class VideoProcessorApp:
                 if resolve_remote:
                     processing_uploads = processing_uploads_for_batch(
                         self.uploaded_videos, resolved_local_entries, remote_entries)
+                elif full_download and self._download_failures:
+                    processing_uploads = [
+                        upload for upload in self.uploaded_videos
+                        if self._download_key(upload) not in self._download_failures
+                    ]
+                    skipped_failed = len(self.uploaded_videos) - len(processing_uploads)
+                    if skipped_failed:
+                        print(f"{Fore.YELLOW}Skipping {skipped_failed} source(s) whose "
+                              f"Full Download failed; they stay in the list and the "
+                              f"next Process retries them.{Style.RESET_ALL}")
                 else:
                     processing_uploads = list(self.uploaded_videos)
                 def run_detection(upload, i):
                     """Run detection for one upload; returns True on success."""
                     nonlocal vids_with_clips
+                    self._set_processing_stage("Detection")
                     # 任务边界（按源）：暂停在这里等待，取消优先。检测内部的按块暂停
                     # 在 sound_reader 的块循环里，粒度约一块音频。
                     if pause_or_cancel(cancel_pending):
@@ -8862,6 +9119,21 @@ class VideoProcessorApp:
                             retain_hits = None
                         if retain_hits is not None:
                             retained_audio[retain_key] = retain_hits
+                    # Local inputs still know which source they came from. Hand that to
+                    # get_timestamps so Audio Cache / Full Download get a disk checkpoint
+                    # and a result cache keyed by source + kind + settings, exactly like a
+                    # Remote Stream source (but never sharing its key).
+                    local_cache_identity = None
+                    local_cache_kind = None
+                    if not isinstance(input_video_path, MediaSource):
+                        local_cache_identity = upload.get_source()
+                        if local_cache_identity is not None:
+                            local_cache_kind = "download" if full_download else "audio-cache"
+                    progress_prefix = (
+                        "Remote Stream"
+                        if isinstance(input_video_path, MediaSource)
+                        else ("Full Download" if full_download else "Audio Cache")
+                    )
                     try:
                         timestamps, used_existing_data = get_timestamps(
                             input_video_path, precision, current_block_size, threshold, focus_idx, selected_model, self.final_bar,
@@ -8871,16 +9143,19 @@ class VideoProcessorApp:
                             prefetch_concurrency=self.remote_audio_concurrency.get(),
                             prepare_source_func=_prepare_remote_source,
                             select_candidate_func=(
-                                lambda source: select_audio_candidate(source, log_func=print)
+                                lambda source: select_audio_candidate(
+                                    source, log_func=print, sustained=True)
                                 if isinstance(source, MediaSource) else None
                             ),
                             progress_callback=lambda sample, upload=upload, i=i:
                                 self._queue_transfer_progress(
                                     sample,
-                                    f"Remote Stream [{i + 1}/{len(processing_uploads)}] "
+                                    f"{progress_prefix} [{i + 1}/{len(processing_uploads)}] "
                                     f"{get_source_display_name(upload)}",
                                 ),
                             retain_audio=retain_hits,
+                            cache_identity=local_cache_identity,
+                            cache_kind=local_cache_kind,
                         )
                     except RemoteAudioIncompleteError as exc:
                         failure = f"{get_source_display_name(input_video_path)}: {exc}"
@@ -8947,9 +9222,11 @@ class VideoProcessorApp:
                                     progress_callback=lambda sample, upload=upload, i=i:
                                         self._queue_transfer_progress(
                                             sample,
-                                            f"Remote Stream [{i + 1}/{len(processing_uploads)}] "
+                                            f"{progress_prefix} [{i + 1}/{len(processing_uploads)}] "
                                             f"{get_source_display_name(upload)}",
                                         ),
+                                    cache_identity=local_cache_identity,
+                                    cache_kind=local_cache_kind,
                                 )
                             except InterruptedError:
                                 raise       # 取消同样不能被当成"重下后仍失败"
@@ -9103,6 +9380,7 @@ class VideoProcessorApp:
 
                 # --- re-verify and/or review before final compile ---
                 if self.use_verify.get():
+                    self._set_processing_stage("Verification")
                     print(f"{Fore.CYAN}Running verification scan...")
                     dict_list = _verify_and_expand(
                         dict_list, selected_model,
@@ -9143,6 +9421,7 @@ class VideoProcessorApp:
                 pre_review = {source_key(e['filename']): [(t['start'], t['end']) for t in e.get('timestamps', [])]
                               for e in dict_list}
                 if self.use_review.get():
+                    self._set_processing_stage("Review")
                     dlg = ReviewDialog(self.root, dict_list, padding,
                                       output_video_path,
                                       use_verify=self.use_verify.get(),
@@ -9185,6 +9464,7 @@ class VideoProcessorApp:
                     dict_list, refresh_func,
                     label="VODs" if self.is_video else "Videos")
                 try:
+                    self._set_processing_stage("Preparing clips")
                     self.clear_transfer_progress("Preparing remote clips...")
                     remote_failure_records = []
                     compile_entries = []
@@ -9221,6 +9501,7 @@ class VideoProcessorApp:
                     if not compile_entries:
                         raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
                     self.clear_transfer_progress("Starting compile...")
+                    self._set_processing_stage("Compile")
                     compile_vid(compile_entries, output_video_path, merge_clips,
                                 combine, res, self.final_bar, normalize,
                                 self.is_video, None, excluded=excluded,
@@ -9262,6 +9543,7 @@ class VideoProcessorApp:
                 self.remove_urls_from_list()
 
             self.root.update_idletasks()
+            self._set_processing_stage("")
             self.clear_transfer_progress("Completed")
             self.reenable_disabled_objects()
 

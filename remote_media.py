@@ -18,7 +18,8 @@ from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from utils import (FFMPEG_PATH, cancel_pending, run_tracked, run_tracked_progress,
-                   is_twitch_platform, register_proc, unregister_proc)
+                   is_twitch_platform, is_youtube_platform, register_proc,
+                   unregister_proc)
 from remote_prefetch import (
     CdnTooSlowError,
     _probe_real_size,
@@ -420,6 +421,16 @@ class PlaylistDescriptor:
             and entry.index not in self._hydrated_indices
         )
 
+    def limit_entries(self, count):
+        """Keep only the first ``count`` flat entries (generic-site safety cap)."""
+        try:
+            count = max(0, int(count))
+        except (TypeError, ValueError):
+            return self
+        self._entries = self._entries[:count]
+        self.total_count = len(self._entries)
+        return self
+
     def hydrate_entry(self, entry: PlaylistEntry) -> PlaylistEntry:
         if not self._hydrate_entry or entry.index in self._hydrated_indices:
             return entry
@@ -581,6 +592,15 @@ _AUDIO_PROBE_MIN_BYTES = 64 * 1024
 _AUDIO_PROBE_HASH_BYTES = 256 * 1024
 _AUDIO_PROBE_MAX_CANDIDATES = 5
 _AUDIO_MIN_BANDWIDTH = 1.0
+# Bilibili's dispatched node can serve a fast initial burst and then throttle a few
+# seconds later (measured: 2-10 MB/s for a moment, then 0.2-0.9 MB/s). A 1 MiB probe
+# is entirely inside that burst, so it cannot tell that node from a genuinely fast
+# mirror. The sustained probe ignores a short warm-up and averages the rest of a
+# bounded window instead.
+_AUDIO_SUSTAINED_SECONDS = 5.0
+_AUDIO_SUSTAINED_WARMUP = 1.5
+_AUDIO_SUSTAINED_MAX_BYTES = 64 * 1024 * 1024
+_AUDIO_SUSTAINED_MIN_BANDWIDTH = 2.0
 # A mirror must beat the current node by this factor before a transfer is
 # disturbed. Host speed fluctuates on a minutes timescale, so a single probe
 # sample is a veto (dead/very slow), not a precise ranking.
@@ -739,6 +759,98 @@ def _probe_url_bandwidth(
     return AudioProbe(len(data) / elapsed / (1024 * 1024), digest, len(data))
 
 
+def probe_audio_candidate_sustained(
+    source: MediaSource,
+    candidate: Mapping[str, Any],
+    seconds: float = _AUDIO_SUSTAINED_SECONDS,
+    warmup: float = _AUDIO_SUSTAINED_WARMUP,
+    max_bytes: int = _AUDIO_SUSTAINED_MAX_BYTES,
+    request_func: Callable[..., Any] | None = None,
+    log_func: Callable[[str], Any] | None = None,
+) -> AudioProbe | None:
+    """Measure an audio candidate for long enough to leave its initial burst.
+
+    The bounded 1 MiB probe above answers "is this node reachable", not "will it still
+    be fast after a few seconds". Bilibili nodes are measured going from 2-10 MB/s to
+    0.2-0.9 MB/s within seconds, so the initial burst would always win. This reads for
+    ``seconds``, ignores ``warmup`` seconds, and averages the rest.
+    """
+    url = str(candidate.get("url") or "")
+    if not url:
+        return None
+    headers = candidate.get("http_headers") or source.audio_headers or source.http_headers
+    return _probe_url_sustained(
+        url, headers, seconds=seconds, warmup=warmup, max_bytes=max_bytes,
+        request_func=request_func, log_func=log_func)
+
+
+def _probe_url_sustained(
+    url: str,
+    headers: Mapping[str, str] | None = None,
+    seconds: float = _AUDIO_SUSTAINED_SECONDS,
+    warmup: float = _AUDIO_SUSTAINED_WARMUP,
+    max_bytes: int = _AUDIO_SUSTAINED_MAX_BYTES,
+    request_func: Callable[..., Any] | None = None,
+    log_func: Callable[[str], Any] | None = None,
+) -> AudioProbe | None:
+    """Read one range for a real time window and average only the steady part."""
+    url = str(url or "")
+    if not url:
+        return None
+    try:
+        seconds = max(1.0, float(seconds))
+        warmup = max(0.0, min(float(warmup), seconds - 0.5))
+        max_bytes = max(_AUDIO_PROBE_MIN_BYTES, int(max_bytes))
+    except (TypeError, ValueError):
+        return None
+    if request_func is not None:
+        # Test seam: reuse the bounded probe's request contract (data, elapsed, status,
+        # content_range) rather than inventing a second one.
+        return _probe_url_bandwidth(
+            url, headers, probe_bytes=max_bytes, deadline=seconds,
+            request_func=request_func, log_func=log_func)
+
+    request = Request(url, headers={**dict(headers or {}),
+                                    "Range": f"bytes=0-{max_bytes - 1}"})
+    started = time.monotonic()
+    data = bytearray()
+    measured = 0
+    status = 0
+    try:
+        with urlopen(request, timeout=2.0) as response:
+            status = int(getattr(response, "status", response.getcode()))
+            if status != 206:
+                if log_func is not None:
+                    log_func(f"Sustained probe failed (HTTP {status}); skipping candidate")
+                return None
+            while True:
+                now = time.monotonic() - started
+                if now >= seconds or len(data) >= max_bytes:
+                    break
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if time.monotonic() - started >= warmup:
+                    measured += len(chunk)
+    except Exception as exc:                                  # noqa: BLE001
+        if log_func is not None:
+            log_func(f"Sustained probe failed ({type(exc).__name__}); skipping candidate")
+        return None
+    elapsed = time.monotonic() - started
+    if len(data) < _AUDIO_PROBE_MIN_BYTES:
+        if log_func is not None:
+            log_func(f"Sustained probe failed (only {len(data)} bytes); skipping candidate")
+        return None
+    steady_seconds = max(0.25, elapsed - warmup)
+    # If the node was so fast that the byte cap filled during warm-up, fall back to the
+    # total average: it has already delivered far more than one block, so it is healthy.
+    speed = (measured / steady_seconds) if measured else (len(data) / max(0.001, elapsed))
+    digest = (hashlib.sha256(bytes(data[:_AUDIO_PROBE_HASH_BYTES])).hexdigest()
+              if len(data) >= _AUDIO_PROBE_HASH_BYTES else "")
+    return AudioProbe(speed / (1024 * 1024), digest, len(data))
+
+
 def _candidate_groups(candidates: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Split a flat (format x cdn-host) candidate list into per-format groups."""
     groups: list[list[dict[str, Any]]] = []
@@ -769,6 +881,9 @@ def select_audio_candidate(
     deadline: float = _AUDIO_PROBE_SECONDS,
     max_candidates: int = _AUDIO_PROBE_MAX_CANDIDATES,
     probe_func: Callable[[Mapping[str, Any]], Any] | None = None,
+    sustained: bool = False,
+    sustained_seconds: float = _AUDIO_SUSTAINED_SECONDS,
+    sustained_warmup: float = _AUDIO_SUSTAINED_WARMUP,
 ) -> dict[str, Any] | None:
     """Keep the current audio CDN unless it is measurably worse than a mirror.
 
@@ -782,6 +897,9 @@ def select_audio_candidate(
 
     ``run_func`` / ``min_realtime_speed`` are the legacy ffmpeg-probe seam used
     by the old tests; production uses ``probe_func`` (default: the byte probe).
+    ``sustained`` switches to a five-second steady-state sample (the initial burst is
+    ignored), because a Bilibili node can look fast for 1 MiB and then throttle to
+    0.2-0.9 MB/s; that mode also raises the "healthy enough" bar to 2 MB/s.
     ``stats`` receives ``groups``/``failed_groups`` for ``ProbeCooldown`` plus
     ``probed``/``current_speed``/``chosen`` for diagnostics.
     """
@@ -804,6 +922,10 @@ def select_audio_candidate(
         threshold = float(min_bandwidth)
     except (TypeError, ValueError):
         threshold = _AUDIO_MIN_BANDWIDTH
+    if sustained and threshold <= _AUDIO_MIN_BANDWIDTH:
+        # A 1 MiB burst can read 2-10 MB/s and then settle at 0.2-0.9; requiring a
+        # sustained node to beat the old 1 MB/s bar would still keep the bursty one.
+        threshold = _AUDIO_SUSTAINED_MIN_BANDWIDTH
     stats_state: dict[str, Any] = {
         "groups": 1, "failed_groups": 0, "probed": 0,
         "current_speed": None, "chosen": None,
@@ -813,6 +935,10 @@ def select_audio_candidate(
     def measure(candidate: Mapping[str, Any], note: str = "") -> AudioProbe | None:
         if probe_func is not None:
             raw = probe_func(candidate)
+        elif sustained:
+            raw = probe_audio_candidate_sustained(
+                source, candidate, seconds=sustained_seconds,
+                warmup=sustained_warmup, log_func=log_func)
         elif legacy:
             raw = probe_audio_candidate(
                 source, candidate, duration=probe_duration, run_func=run_func,
@@ -840,6 +966,8 @@ def select_audio_candidate(
                 value = f"{sample.speed:g}x"
             else:
                 value = f"{sample.speed:.2f} MB/s"
+                if sustained:
+                    value += f" (sustained {sustained_seconds:g}s)"
             log_func(f"Audio candidate {format_id} abr={abr}{suffix} "
                      f"read={value}{note}")
         return sample
@@ -4016,6 +4144,44 @@ def stable_source_id(source: MediaSource) -> str:
         (parts.scheme.lower(), parts.netloc.lower(), parts.path, "", "")
     )
     return f"{platform}:{canonical_url}"
+
+
+def is_known_platform(platform) -> bool:
+    """True for the three platforms AutoComper has platform-specific support for.
+
+    Everything else is a "generic" yt-dlp site: Full Download can still fetch it and the
+    local detection/compile pipeline works, but Remote Stream / Audio Cache only support
+    these three families (they rely on platform-specific audio loading and CDN handling).
+    """
+    key = str(platform or "").strip().casefold()
+    if not key:
+        return False
+    if "bilibili" in key:
+        return True
+    if is_youtube_platform(key):
+        return True
+    if is_twitch_platform(key):
+        return True
+    return False
+
+
+def source_is_generic(source) -> bool:
+    """True for a resolved source outside the three supported platforms."""
+    return isinstance(source, MediaSource) and not is_known_platform(source.platform)
+
+
+def source_display_platform(source) -> str:
+    """Platform label for generic sources (``soundcloud`` / ``generic (host)``)."""
+    platform = str(getattr(source, "platform", "") or "").strip()
+    label = platform or "unknown"
+    if label.casefold() in {"generic", "unknown"}:
+        try:
+            host = (urlsplit(str(getattr(source, "source_url", ""))).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host:
+            return f"{label} ({host})"
+    return label
 
 
 def source_has_embedded_audio(source: MediaSource) -> bool:

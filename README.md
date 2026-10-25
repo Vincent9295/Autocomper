@@ -21,9 +21,11 @@ This enhanced version adds **clip review, re-verification, editing, batch proces
 | **Audio Mode** | Full audio-only pipeline with native FFmpeg concat. |
 | **CPU/GPU Toggle** | One-click switch between CUDA and CPU inference — keeps your GPU quiet during overnight runs. Saved in presets. |
 | **Output Frame Rate** | Choose **Auto (60/30)**, **30 fps**, or **60 fps** next to the Process Videos button. Auto follows the batch: mostly-60fps material (typical for YouTube/Twitch) is delivered at 60fps with every frame kept, anything else stays at 30fps. 30fps output (what earlier versions always did) drops half the frames of a 60fps source; 60fps output costs ~30% more encode time but does not enlarge the file. Saved in settings. |
-| **Pause / Resume** | A **Pause** button next to **Process Videos** (the icon turns into a play button) stops a run without cancelling it, then continues it from the same place when you press it again. It pauses between steps: the clip download, clip cut, integrity check, merge batch or detection block already in flight finishes first, and **Cancel** still works instantly while paused. The final merge cannot be interrupted (it is one FFmpeg pass over the whole film), so a pause asked for during it takes effect when that pass ends. While paused the app keeps its memory and its temporary files, and closing it still loses the compile work, exactly like Cancel. See [Pausing a Run](#pausing-a-run). |
+| **Pause / Resume** | A **Pause** button next to **Process Videos** (the icon turns into a play button) stops a run without cancelling it, then continues it from the same place when you press it again. It pauses between steps, and in **Full Download** it also stops a transfer that is already running: generic sites and audio mode keep their `.part` and resume it, the Bilibili/YouTube parallel transfer restarts that one file. The final merge cannot be interrupted (it is one FFmpeg pass over the whole film), so a pause asked for during it takes effect when that pass ends. While paused the app keeps its memory and its temporary files, and closing it still loses the compile work, exactly like Cancel. See [Pausing a Run](#pausing-a-run). |
+| **Resumable Detection** | Audio Cache and Full Download write a per-block checkpoint and a cached detection result for the downloaded local file, keyed by source, mode and detection settings, with the file's size/mtime as validation. Exit, crash or power loss during detection and the next Process continues at the next block; a finished detection is reused. See [Resuming an Interrupted Detection](#resuming-an-interrupted-detection). |
 | **Remote VOD Processing** | Process Bilibili, YouTube, and Twitch VODs from remote audio; fetch only selected video segments. |
 | **Remote Network Modes** | Choose Remote Stream, Audio Cache, or Full Download for slow or unstable networks. |
+| **Any yt-dlp Site (Experimental)** | **Add Media → Add Any URL (yt-dlp)** downloads a video from any site the bundled yt-dlp supports, then runs detection and compile on the downloaded file. Full Download only; single videos work best, playlists are best-effort (first 300 entries). See [Any yt-dlp Site](#any-yt-dlp-site-experimental-full-download-only). |
 | **Compile Progress Monitoring** | Live remote clip preparation, FFmpeg encoding progress, merge progress, speed, and ETA. |
 | **Max Download Concurrency** | Control how many remote clips are fetched at once while preparing a compilation (default 5). |
 | **Fixed Timestamps Files** | Timestamps are always saved as fixed names — `timestamps.txt` (detection), with re-verify writing `timestamps_reverified.txt` and review writing `timestamps_selected.txt`. Each is overwritten per run, so nothing piles up across videos. |
@@ -121,7 +123,7 @@ If CUDA isn't installed, the app falls back to CPU automatically.
 
 ## 📖 Usage
 
-1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist. To rebuild a batch you have processed before, use **Add Media → Import URLs from Timestamps .txt** and pick one of its timestamps files: every URL in that file is queued again. If you are only partway through a long selection, **Add Media → Export Queued Sources to .txt** saves the current list so you can close the program and queue it again later.
+1. **Add Videos** — pick files, use **Add Folder**, or add a Bilibili, YouTube, or Twitch VOD URL/playlist. To build a batch from any other yt-dlp-supported site, use **Add Media → Add Any URL (yt-dlp)** (it downloads the complete file and works with **Full Download** only). To rebuild a batch you have processed before, use **Add Media → Import URLs from Timestamps .txt** and pick one of its timestamps files: every URL in that file is queued again. If you are only partway through a long selection, **Add Media → Export Queued Sources to .txt** saves the current list so you can close the program and queue it again later.
 2. **Configure** — set Precision / Block Size / Threshold. Use tooltips for guidance.
 3. **Choose Remote Processing** for URL inputs:
    - **Remote Stream** reads remote audio directly and fetches video only for previews/selected clips.
@@ -142,14 +144,21 @@ A pause takes effect at a **step boundary**, so whatever is already in flight is
 - one clip download, or one clip cut (seconds);
 - one integrity check (seconds);
 - one merge batch (tens of seconds);
-- one detection block, about ten seconds of audio (about a second of work).
+- one detection block (one block of audio, 600 s by default).
 
 Two things it deliberately cannot do, because killing a child process mid-write is how files get corrupted and how a healthy FFmpeg gets mistaken for a stalled one:
 
 - it cannot interrupt the **final merge**, which is a single FFmpeg pass over the whole film, so a pause asked for during it takes effect when that pass ends;
-- it cannot interrupt a download that is already running in **Full Download** or a segment being fetched. It does stop the *next* one from starting.
+- it cannot interrupt a segment being fetched in Remote Stream. It does stop the *next* one from starting.
 
-While paused, AutoComper keeps its memory (the detection model and the caches stay loaded) and its temporary merge files on disk, so a pause is not the same as freeing the machine. Closing the app while paused loses the compile work, exactly like Cancel. **Cancel** stays usable at all times and always wins: pressing it while paused stops the run immediately.
+**Full Download is the exception on purpose**: a download can be twenty gigabytes, so Pause now aborts the transfer in flight instead of waiting for it. The entry stays in the list and Resume continues it:
+
+- generic sites and audio mode use yt-dlp's own downloader, so the `.part` file is kept and the transfer resumes where it stopped;
+- the Bilibili/YouTube parallel transfer cannot keep its temporary file across a pause, so that one file restarts from zero on Resume (the log says so). Already finished sources are not downloaded again.
+
+**Cancelling** is cooperative in the same way. It sets the cancel flag, kills the tracked FFmpeg processes and waits for the worker to leave, but a long audio block, a network read or the final merge can take a while to return. After 20 seconds the log names the stage it is still waiting for (for example `Detection`) and points out that **Add Media > Export Queued Sources** still works, so switching versions does not cost you the current list. After 120 seconds a dialog offers to close the program if the call is truly stuck. Export is the only Add Media action available while a job is running; adding or reordering media is disabled until it ends.
+
+While paused, AutoComper keeps its memory (the detection model and the caches stay loaded) and its temporary merge files on disk, so a pause is not the same as freeing the machine. Closing the app while paused loses the compile work, exactly like Cancel, but a pending Full Download `.part` and a detection checkpoint survive. **Cancel** stays usable at all times and always wins: pressing it while paused stops the run immediately.
 
 ### Parallelism and Memory
 
@@ -191,6 +200,8 @@ Bilibili can go one step further: its audio is fetched one block at a time, so a
 
 Sources that failed detection in an earlier run are retried automatically in the next run, and the log names them (`Re-detecting N remote source(s) that failed detection in a previous run: ...`). There is no prompt to answer, so an unattended batch is never blocked. A source whose detection result is already cached costs nothing at this stage: it is skipped without touching the network.
 
+**Audio Cache and Full Download keep the same safety net for the file they already downloaded.** A detection interrupted by a closed window, a crash or a power cut resumes at the next block instead of re-running the model over hours of audio, and a finished detection is reused on the next Process. Their cache entries live in the same `detection` folder but carry an `input_kind` (`audio-cache` or `download`) so the two modes never share a checkpoint, and the checkpoint records the local file's path, size and modification time: re-downloading or replacing the file invalidates it automatically. The cache files are pretty-printed JSON (one field per line) and include a readable `key` block, so you can inspect a paused run without decoding a single line. The log says `Full Download detection resumed: 12/24 blocks ...` or `Audio Cache detection resumed: ...`, with the key it used.
+
 #### Full Download Speed and Source Quality
 
 Bilibili and YouTube hand out whole `https` streams (no HLS/DASH fragments). yt-dlp can only fetch such a stream on **one** connection, and Bilibili throttles a single connection hard - measured on one VOD at the same moment, on the same signed URL: about **1 MB/s on one connection against 20-23 MB/s with four range requests**. Full Download therefore uses the same parallel range transport that Audio Cache already used: one connection pool per stream (`Max Download Concurrency`, default 8) with `Audio Cache Chunk Size` bytes per request (default 8 MiB), then a stream-copy merge of the selected video and audio. It falls back to yt-dlp's own resumable downloader whenever the parallel path does not apply or fails: segmented (HLS/DASH) sources, an unknown or unprobeable stream size, a configured speed limit, or any transfer error - so a download can be slower than it could be, but never broken. Bilibili downloads also re-check their CDN node: if the assigned one measures clearly slow, the known mirror hosts are probed once and the fastest reachable one is used for the whole file.
@@ -204,6 +215,22 @@ to No Limit for maximum detail.
 ```
 
 That warning is worth acting on: detail that was never downloaded cannot be restored afterwards. A 720p source stays soft even after a compilation upscales it to 1080p, and the compile itself is not the cause (measured on a real 1080p30 clip: the final encode keeps 99-100% of the source's sharpness at SSIM 0.991-0.996, while the same clip re-encoded again and again by the batched merge loses ~0.4% sharpness per generation).
+
+#### Any yt-dlp Site (Experimental, Full Download Only)
+
+**Add Media → Add Any URL (yt-dlp)** accepts a link from any site the bundled yt-dlp can download, not just Bilibili, YouTube and Twitch. The complete file is downloaded first and detection/compile then run on that local file, exactly like a normal Full Download.
+
+- **Full Download only.** Remote Stream and Audio Cache keep their platform-specific audio/CDN handling and only support the three main platforms. If a generic source is in the list while another mode is selected, Process refuses the run and names the URLs instead of silently skipping them.
+- **Bring cookies for login-only sites.** Remote Browser Cookies (or a cookies.txt) are used as usual. Live streams are refused, DRM-protected sources fail with yt-dlp's message.
+- **Single videos work best.** Generic playlists are best-effort: the first 300 entries are offered, and flat metadata from unknown extractors can be missing titles/durations.
+- **Large files are resumable.** The downloader keeps a `.part` file, retries with 5/10/20/30/60/120s backoff, gives up only after 5 attempts in a row without any progress (20 restarts at most), and Cancel stops the transfer while keeping the partial file for the next run. Generic sources always use yt-dlp's resumable downloader rather than the parallel range transport, because only that path can resume a multi-GB file across attempts.
+- **Pause works mid-transfer.** Pressing Pause during a multi-GB download aborts the transfer and keeps the `.part`; Resume continues it. See [Pausing a Run](#pausing-a-run) for the one case that restarts a file.
+- **Quality is your setting first.** If the site offers no format matching **Max Download Quality**, the download falls back to the best available format and says so in the log; it never lowers the quality on its own.
+- **Downloads are verified.** After finishing, the container duration is compared with the parsed source duration (tolerance 5s or 1%, whichever is larger) and an audio track is required. A short or audio-less file is retried once, then skipped instead of entering the compilation.
+- **Name collisions are safe.** Two different videos with the same title are saved as `Title` and `Title (2)`; re-running the same source reuses the existing file.
+- A failed generic download **stays in the list** marked `[download failed]`, is skipped for that run, and is retried (from its partial file) the next time you press Process.
+
+This is an experimental convenience: it relies on the bundled yt-dlp's extractor, so a site can break at any time. The tested matrix covers direct files, HLS/DASH, audio-only sites, playlists, login-required pages, live refusal, DRM refusal and very large resumable downloads.
 
 While a compilation is being prepared, the UI reports `Preparing clips: N / total` together with the current VOD, clip number, time range, and live download speed/ETA. During the FFmpeg compile the same panel shows encoding progress, speed, and ETA, and the log lists each clip as it is written and each concat batch as it is merged. The UI stays responsive even for large compilations.
 
@@ -334,7 +361,7 @@ Remote speed depends on more than the local internet connection. Common causes i
 - a temporary HTTP error or interrupted range request;
 - a platform selecting a slower audio CDN or format.
 
-AutoComper mitigates transient failures by retrying remote chunks, committing and reporting progress as the bytes arrive, resuming each range from its own byte offset, rotating to another verified mirror when a host stalls, refreshing signed URLs only when they are actually rejected or near expiry, and retrying Bilibili Remote Stream blocks independently. The audio-cache prefetch measures real byte throughput (not a 3-second FFmpeg speed sample), keeps the dispatched node unless a mirror is clearly faster, and refuses to mix ranges from a mirror that serves different bytes. **A slow source is never skipped:** it is tried on every known mirror and, if the whole CDN is slow at that moment, it keeps downloading at whatever rate is available with live progress and an honest ETA. These measures cannot remove a persistent ISP/CDN speed cap. If a source remains slow, try another network route, disable or change the VPN, use **Audio Cache** so later runs do not redownload audio, or use **Full Download**.
+AutoComper mitigates transient failures by retrying remote chunks, committing and reporting progress as the bytes arrive, resuming each range from its own byte offset, rotating to another verified mirror when a host stalls, refreshing signed URLs only when they are actually rejected or near expiry, and retrying Bilibili Remote Stream blocks independently. The Bilibili audio selector measures **sustained** byte throughput over a five-second window and ignores the initial burst, because a dispatched node can serve 2-10 MB/s for a few seconds and then settle at 0.2-0.9 MB/s; Remote Stream also re-probes the audio CDN after two consecutive slow blocks instead of staying on a throttled node for the whole VOD. It never mixes ranges from a mirror that serves different bytes. **A slow source is never skipped:** it is tried on every known mirror and, if the whole CDN is slow at that moment, it keeps downloading at whatever rate is available with live progress and an honest ETA. These measures cannot remove a persistent ISP/CDN speed cap. If a source remains slow, try another network route, disable or change the VPN, use **Audio Cache** so later runs do not redownload audio, or use **Full Download**.
 
 During **Preparing clips**, a clip that makes no progress for 30 seconds prints a heartbeat line plus a short hint explaining that this is normally caused by **Max Download Concurrency** being too high for the connection or by an unstable network path, and that the clip is retried automatically. The hint appears at most once per clip, and a download that keeps making progress never prints it. Each clip's failure timeout is also sized from its own expected size (between 2 and 10 minutes) instead of a flat 10 minutes, so a short clip stuck on a dead connection is abandoned quickly while a long clip on a slow but working line is still allowed to finish.
 

@@ -1,9 +1,11 @@
 altgraph==0.17.4
 Brotli==1.1.0
 certifi==2026.10.19
+cffi==2.1.1
 charset-normalizer==3.3.0
 colorama==0.4.6
 coloredlogs==15.0.1
+curl-cffi==0.16.3
 cx-Logging==3.1.0
 cx_Freeze==6.15.15
 decorator==4.4.2
@@ -24,6 +26,7 @@ Pillow==9.4.0
 proglog==0.1.10
 protobuf==4.25.2
 pycryptodomex==3.20.0
+pycparser==3.12
 pyinstaller-hooks-contrib==2024.0
 pyreadline3==3.4.1
 requests>=2.32.2

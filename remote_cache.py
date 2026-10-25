@@ -353,7 +353,11 @@ class CacheStore:
 
     @classmethod
     def save_json(cls, path: str | os.PathLike[str], value: Any) -> None:
-        data = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        # Pretty-printed on purpose: these files are meant to be opened and inspected
+        # while a run is paused (a checkpoint is a long session's only record). The cache
+        # key hash is computed separately from a compact JSON and is unaffected.
+        data = json.dumps(value, ensure_ascii=True, sort_keys=True,
+                          indent=2).encode("utf-8")
         cls.save_file(path, data)
 
     @staticmethod

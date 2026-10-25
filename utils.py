@@ -706,6 +706,17 @@ def _is_youtube_download_url(url: str) -> bool:
                for marker in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
 
 
+def _youtube_client_regression(exc: Exception) -> bool:
+    """True for the YouTube failure class where an anonymous retry helps.
+
+    Lazy import: remote_media imports this module at load time, so importing it at
+    module level here would be circular. The resolve path already uses the same
+    predicate for its anonymous fallback (see _extract_with_cookie_policy).
+    """
+    from remote_media import _is_youtube_client_regression_error
+    return _is_youtube_client_regression_error(exc)
+
+
 def _download_ydl_options(browser_cookies: str | None = None, url: str | None = None) -> dict:
     """Return yt-dlp cookie options without ever passing an anonymous Auto value.
 
@@ -766,6 +777,181 @@ def _download_log(logger, message):
     info = getattr(logger, "info", None)
     if callable(info):
         info(message)
+
+
+# ── Full Download: large-file reliability ─────────────────────────────
+# Full Download fetches whole films (10 MB up to tens of GB). A hard network drop must
+# not restart the transfer, and a flaky line must not exhaust the retry budget while the
+# file is still growing. The budget below is progress-aware: an attempt that grew the
+# .part file does not count as a failure.
+FULL_DOWNLOAD_MAX_RESTARTS = 20
+FULL_DOWNLOAD_ZERO_PROGRESS_LIMIT = 5
+FULL_DOWNLOAD_MIN_PROGRESS_BYTES = 1024 * 1024
+FULL_DOWNLOAD_RETRY_BACKOFF = (5, 10, 20, 30, 60, 120)
+FULL_DOWNLOAD_YTDLP_RETRIES = 10
+FULL_DOWNLOAD_FRAGMENT_CONCURRENCY_MAX = 8
+FULL_DOWNLOAD_DURATION_FLOOR = 5.0
+FULL_DOWNLOAD_DURATION_RATIO = 0.01
+_FALLBACK_FORMAT = 'bestvideo+bestaudio/best'
+_MEDIA_DURATION_RE = re.compile(r"Duration: (\d+):(\d+):(\d+)\.(\d+)")
+
+
+def _download_part_bytes(output_location, stem):
+    """Bytes yt-dlp already has on disk for this download (.part/.ytdl files)."""
+    total = 0
+    prefix = str(stem).casefold()
+    try:
+        names = os.listdir(output_location)
+    except OSError:
+        return 0
+    for name in names:
+        lowered = name.casefold()
+        if not lowered.startswith(prefix + "."):
+            continue
+        if not (lowered.endswith(".part") or lowered.endswith(".ytdl")):
+            continue
+        try:
+            total += os.path.getsize(os.path.join(output_location, name))
+        except OSError:
+            pass
+    return total
+
+
+def _download_retry_delay(restarts):
+    index = min(max(0, int(restarts) - 1), len(FULL_DOWNLOAD_RETRY_BACKOFF) - 1)
+    return float(FULL_DOWNLOAD_RETRY_BACKOFF[index])
+
+
+class PauseRequested(Exception):
+    """A pause was requested while a Full Download was in flight.
+
+    Distinct from Cancel on purpose: the partial file (``.part`` for yt-dlp) is kept, the
+    entry stays in the list, and the next run resumes instead of marking a failure.
+    """
+
+
+def stop_pending():
+    """Whether a transfer should stop now (Cancel or Pause), for the range writer."""
+    return cancel_pending() or pause_pending()
+
+
+def _wait_before_download_retry(restarts):
+    """Cancel/pause-aware backoff between Full Download attempts."""
+    deadline = time.monotonic() + _download_retry_delay(restarts)
+    while True:
+        if cancel_pending():
+            raise InterruptedError("Download cancelled by user.")
+        if pause_pending():
+            raise PauseRequested("Download paused by user.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+
+
+def _cancel_aware_hook(hook):
+    """Wrap a yt-dlp progress hook so Cancel stops an in-process download.
+
+    yt-dlp runs inside this process (it is not a tracked child), so Stop cannot kill it;
+    raising from the progress hook aborts the transfer, and the .part file stays for the
+    next resume. This is the only cancellation point for a multi-GB Full Download.
+    """
+    def wrapped(data):
+        if cancel_pending():
+            raise InterruptedError("Download cancelled by user.")
+        if pause_pending():
+            raise PauseRequested("Download paused by user.")
+        if callable(hook):
+            hook(data)
+    return wrapped
+
+
+def _fragment_concurrency(concurrency):
+    try:
+        value = int(concurrency) if concurrency is not None else 4
+    except (TypeError, ValueError):
+        value = 4
+    return max(1, min(FULL_DOWNLOAD_FRAGMENT_CONCURRENCY_MAX, value))
+
+
+def _format_candidates(format_str, fallback_str=_FALLBACK_FORMAT):
+    """Formats to try, most specific first: user quality, best available, site default."""
+    candidates = [format_str]
+    for value in (fallback_str, None):
+        if value != candidates[-1]:
+            candidates.append(value)
+    return candidates
+
+
+def probe_media_container(path):
+    """Return (duration_seconds|None, has_video, has_audio) from ffmpeg's header dump.
+
+    Reads the container header only (``ffmpeg -i``); never decodes the film, so checking
+    a 30 GB file stays a sub-second operation.
+    """
+    try:
+        result = run_tracked(
+            [FFMPEG_PATH, "-hide_banner", "-nostdin", "-i", str(path)],
+            timeout=60, text=True)
+        output = (getattr(result, "stderr", "") or "") + (getattr(result, "stdout", "") or "")
+    except Exception:                                            # noqa: BLE001
+        return None, False, False
+    match = _MEDIA_DURATION_RE.search(output)
+    duration = None
+    if match:
+        hours, minutes, seconds, fraction = match.groups()
+        duration = (int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+                    + int(fraction) / (10 ** len(fraction)))
+    return duration, "Video:" in output, "Audio:" in output
+
+
+def verify_downloaded_media(path, expected_duration, media_type="video"):
+    """Cheap post-download check: duration vs the parsed source and required audio.
+
+    A truncated film would silently shorten the compilation, so a short file is treated
+    as a failed download (the caller retries once, then skips it). Returns (ok, message).
+    """
+    duration, has_video, has_audio = probe_media_container(path)
+    if media_type == "video":
+        if not has_video:
+            return False, "the downloaded file has no video track"
+        if not has_audio:
+            return False, ("the downloaded file has no audio track, so there is nothing "
+                           "to detect (use Audio mode if this source is audio-only)")
+    elif not has_audio:
+        return False, "the downloaded file has no audio track"
+    try:
+        expected = float(expected_duration) if expected_duration is not None else None
+    except (TypeError, ValueError):
+        expected = None
+    if expected and expected > 0 and duration is not None and duration > 0:
+        tolerance = max(FULL_DOWNLOAD_DURATION_FLOOR, expected * FULL_DOWNLOAD_DURATION_RATIO)
+        if duration + tolerance < expected:
+            return False, (f"the downloaded file is shorter than the source "
+                           f"({duration:.1f}s vs {expected:.1f}s)")
+    return True, ""
+
+
+def _discard_download_output(output_file, output_location, stem):
+    """Remove a complete-but-invalid download so the retry really fetches it again."""
+    try:
+        if output_file and os.path.isfile(output_file):
+            os.remove(output_file)
+    except OSError:
+        pass
+    try:
+        names = os.listdir(output_location)
+    except OSError:
+        return
+    prefix = str(stem).casefold()
+    for name in names:
+        lowered = name.casefold()
+        if lowered.startswith(prefix + ".") and (
+                lowered.endswith(".part") or lowered.endswith(".ytdl")):
+            try:
+                os.remove(os.path.join(output_location, name))
+            except OSError:
+                pass
 
 
 # ── Full Download: parallel range transport ───────────────────────────
@@ -1077,6 +1263,10 @@ def _download_streams_with_ranges(stem, output_location, streams, logger,
     base = [0]
 
     def progress(done, total, elapsed):
+        if cancel_pending():
+            raise InterruptedError("Download cancelled by user.")
+        if pause_pending():
+            raise PauseRequested("Download paused by user.")
         current = base[0] + done
         logger_hook = getattr(logger, "hook", None)
         if callable(logger_hook):
@@ -1114,7 +1304,7 @@ def _download_streams_with_ranges(stem, output_location, streams, logger,
                 stream_url(index, fmt), target,
                 headers=fmt.get("http_headers"), size=known_sizes[index],
                 chunk_size=chunk, concurrency=workers, logger=None,
-                progress_callback=progress, cancel_check=cancel_pending)
+                progress_callback=progress, cancel_check=stop_pending)
             fetched.append((fmt, target))
             base[0] += os.path.getsize(target)
 
@@ -1191,6 +1381,8 @@ def _accelerated_download(stem, output_location, info, logger,
             stem, output_location, streams, logger,
             concurrency=concurrency, chunk_size=chunk_size,
             bilibili_hosts=_is_bilibili_info(info))
+    except PauseRequested:
+        raise
     except InterruptedError:
         raise
     except Exception as exc:
@@ -1257,6 +1449,8 @@ def _accelerated_audio_download(stem, output_location, info, logger, ydl_opts,
                              f"{os.path.basename(str(stem))}.{codec}")
         _convert_audio(downloaded, final, encoder, quality)
         return final
+    except PauseRequested:
+        raise
     except InterruptedError:
         raise
     except Exception as exc:
@@ -1490,7 +1684,7 @@ def _finalize_staged_download(staged, output_file):
         raise
 
 
-def download_video(url: str, filename: str, output_location: str, max_quality: str, max_speed: int, logger, n_retries: int = 3, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None) -> Tuple[bool, str]:
+def download_video(url: str, filename: str, output_location: str, max_quality: str, max_speed: int, logger, n_retries: int = 5, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None, allow_parallel: bool = True) -> Tuple[bool, str]:
     logger.reset_total_progress(100)
     os.makedirs(output_location, exist_ok=True)
     # 名字主干在这里统一截短：yt-dlp 现在直接下到 output_location（见 outtmpl），
@@ -1500,17 +1694,24 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
 
     max_height = convert_quality_str_to_int(max_quality)
 
-    format_str = \
-        f'bestvideo[height<={max_height}]+bestaudio/bestvideo[height<=720][fps<=60]+bestaudio/bestvideo[height<={max_height}]/best[height<={max_height}]' \
-        if max_quality in DOWNLOAD_QUALITY_OPTIONS and max_quality != DOWNLOAD_QUALITY_OPTIONS[0] else 'bestvideo+bestaudio/best'
+    format_str = (
+        f'bestvideo[height<={max_height}]+bestaudio/'
+        f'bestvideo[height<=720][fps<=60]+bestaudio/'
+        f'bestvideo[height<={max_height}]/best[height<={max_height}]'
+        if max_quality in DOWNLOAD_QUALITY_OPTIONS
+        and max_quality != DOWNLOAD_QUALITY_OPTIONS[0] else _FALLBACK_FORMAT)
 
+    zero_progress_limit = max(1, int(n_retries))
     last_error = None
+    verification_retried = False
     # devnull 要显式 UTF-8：yt-dlp 的输出（含视频标题）会写进这个流，用本地
     # 代码页（中文 Windows = GBK、西文 = cp1252）时，标题里只要有一个该代码页
     # 编码不了的字符（cp1252 下的西里尔字母、任何平台的 emoji）就抛
     # UnicodeEncodeError，把下载误报成失败。errors='replace' 保证永不炸。
     with open(os.devnull, 'w', encoding='utf-8', errors='replace') as devnull:
-        for cookie_source in _download_cookie_candidates(browser_cookies):
+        cookie_sources = _download_cookie_candidates(browser_cookies)
+        anonymous_fallback_added = None in cookie_sources
+        for cookie_source in cookie_sources:
             ydl_opts = {
                 # 暂存目录必须是真正的目标目录：以前是相对路径（落进进程工作目录），
                 # 完整下载完再 shutil.move 过去——工作目录不可写或目标名超 MAX_PATH
@@ -1518,16 +1719,20 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                 'outtmpl': os.path.join(output_location, f"{stem}.%(ext)s"),
                 'quiet': True,
                 'logger': logger,
-                'progress_hooks': [logger.hook],
+                'progress_hooks': [_cancel_aware_hook(getattr(logger, "hook", None))],
                 'ffmpeg_location': FFMPEG_PATH
             }
-            ydl_opts.update(_download_transfer_options(n_retries))
+            ydl_opts.update(_download_transfer_options(
+                max(int(n_retries), FULL_DOWNLOAD_YTDLP_RETRIES)))
             ydl_opts.update(_download_ydl_options(cookie_source, url=url))
             if max_speed > 0:
                 ydl_opts['limit_rate'] = f"{max_speed}K"
-            attempts = 0
-            while attempts < n_retries:
-                if attempts > 0:
+            restarts = 0
+            zero_progress = 0
+            last_part_bytes = _download_part_bytes(output_location, stem)
+            while restarts < FULL_DOWNLOAD_MAX_RESTARTS:
+                if restarts > 0:
+                    _wait_before_download_retry(restarts)
                     ydl_opts.pop('concurrent_fragment_downloads', None)
                 old_stdout = sys.stdout
                 old_stderr = sys.stderr
@@ -1535,32 +1740,45 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                 sys.stderr = devnull
 
                 try:
-                    # format 必须在解析前设好：选中结果（requested_formats）是并行
-                    # 传输规划的依据，否则要多做一次完整解析。
-                    ydl_opts['format'] = format_str
-                    try:
-                        with YoutubeDL(ydl_opts) as ydl:
-                            video_info = ydl.extract_info(url, download=False)
-                    except Exception:
-                        # 提前设定 format 后，"选不出任何格式"（例如纯音频源配上
-                        # 720p 上限）会在解析阶段就抛错，而旧行为是解析成功、再由
-                        # has_video 判定跳过。退回无格式解析以保持旧行为。
-                        ydl_opts.pop('format', None)
-                        with YoutubeDL(ydl_opts) as ydl:
-                            video_info = ydl.extract_info(url, download=False)
-                        ydl_opts['format'] = format_str
+                    # 解析：先按用户的画质设置，选不出任何格式时才退到 best，
+                    # 最后才用站点默认（有些站点没有 height/filesize 元数据）。
+                    video_info = None
+                    parse_error = None
+                    used_format = format_str
+                    for candidate in _format_candidates(format_str):
+                        if candidate is None:
+                            ydl_opts.pop('format', None)
+                        else:
+                            ydl_opts['format'] = candidate
+                        try:
+                            with YoutubeDL(ydl_opts) as ydl:
+                                video_info = ydl.extract_info(url, download=False)
+                            used_format = candidate
+                            break
+                        except Exception as exc:
+                            parse_error = exc
+                    if video_info is None:
+                        raise parse_error or DownloadError("could not read the source")
+                    if used_format != format_str:
+                        if format_str != _FALLBACK_FORMAT and max_height:
+                            _download_log(logger, (
+                                f"Max Quality ({max_height}p) matched no format on "
+                                f"this source; using the best available"))
+                        else:
+                            _download_log(logger, 'Using the site default format')
                     try:
                         estimated = estimate_download_size(video_info)
                     except Exception:
                         estimated = None
                     check_download_space(output_location, estimated)
-                    if attempts == 0:
+                    if restarts == 0:
                         log_download_choice(logger, video_info, max_height)
                     parallel = _supports_parallel_fragments(video_info)
-                    if parallel and attempts == 0:
-                        ydl_opts['concurrent_fragment_downloads'] = 4
+                    if parallel and restarts == 0:
+                        ydl_opts['concurrent_fragment_downloads'] = _fragment_concurrency(
+                            concurrency)
                         _download_log(logger, 'Download resume enabled; parallel fragments enabled')
-                    elif attempts > 0 and parallel:
+                    elif restarts > 0 and parallel:
                         _download_log(logger, 'Parallel download failed; retrying sequentially')
                     else:
                         _download_log(logger, 'Download resume enabled; sequential transfer')
@@ -1573,17 +1791,26 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                     )
                     if not has_video:
                         return True, None
+                    expected_duration = video_info.get('duration')
                     # 并行 Range 传输（Bilibili/YouTube 的整段 https 格式）：yt-dlp
                     # 对这类格式只能单连接，而 B 站按连接限速。失败即回落 yt-dlp。
+                    # generic 站点不走这条路：它的临时文件不能跨尝试续传，30 GB 的
+                    # 下载在 80% 失败会白下，yt-dlp 的 .part 才能续传。
                     if max_speed and int(max_speed) > 0:
                         _download_log(logger, 'Speed limit is set; using the standard '
                                               'resumable downloader')
-                    else:
+                    elif allow_parallel:
                         accelerated = _accelerated_download(
                             stem, output_location, video_info, logger,
                             concurrency=concurrency, chunk_size=chunk_size,
                             max_speed=max_speed)
                         if accelerated:
+                            ok, reason = verify_downloaded_media(
+                                accelerated, expected_duration, "video")
+                            if not ok:
+                                _download_log(logger, f"Download check failed: {reason}")
+                                _discard_download_output(accelerated, output_location, stem)
+                                raise DownloadError(f"download verification failed: {reason}")
                             return True, accelerated
                     with YoutubeDL(ydl_opts) as ydl:
                         info_dict = ydl.extract_info(url, download=True)
@@ -1595,32 +1822,83 @@ def download_video(url: str, filename: str, output_location: str, max_quality: s
                     # 搬移失败会清掉暂存件（见 _finalize_staged_download）。
                     _finalize_staged_download(
                         str(info_dict.get('filepath') or output_file), output_file)
+                    ok, reason = verify_downloaded_media(output_file, expected_duration, "video")
+                    if not ok:
+                        _download_log(logger, f"Download check failed: {reason}")
+                        if not verification_retried:
+                            # 完整但偏短/没有音轨：删掉重下一次，绝不让半成品进成片。
+                            verification_retried = True
+                            _discard_download_output(output_file, output_location, stem)
+                            raise DownloadError(f"download verification failed: {reason}")
+                        return False, f"download verification failed: {reason}"
                     return True, output_file
+                except PauseRequested:
+                    raise
                 except InterruptedError:
-                    # 用户在并行传输中按了 Stop：当成取消向上抛，不要走重试。
+                    # 用户在下载/并行传输中按了 Stop：当成取消向上抛，不要走重试。
+                    # 并行 Range 的取消检查也覆盖 Pause，两者从这里分流。
+                    if pause_pending():
+                        raise PauseRequested("Download paused by user.") from None
                     raise
                 except Exception as e:
                     last_error = e
-                    attempts += 1
-                    if attempts >= n_retries:
+                    restarts += 1
+                    current = _download_part_bytes(output_location, stem)
+                    if current >= last_part_bytes + FULL_DOWNLOAD_MIN_PROGRESS_BYTES:
+                        zero_progress = 0
+                        last_part_bytes = current
+                        _download_log(
+                            logger,
+                            f"Retry {restarts}/{FULL_DOWNLOAD_MAX_RESTARTS}: resuming "
+                            f"from {current / (1024 ** 2):.1f} MB")
+                    else:
+                        zero_progress += 1
+                    # 同一个坏客户端重试也不会变好：直接跳到匿名候选（见下方 append）。
+                    if (cookie_source is not None and _is_youtube_download_url(url)
+                            and _youtube_client_regression(e)):
+                        break
+                    if zero_progress >= zero_progress_limit:
+                        _download_log(
+                            logger,
+                            f"Giving up after {restarts} attempt(s) without progress")
+                        break
+                    if restarts >= FULL_DOWNLOAD_MAX_RESTARTS:
                         break
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
+            # YouTube：cookie 解析可能给出一个选不出任何视频格式的客户端结果
+            # （2026.10.21 起实测：带 Firefox cookies 时只剩图片格式，报
+            # "Requested format is not available"）。同一个错误在 resolve 层已经
+            # 有匿名回退；下载层也要有，否则 Remote Stream/Audio Cache 能解析、
+            # Full Download 却直接失败。匿名也失败时保留最后一次错误。
+            if (not anonymous_fallback_added and cookie_source is not None
+                    and last_error is not None and _is_youtube_download_url(url)
+                    and _youtube_client_regression(last_error)):
+                anonymous_fallback_added = True
+                cookie_sources.append(None)
+                _download_log(
+                    logger,
+                    "YouTube rejected the cookie-authenticated format list; "
+                    "retrying the download without cookies")
     return False, str(last_error) if last_error else "download failed"
 
 
-def download_audio(url: str, filename: str, output_location: str, max_speed: int, logger, n_retries: int = 10, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None) -> Tuple[bool, str]:
+def download_audio(url: str, filename: str, output_location: str, max_speed: int, logger, n_retries: int = 5, browser_cookies: str | None = None, concurrency: int | None = None, chunk_size: int | None = None, allow_parallel: bool = True) -> Tuple[bool, str]:
     logger.reset_total_progress(100)
 
     os.makedirs(output_location, exist_ok=True)
     # 同 download_video：名字主干先按 MAX_PATH 截短，yt-dlp 直接下到目标目录。
     stem = capped_download_stem(output_location, filename)
     last_error = None
+    zero_progress_limit = max(1, int(n_retries))
+    verification_retried = False
     # 同 download_video：devnull 显式 UTF-8 + replace，标题含本地代码页编不了的
     # 字符时不能让 yt-dlp 的输出把整个下载炸掉。
     with open(os.devnull, 'w', encoding='utf-8', errors='replace') as devnull:
-        for cookie_source in _download_cookie_candidates(browser_cookies):
+        cookie_sources = _download_cookie_candidates(browser_cookies)
+        anonymous_fallback_added = None in cookie_sources
+        for cookie_source in cookie_sources:
             ydl_opts = {
                 # 同 download_video：outtmpl 落到目标目录，不再是进程工作目录。
                 'outtmpl': os.path.join(output_location, f"{stem}.%(ext)s"),
@@ -1632,16 +1910,20 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                'progress_hooks': [logger.hook],
+                'progress_hooks': [_cancel_aware_hook(getattr(logger, "hook", None))],
                 'ffmpeg_location': FFMPEG_PATH
             }
-            ydl_opts.update(_download_transfer_options(n_retries))
+            ydl_opts.update(_download_transfer_options(
+                max(int(n_retries), FULL_DOWNLOAD_YTDLP_RETRIES)))
             ydl_opts.update(_download_ydl_options(cookie_source, url=url))
             if max_speed > 0:
                 ydl_opts['limit_rate'] = f"{max_speed}K"
-            attempts = 0
-            while attempts < n_retries:
-                if attempts > 0:
+            restarts = 0
+            zero_progress = 0
+            last_part_bytes = _download_part_bytes(output_location, stem)
+            while restarts < FULL_DOWNLOAD_MAX_RESTARTS:
+                if restarts > 0:
+                    _wait_before_download_retry(restarts)
                     ydl_opts.pop('concurrent_fragment_downloads', None)
                 old_stdout = sys.stdout
                 old_stderr = sys.stderr
@@ -1656,24 +1938,34 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                         except Exception:
                             estimated = None
                         check_download_space(output_location, estimated)
-                        if attempts == 0:
+                        if restarts == 0:
                             log_download_choice(logger, metadata, None)
-                        if _supports_parallel_fragments(metadata) and attempts == 0:
-                            ydl_opts['concurrent_fragment_downloads'] = 4
+                        parallel = _supports_parallel_fragments(metadata)
+                        if parallel and restarts == 0:
+                            ydl_opts['concurrent_fragment_downloads'] = _fragment_concurrency(
+                                concurrency)
                             _download_log(logger, 'Download resume enabled; parallel fragments enabled')
-                        elif attempts > 0:
+                        elif restarts > 0:
                             _download_log(logger, 'Parallel download failed; retrying sequentially')
                         else:
                             _download_log(logger, 'Download resume enabled; sequential transfer')
+                        expected_duration = metadata.get('duration')
                         if max_speed and int(max_speed) > 0:
                             _download_log(logger, 'Speed limit is set; using the standard '
                                                   'resumable downloader')
-                        else:
+                        elif allow_parallel:
                             accelerated = _accelerated_audio_download(
                                 stem, output_location, metadata, logger, ydl_opts,
                                 concurrency=concurrency, chunk_size=chunk_size,
                                 max_speed=max_speed)
                             if accelerated:
+                                ok, reason = verify_downloaded_media(
+                                    accelerated, expected_duration, "audio")
+                                if not ok:
+                                    _download_log(logger, f"Download check failed: {reason}")
+                                    _discard_download_output(accelerated, output_location, stem)
+                                    raise DownloadError(
+                                        f"download verification failed: {reason}")
                                 return True, accelerated
                         info_dict = ydl.extract_info(url, download=True)
                         file_ext = ydl.params['postprocessors'][0].get(
@@ -1681,18 +1973,61 @@ def download_audio(url: str, filename: str, output_location: str, max_speed: int
                         output_file = os.path.join(output_location, f"{stem}.{file_ext}")
                         _finalize_staged_download(
                             str(info_dict.get('filepath') or output_file), output_file)
+                        ok, reason = verify_downloaded_media(
+                            output_file, expected_duration, "audio")
+                        if not ok:
+                            _download_log(logger, f"Download check failed: {reason}")
+                            if not verification_retried:
+                                verification_retried = True
+                                _discard_download_output(output_file, output_location, stem)
+                                raise DownloadError(
+                                    f"download verification failed: {reason}")
+                            return False, f"download verification failed: {reason}"
                         return True, output_file
+                except PauseRequested:
+                    raise
                 except InterruptedError:
-                    # 同 download_video：并行传输中的 Stop 是取消，不是失败。
+                    # 同 download_video：下载中的 Stop 是取消，不是失败；暂停则
+                    # 保留 .part 等 Resume。
+                    if pause_pending():
+                        raise PauseRequested("Download paused by user.") from None
                     raise
                 except Exception as e:
                     last_error = e
-                    attempts += 1
-                    if attempts >= n_retries:
+                    restarts += 1
+                    current = _download_part_bytes(output_location, stem)
+                    if current >= last_part_bytes + FULL_DOWNLOAD_MIN_PROGRESS_BYTES:
+                        zero_progress = 0
+                        last_part_bytes = current
+                        _download_log(
+                            logger,
+                            f"Retry {restarts}/{FULL_DOWNLOAD_MAX_RESTARTS}: resuming "
+                            f"from {current / (1024 ** 2):.1f} MB")
+                    else:
+                        zero_progress += 1
+                    # 同 download_video：坏客户端不重试，直接去匿名候选。
+                    if (cookie_source is not None and _is_youtube_download_url(url)
+                            and _youtube_client_regression(e)):
+                        break
+                    if zero_progress >= zero_progress_limit:
+                        _download_log(
+                            logger,
+                            f"Giving up after {restarts} attempt(s) without progress")
+                        break
+                    if restarts >= FULL_DOWNLOAD_MAX_RESTARTS:
                         break
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
+            if (not anonymous_fallback_added and cookie_source is not None
+                    and last_error is not None and _is_youtube_download_url(url)
+                    and _youtube_client_regression(last_error)):
+                anonymous_fallback_added = True
+                cookie_sources.append(None)
+                _download_log(
+                    logger,
+                    "YouTube rejected the cookie-authenticated audio formats; "
+                    "retrying the download without cookies")
     return False, str(last_error) if last_error else "download failed"
 
 
