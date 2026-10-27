@@ -239,6 +239,27 @@ class SourceResolveError(RemoteMediaError):
     """A single source could not be resolved."""
 
 
+class KnownPlatformFallbackError(SourceResolveError):
+    """A Bilibili/YouTube/Twitch URL came back through yt-dlp's generic extractor.
+
+    That almost always means the platform extractor needed a signed-in session (age,
+    region, subscriber-only, login) and yt-dlp fell back to the generic webpage parser.
+    It is not a real generic site, so the caller must not treat it as one.
+    """
+
+    def __init__(self, url: str, family: str):
+        label = _KNOWN_PLATFORM_LABELS.get(family, family.title())
+        super().__init__(
+            f"{url} is a {label} video, but yt-dlp returned its generic extractor. "
+            f"This usually means the page needs a logged-in session (age, region, or "
+            f"login). Configure Remote Browser Cookies (Firefox/Chrome/Edge) or a "
+            f"cookies.txt file in Remote Settings and add the URL again. Switching to "
+            f"Full Download would only download the generic fallback, not the normal "
+            f"{label} stream.")
+        self.url = url
+        self.family = family
+
+
 class LiveBroadcastError(SourceResolveError):
     """The URL points at an ongoing broadcast instead of a finished replay.
 
@@ -4378,6 +4399,103 @@ def _is_bilibili_url(url: str) -> bool:
 
 
 _YOUTUBE_HOST_MARKERS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+_KNOWN_PLATFORM_LABELS = {
+    "bilibili": "Bilibili",
+    "youtube": "YouTube",
+    "twitch": "Twitch",
+}
+_LOCALE_PREFIX_RE = re.compile(r"^/[A-Za-z]{2}(?:-[A-Za-z]{2})?/")
+
+
+def _strip_known_locale_prefix(path: str, markers: tuple[str, ...]) -> str:
+    """Drop a leading ``/en/`` / ``/zh-CN/`` before a known video marker.
+
+    Bilibili switches its URL shape with the site language: an English-locale video is
+    ``/en/video/BV...``. yt-dlp's BiliBili extractor only matches ``/video/BV...``, so
+    without this normalisation it falls back to the generic extractor and the source is
+    classified as a generic site. The same prefix appears in saved timestamps, which is
+    why a review/compile could leave an ``/en`` URL behind.
+    """
+    match = _LOCALE_PREFIX_RE.match(path or "")
+    if match and path[match.end():].lower().startswith(markers):
+        return path[match.end() - 1:]
+    return path
+
+
+def canonical_known_platform_url(url: str) -> str:
+    """Remove a locale prefix from Bilibili/YouTube/Twitch video URLs."""
+    try:
+        parsed = urlsplit(str(url or ""))
+    except ValueError:
+        return str(url or "")
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if not host:
+        return str(url or "")
+    if _is_bilibili_url(url):
+        path = _strip_known_locale_prefix(
+            path, ("video/", "festival/", "bangumi/", "medialist/", "list/"))
+    elif _is_youtube_url(url):
+        path = _strip_known_locale_prefix(
+            path, ("watch", "shorts/", "live/", "embed/"))
+    elif host == "twitch.tv" or host.endswith(".twitch.tv"):
+        path = _strip_known_locale_prefix(path, ("videos/", "clip/", "v/"))
+    if path == parsed.path:
+        return str(url or "")
+    return urlunsplit((parsed.scheme, parsed.netloc, path,
+                       parsed.query, parsed.fragment))
+
+
+def _known_platform_video_family(url: str) -> str | None:
+    """Return ``bilibili``/``youtube``/``twitch`` for a known-platform video URL.
+
+    Only video-like paths are classified. Channel pages, articles and directories are
+    deliberately left alone: those may legitimately resolve through the generic
+    extractor, and treating them as login failures would be wrong. Locale prefixes such
+    as ``/en/video/`` are normalised first.
+    """
+    url = canonical_known_platform_url(url)
+    try:
+        parsed = urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if not host:
+        return None
+    if _is_bilibili_url(url):
+        if host == "b23.tv" or path.startswith(("/video/", "/festival/", "/bangumi/",
+                                                "/medialist/", "/list/")):
+            return "bilibili"
+    if _is_youtube_url(url):
+        if host == "youtu.be" or path.startswith(("/watch", "/shorts/", "/live/",
+                                                  "/embed/")):
+            return "youtube"
+    if host == "twitch.tv" or host.endswith(".twitch.tv") or host == "clips.twitch.tv":
+        if (host == "clips.twitch.tv"
+                or path.startswith(("/videos/", "/clip/", "/v/"))
+                or "/clip/" in path):
+            return "twitch"
+    return None
+
+
+def known_platform_video_family(url: str) -> str | None:
+    """Public form of :func:`_known_platform_video_family` for UI error text."""
+    return _known_platform_video_family(url)
+
+
+def _reject_known_platform_generic(url: str, info: Mapping[str, Any]) -> None:
+    """Raise when a known video URL resolved through yt-dlp's generic extractor."""
+    family = _known_platform_video_family(url)
+    if family is None:
+        return
+    platform = str(info.get("extractor_key") or info.get("extractor") or "").casefold()
+    # Only an explicit generic extractor is a fallback. A missing key appears in
+    # lightweight/fake info mappings and in hydrated test data; production yt-dlp
+    # always names the extractor, and treating a missing key as generic would reject
+    # perfectly usable hydrated entries.
+    if platform in {"generic", "unknown"}:
+        raise KnownPlatformFallbackError(str(url), family)
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -4543,35 +4661,71 @@ def _extract_with_cookie_policy(
     extract_flat: bool = False,
     resolve_timeout: float = 90,
 ) -> Mapping[str, Any]:
+    url = canonical_known_platform_url(url)
     normalized = _normalize_browser_cookies(browser_cookies)
     if normalized not in (None, "auto"):
         try:
-            return _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat,
+            info = _extract_info(url, ydl_factory, normalized, extract_flat=extract_flat,
                                  resolve_timeout=resolve_timeout)
+            _reject_known_platform_generic(url, info)
+            return info
         except SourceResolveError as exc:
             # YouTube 带 cookie 的解析被客户端改坏时（yt-dlp #17389 的 page-reload，
             # 以及 2026.10.21 起 tv_samsung 默认客户端给出的 "format not available"），
             # 公开视频匿名解析正常——回退匿名重试一次；仍失败则抛原始错误
             # （cookie 那条失败原因更具体）。
-            if _is_youtube_url(url) and _is_youtube_client_regression_error(exc):
+            if (_is_youtube_url(url) and _is_youtube_client_regression_error(exc)
+                    and not isinstance(exc, KnownPlatformFallbackError)):
                 try:
-                    return _extract_info(url, ydl_factory, None, extract_flat=extract_flat,
+                    info = _extract_info(url, ydl_factory, None, extract_flat=extract_flat,
                                          resolve_timeout=resolve_timeout)
+                    _reject_known_platform_generic(url, info)
+                    return info
                 except SourceResolveError:
                     raise exc
             raise
 
     try:
-        return _extract_info(url, ydl_factory, extract_flat=extract_flat,
+        info = _extract_info(url, ydl_factory, extract_flat=extract_flat,
                              resolve_timeout=resolve_timeout)
+        _reject_known_platform_generic(url, info)
+        return info
+    except KnownPlatformFallbackError as fallback_error:
+        # ``None`` means "never read browser cookies"; honour that and report the
+        # login/age hint instead of silently falling back. ``auto`` retries every
+        # configured browser before giving up.
+        if normalized is None:
+            raise
+        failures = []
+        for browser in _BROWSER_COOKIE_NAMES:
+            try:
+                info = _extract_info(url, ydl_factory, browser, extract_flat=extract_flat,
+                                     resolve_timeout=resolve_timeout)
+                _reject_known_platform_generic(url, info)
+                return info
+            except SourceResolveError as exc:
+                failures.append(_short_cookie_failure(browser, exc))
+                if _cookie_failure_should_print(browser, url):
+                    print(f"Remote browser cookies failed ({url}): {failures[-1]}")
+        label = _KNOWN_PLATFORM_LABELS.get(fallback_error.family,
+                                           fallback_error.family.title())
+        detail = "; ".join(failures)
+        raise SourceResolveError(
+            f"Could not resolve the {label} video {url} even with browser cookies"
+            + (f": {detail}" if detail else "")
+            + ". Sign-in appears to be required; configure Remote Browser Cookies "
+              "(Firefox/Chrome/Edge) or a cookies.txt file in Remote Settings."
+        ) from fallback_error
     except SourceResolveError as initial_error:
         if not _should_auto_use_cookies(url, initial_error):
             raise
         failures = []
         for browser in _BROWSER_COOKIE_NAMES:
             try:
-                return _extract_info(url, ydl_factory, browser, extract_flat=extract_flat,
+                info = _extract_info(url, ydl_factory, browser, extract_flat=extract_flat,
                                      resolve_timeout=resolve_timeout)
+                _reject_known_platform_generic(url, info)
+                return info
             except SourceResolveError as exc:
                 failures.append(_short_cookie_failure(browser, exc))
                 if _cookie_failure_should_print(browser, url):
@@ -5246,7 +5400,8 @@ def _source_from_info(url: str, info: Mapping[str, Any], max_height: int | None 
             "then process the replay URL (e.g. twitch.tv/videos/<id>).")
 
     platform = str(info.get("extractor_key") or info.get("extractor") or "unknown").lower()
-    source_url = str(info.get("webpage_url") or info.get("original_url") or url)
+    source_url = canonical_known_platform_url(
+        str(info.get("webpage_url") or info.get("original_url") or url))
     source_id = str(info.get("id") or "")
     duration = info.get("duration")
     try:
@@ -5319,7 +5474,10 @@ def source_from_hydrated_entry(entry: PlaylistEntry, max_height: int | None = No
     if not isinstance(info, Mapping):
         raise SourceResolveError(f"Source was not hydrated: {entry.webpage_url}")
     info = dict(info)
-    info.setdefault("webpage_url", entry.webpage_url)
+    page_url = canonical_known_platform_url(entry.webpage_url)
+    # Force the canonical page URL: _resolved_info may have saved the English-locale
+    # /en/video/... form, and setdefault would keep it as source_url/timestamps.
+    info["webpage_url"] = page_url
     info.setdefault("id", entry.entry_id)
     if info.get("_type") in ("playlist", "multi_video"):
         raise SourceResolveError(f"Source is a playlist, not a single VOD: {entry.webpage_url}")
@@ -5327,11 +5485,14 @@ def source_from_hydrated_entry(entry: PlaylistEntry, max_height: int | None = No
         raise SourceResolveError(
             f"Source metadata is not resolvable without a fresh extraction: {entry.webpage_url}"
         )
-    source = _source_from_info(entry.webpage_url, info, max_height)
+    source = _source_from_info(page_url, info, max_height)
     if not (source.audio_url or source.video_url):
         raise SourceResolveError(
-            f"Source has no usable stream URLs: {entry.webpage_url}"
+            f"Source has no usable stream URLs: {page_url}"
         )
+    family = _known_platform_video_family(page_url)
+    if family and str(source.platform or "").casefold() == "generic":
+        raise KnownPlatformFallbackError(page_url, family)
     return source
 
 
@@ -5382,7 +5543,7 @@ def resolve_source(
     max_height: int | None = None,
 ) -> MediaSource:
     """Resolve one VOD with yt-dlp metadata extraction only."""
-    value = url.strip()
+    value = canonical_known_platform_url(url.strip())
     if not value:
         raise SourceResolveError("Cannot resolve an empty source URL")
     try:
@@ -5390,6 +5551,9 @@ def resolve_source(
     except ValueError as exc:
         raise SourceResolveError(str(exc)) from exc
     source = _source_from_info(value, info)
+    family = _known_platform_video_family(value)
+    if family and str(source.platform or "").casefold() == "generic":
+        raise KnownPlatformFallbackError(value, family)
     return apply_video_quality_limit(source, max_height)
 
 

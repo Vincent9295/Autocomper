@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
@@ -74,7 +74,7 @@ from remote_media import (MediaSource, PCM_SCAN_SAMPLE_RATE, fetch_audio_cache, 
                            stable_source_id, SourceResolveError,
                            LiveBroadcastError,
                            source_is_generic, source_display_platform,
-                           is_known_platform,
+                           is_known_platform, known_platform_video_family,
                            apply_video_quality_limit,
                            resolve_cached_audio,
                            source_from_hydrated_entry,
@@ -2350,27 +2350,15 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             # completed 长时间不增长。每 120s 检查一次，若无进展则打印一次
             # 已收集的失败摘要（Could not fetch ... interval X-Y: <error>），
             # 让用户能看到卡在哪、为什么失败，而不刷屏（仅停滞时打印一次）。
+            # 必须用带 timeout 的 wait 轮询，而不是无 timeout 的 as_completed：
+            # 所有 worker 同时卡住时 as_completed 永远不返回，Cancel 和这条
+            # 120s 提示都永远不会执行（用户实测 Preparing clips 卡一小时）。
             _last_stall_check = time.monotonic()
             _last_completed = 0
             _stall_notified = False
-            for future in as_completed(futures):
-                if cancel_pending():
-                    # 取消：丢弃排队中的任务并立刻退出循环（with 退出的
-                    # shutdown(wait=True) 只需等当前在跑的 attempt 收尾——
-                    # fetch_task 的入口检查会让队列瞬间排空）。
-                    for pending in futures:
-                        pending.cancel()
-                    raise InterruptedError("Operation cancelled by user.")
-                key = futures[future]
-                try:
-                    result = future.result()
-                except Exception:
-                    result = None
-                if result is not None:
-                    results_by_task[key] = result
-                # 停滞检测：completed 已含成功+失败。若 120s 无任何进展，
-                # 打印已记录的失败摘要（这些失败正在被 refresh 重试或已静默记录）。
-                now = time.monotonic()
+
+            def report_stall(now):
+                nonlocal _last_stall_check, _last_completed, _stall_notified
                 with completed_lock:
                     current = state["completed"]
                 if now - _last_stall_check >= 120.0:
@@ -2381,17 +2369,17 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                             f"{Fore.YELLOW}No remote clip progress for 120s "
                             f"({current}/{state['total']} clips finished).")
                         with in_flight_lock:
-                            pending = sorted(
+                            in_flight_items = sorted(
                                 in_flight.values(),
                                 key=lambda item: item["order"])
-                        for meta in pending[:5]:
+                        for meta in in_flight_items[:5]:
                             print(
                                 f"{Fore.YELLOW}  still downloading: video "
                                 f"{meta['video']}/{meta['videos_total']} · clip "
                                 f"{meta['clip']}/{meta['clips_total']} · Range "
                                 f"{meta['start']:g}-{meta['end']:g}s"
                                 f"{Style.RESET_ALL}")
-                        if pending:
+                        if in_flight_items:
                             print(
                                 f"{Fore.YELLOW}  (a clip stuck here is abandoned by "
                                 f"its stall watchdog and retried; see the heartbeat "
@@ -2402,6 +2390,27 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                 elif current != _last_completed:
                     _last_completed = current
                     _stall_notified = False
+
+            pending = set(futures)
+            while pending:
+                if cancel_pending():
+                    # 取消：丢弃排队中的任务并立刻退出循环（with 退出的
+                    # shutdown(wait=True) 只需等当前在跑的 attempt 收尾——
+                    # fetch_task 的入口检查会让队列瞬间排空）。
+                    for item in pending:
+                        item.cancel()
+                    raise InterruptedError("Operation cancelled by user.")
+                done, pending = wait(pending, timeout=1.0,
+                                     return_when=FIRST_COMPLETED)
+                for future in done:
+                    key = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception:
+                        result = None
+                    if result is not None:
+                        results_by_task[key] = result
+                report_stall(time.monotonic())
 
     materialized = []
     for kind, payload in result_plan:
@@ -8485,6 +8494,17 @@ class VideoProcessorApp:
                 listed = ", ".join(unsupported_generic[:5])
                 if len(unsupported_generic) > 5:
                     listed += f" (+{len(unsupported_generic) - 5} more)"
+                cookie_urls = [value for value in unsupported_generic
+                               if known_platform_video_family(value)]
+                if cookie_urls:
+                    raise Exception(
+                        "These Bilibili/YouTube/Twitch URLs were resolved through "
+                        "yt-dlp's generic extractor, which usually means the video "
+                        "needs a logged-in session (age, region, or login): "
+                        f"{listed}. Configure Remote Browser Cookies (Firefox/Chrome/"
+                        "Edge) or a cookies.txt file and add them again; switching "
+                        "to Full Download would only download the generic fallback, "
+                        "not the normal platform stream.")
                 raise Exception(GENERIC_MODE_REJECTION.format(urls=listed))
             detection_size = detection_block_size(self.remote_mode.get(), block_size)
             if self.remote_mode.get() == "Remote Stream":
