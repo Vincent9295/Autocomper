@@ -490,7 +490,8 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
                          stall_timeout=None, progress_stall_timeout=None,
                          heartbeat_label=None, heartbeat_interval=60.0,
                          heartbeat_verb="encoding", heartbeat_stall_threshold=0.0,
-                         heartbeat_hint=None):
+                         heartbeat_hint=None, first_output_timeout=None,
+                         stall_message=None):
     """Run FFmpeg while forwarding its machine-readable progress output.
 
     ``stall_timeout`` (seconds) adds a no-data watchdog: if FFmpeg produces no
@@ -498,6 +499,25 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
     and ``RemoteAudioStallError`` is raised so callers can refresh and retry
     instead of hanging forever. Reads happen on a daemon thread so a silent
     process can never block the timeout check.
+
+    ``first_output_timeout`` (seconds) is a **startup grace** for the phase
+    before FFmpeg's first progress line. Some legitimate work is completely
+    silent: a clip fetch must open the inputs, seek, and decode from the
+    previous keyframe up to the clip start (measured on a real 1080p60 YouTube
+    VOD: 12-13 s of silence at concurrency 1, 28-35 s at concurrency 6), and a
+    local batch merge may stall on a loaded disk. With a 30 s watchdog those
+    healthy jobs were killed and retried as if the URL had expired (round 57:
+    31 of 36 failed clips were exactly that). Once the first line arrives the
+    normal ``stall_timeout`` applies again, so a wedged process is still killed
+    - only later. The queue read is the wake-up timer, so the wait stays
+    bounded: no line for ``max(stall_timeout, first_output_timeout)`` seconds
+    kills the process exactly like today, just after a longer, bounded grace.
+    ``None`` keeps the old behaviour (grace == ``stall_timeout``).
+
+    ``stall_message`` optionally overrides the message of the no-output error
+    (``{seconds}`` is replaced with the timeout that expired). Compile passes a
+    local-files wording because "remote URL likely expired" is wrong for a
+    local merge.
 
     ``progress_stall_timeout`` (seconds) adds a second watchdog on the *content*:
     progress lines that keep arriving while ``out_time`` never advances are
@@ -535,22 +555,44 @@ def run_tracked_progress(cmd, duration=None, timeout=None, progress_callback=Non
         # 主循环非阻塞等待，FFmpeg 在 CDN 半开连接上挂起时（无输出）能在
         # stall_timeout 后 kill，而不是永远阻塞 timeout 检查。
         effective_stall = stall_timeout if (stall_timeout is not None and stall_timeout > 0) else 30
+        # 启动宽限：首行输出之前的合法静默（打开输入/seek/从关键帧解码到 clip 起点、
+        # 本地大批次合并时的磁盘抖动）比"帧间停滞"长得多。不传就等于旧的 30s 行为。
+        try:
+            grace = float(first_output_timeout)
+        except (TypeError, ValueError):
+            grace = 0.0
+        if grace <= 0:
+            grace = effective_stall
         return _run_progress_with_stall(p, state, output, duration,
                                         progress_callback, started_at,
                                         timeout, effective_stall, command,
                                         progress_stall_timeout,
                                         heartbeat_label, heartbeat_interval,
                                         heartbeat_verb, heartbeat_stall_threshold,
-                                        heartbeat_hint)
+                                        heartbeat_hint,
+                                        first_output_timeout=grace,
+                                        stall_message=stall_message)
     finally:
         _ACTIVE_PROCS.discard(p)
+
+
+def _no_output_stall_message(template, seconds):
+    """Message for the no-output watchdog; ``template`` may carry ``{seconds}``."""
+    if template:
+        try:
+            return str(template).format(seconds=float(seconds))
+        except (KeyError, IndexError, ValueError, TypeError):
+            return str(template)
+    return (f"No data from FFmpeg for {seconds:g}s; remote URL likely "
+            f"expired or the connection hung")
 
 
 def _run_progress_with_stall(p, state, output, duration, progress_callback,
                              started_at, timeout, stall_timeout, command,
                              progress_stall_timeout=None, heartbeat_label=None,
                              heartbeat_interval=60.0, heartbeat_verb="encoding",
-                             heartbeat_stall_threshold=0.0, heartbeat_hint=None):
+                             heartbeat_stall_threshold=0.0, heartbeat_hint=None,
+                             first_output_timeout=None, stall_message=None):
     import queue as _queue
     import threading as _threading
 
@@ -572,23 +614,35 @@ def _run_progress_with_stall(p, state, output, duration, progress_callback,
     last_advance_at = time.monotonic()
     last_progress_value = None
     last_heartbeat = time.monotonic()
+    seen_output = False
     try:
         while True:
             if cancel_pending():
                 p.kill()
                 raise InterruptedError("Operation cancelled by user.")
+            # 首个进度行之前用启动宽限（合法的静默：打开输入/seek/从关键帧解到
+            # clip 起点；本地合并时是磁盘/内存抖动），首行之后回到 stall_timeout。
+            # 两种情况的等待都是有界的：items.get 就是唯一的唤醒计时器。
+            pending_timeout = stall_timeout
+            if not seen_output and first_output_timeout and first_output_timeout > 0:
+                pending_timeout = max(float(stall_timeout), float(first_output_timeout))
             try:
-                item = items.get(timeout=stall_timeout)
+                item = items.get(timeout=pending_timeout)
             except _queue.Empty:
                 p.kill()
                 from sound_reader import RemoteAudioStallError
                 raise RemoteAudioStallError(
-                    f"No data from FFmpeg for {stall_timeout:g}s; remote URL likely "
-                    f"expired or the connection hung")
+                    _no_output_stall_message(stall_message, pending_timeout))
             if item is None:
                 break
             if isinstance(item, BaseException):
                 raise item
+            if not seen_output:
+                seen_output = True
+                # FFmpeg 的第一行经常是 `out_time_ms=N/A, frame=0`（还没有输出帧），
+                # 它不会进下面的 out_time 推进分支。宽限期满前刚到的这一行如果不
+                # 归零进度停滞计时器，就可能紧接着被 progress_stall_timeout 误判。
+                last_advance_at = time.monotonic()
             text_line = item.decode("utf-8", errors="replace").strip()
             output.append(text_line)
             if "=" in text_line:

@@ -100,6 +100,19 @@ _SHORT_SEGMENT_TOLERANCE = 0.3
 # ——这正是"偶尔一个片段画面冻住/糊掉"能进成片的路径。放宽到 240 秒后，一个片段仍最多重试
 # allowed_attempts 次（次数上限没变，由调用方的 retries 决定），只是不再被墙钟提前掐死。
 _SEGMENT_FAIL_BUDGET_SECONDS = 240.0
+# clip 取回的"首行输出"启动宽限（秒）。ffmpeg 必须先打开输入、按 -ss 定位、再从
+# 上一个关键帧一路解码到 clip 起点，这段工作它**一行都不打印**（round 57 实测，
+# 1080p60 的 YouTube VOD：单并发 12-13 秒静默，用户设置的 6 并发 28-35 秒），
+# 而原来的 30 秒无输出看门狗正好压在这条线上：健康 clip 被当成"URL 过期"杀掉
+# 再重试，日志里 31/36 个失败 clip 都是这么来的。首行到达后仍按调用方的
+# stall_timeout（30s）判定，真的挂死照样被杀，只是判死点推后到 120 秒。
+_SEGMENT_FIRST_OUTPUT_TIMEOUT = 120.0
+# clip 取回是"解码 -> 裁剪 -> 重编码"的短任务，但 ffmpeg 默认会按分辨率开
+# 十几个编解码线程。用户把 Max Download Concurrency 设到 6 时就是 6×十几 个
+# 线程抢 8 个逻辑核，每个 clip 的静默期被拖长 2-3 倍（round 57 实测：单并发
+# 12-13s，6 并发 28-35s）。compile 一直用 -threads 2 限制自己，这里对齐。
+# 注意：这只是每进程上限，不改变并发数；慢线路上的总吞吐由并发 x 带宽决定。
+_SEGMENT_THREADS = "2"
 _short_delivery_records: list[dict[str, Any]] = []
 _short_delivery_lock = threading.Lock()
 
@@ -2000,6 +2013,9 @@ def build_segment_command(
         "-hide_banner",
         "-loglevel",
         "error",
+        # 解码线程上限（见 _SEGMENT_THREADS 的实测记录）。
+        "-threads",
+        _SEGMENT_THREADS,
         "-ss",
         seek_text,
         "-t",
@@ -2063,6 +2079,9 @@ def build_segment_command(
         if codec:
             command.extend(["-c:v", str(codec)])
     command.extend([
+        # 编码线程上限（见 _SEGMENT_THREADS）。这一处位于输出位置，作用于编码器；
+        # 命令开头那一处作用于解码器。
+        "-threads", _SEGMENT_THREADS,
         "-avoid_negative_ts", "make_zero",
         "-reset_timestamps", "1",
     ])
@@ -3754,6 +3773,9 @@ def fetch_segment(
         return run_tracked_progress(
             command, duration=expected_duration, timeout=timeout,
             progress_callback=report, stall_timeout=stall_timeout,
+            # 首行输出前的合法静默（seek + 从上一个关键帧解到 clip 起点）比帧间
+            # 停滞长得多，见 _SEGMENT_FIRST_OUTPUT_TIMEOUT 的实测记录。
+            first_output_timeout=_SEGMENT_FIRST_OUTPUT_TIMEOUT,
             # "Preparing clips"（materialize 下载）阶段的卡死：ffmpeg 仍在按
             # 0.5s 打 progress、out_time 却不动时，原有"30s 无输出"看门狗永远
             # 不触发，界面就停在 "Preparing clips: n/N · ETA 00:00"（测试者反馈）。

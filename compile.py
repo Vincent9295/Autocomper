@@ -33,6 +33,19 @@ MERGE_THRESHOLD = 2  # seconds
 # 回退/失败路径。判定完全在后台，不打日志（批量编译阶段进度卡已在刷新）。
 _PROGRESS_STALL_TIMEOUT = 240.0
 
+# 本地编码/合并的"无输出"判死线（秒）。compile 的输入全是本地文件，而
+# run_tracked_progress 的默认无输出看门狗是 30 秒（远端音频读的语义）。实测
+# 一次 1080p 批次合并会在内存吃紧时（用户日志：可用 815 MB、两个并行 worker
+# 各预留 1.8 GB）静默几十秒——磁盘页面文件抖动、杀软扫描大文件、NVENC 会话
+# 排队都会这样。30 秒判死会把已经跑了几小时的编译整轮丢掉（round 57 用户日志
+# temp.txt："Batch 2 of layer 1 failed ... No data from FFmpeg for 30s"）。
+# 240 秒与"进度不前进"看门狗同一个量级，且真的楔死仍然会被杀掉（有界）。
+_LOCAL_NO_OUTPUT_TIMEOUT = 240.0
+_LOCAL_STALL_MESSAGE = (
+    "FFmpeg produced no output for {seconds:g}s while working on local files "
+    "(disk, free memory, antivirus scanning a large output or a stuck GPU driver "
+    "can cause this)")
+
 # 第一层 concat 产物允许的 A/V 偏差：超过它就重封对齐（正常批次 ±5ms，
 # 出问题的批次 ~75ms）。阈值取 30ms，避免为每批都做一次多余的重封。
 _BATCH_ALIGN_TOLERANCE = 0.03
@@ -87,7 +100,39 @@ def _run_ffmpeg(command, timeout, progress_callback=None, duration=None, stage="
         # 每 60s 刷一行没有信息量（用户要求去掉）；心跳只保留在下载阶段
         # （Preparing clips，每个 clip 都是短任务，卡住需要立刻可见）。
         progress_stall_timeout=_PROGRESS_STALL_TIMEOUT,
+        # 本地任务没有"远端 URL 过期"这回事：判死线放到 240s，并用本地文案
+        # （见 _LOCAL_NO_OUTPUT_TIMEOUT / _LOCAL_STALL_MESSAGE）。
+        stall_timeout=_LOCAL_NO_OUTPUT_TIMEOUT,
+        stall_message=_LOCAL_STALL_MESSAGE,
     )
+
+
+def _is_no_output_stall(exc) -> bool:
+    """Is this the "FFmpeg produced no output for N seconds" stall?
+
+    ``run_tracked_progress`` raises ``sound_reader.RemoteAudioStallError`` (a
+    plain ``Exception``, not ``TimeoutExpired``) so the existing NVENC→x264
+    fallback does not catch it. Compile is entirely local work: a silent FFmpeg
+    here means a disk/RAM/antivirus/driver hiccup, which is worth a retry
+    instead of throwing away a compile that has already run for hours.
+    Lazy import: sound_reader imports utils, and compile must not import it at
+    module level (see the same note in ``_ffmpeg_cut``).
+    """
+    from sound_reader import RemoteAudioStallError
+    return isinstance(exc, RemoteAudioStallError)
+
+
+def _retry_codec_after_stall(video_codec):
+    """Codec list to retry a stalled local encode with.
+
+    A stall is usually not the encoder's fault, so the same codec is retried;
+    only NVENC gets the (already existing) fallback to libx264, which is what a
+    stuck NVENC session needs.
+    """
+    if 'h264_nvenc' in video_codec:
+        _fallback_to_x264()
+        return list(_X264_CODEC)
+    return list(video_codec)
 
 
 def clip_safe_end(duration, entry=None):
@@ -1131,6 +1176,20 @@ def _ffmpeg_concat(file_list, output_file, res=None, normalize=False, fps=None,
             raise
         # NVENC 卡死（如睡眠唤醒后驱动死锁）：永久回退 x264 重试一次
         result = None
+    except Exception as exc:                                      # noqa: BLE001
+        # 本地合并"一段时间没有任何输出"（磁盘/内存/杀软/驱动卡顿）以前会直接
+        # 冒到批次层，把整轮编译判死——compile 没有断点续传，用户得从零重跑。
+        # 它不是远端 URL 问题，也没有理由不重试：这里按"可重试的卡顿"处理。
+        if not _is_no_output_stall(exc):
+            raise
+        if pause_or_cancel(cancel_pending):
+            raise InterruptedError("Compile cancelled by user.")
+        print(f"{Fore.YELLOW}Merge produced no output for a while ({exc}); "
+              f"retrying this merge once.{Style.RESET_ALL}")
+        video_codec = _retry_codec_after_stall(video_codec)
+        result = _run_ffmpeg(build_cmd(video_codec), timeout=concat_timeout,
+                             progress_callback=progress_callback, duration=progress_dur,
+                             stage="Final merge")
     if result is None or (result.returncode != 0 and 'h264_nvenc' in video_codec):
         # 同上：取消导致的失败不是 NVENC 故障，禁止整段合并的 x264 重试。
         # 上一次编码已经结束，这里是任务边界，暂停在此等待。
@@ -1633,6 +1692,24 @@ def _ffmpeg_concat_batched(file_list, output_file, res=None, normalize=False, ba
                                  "merge", progress_note=note,
                                  progress_callback=progress_callback,
                                  budget_fraction=_MERGE_MEMORY_HEADROOM)
+        if failures and all(_is_no_output_stall(error) for _task, error in failures):
+            # 本层的失败全是"本地 FFmpeg 无输出卡顿"（磁盘/内存/杀软抖动）：
+            # 这些批次是健康的，只是那一刻机器给不出 CPU/IO。旧行为是整轮编译
+            # 失败（用户要从零重跑），现在**串行**再试一次——不与其它批次抢资源。
+            print(f"{Fore.YELLOW}  {len(failures)} batch(es) of layer {_lvl + 1} hit a "
+                  f"local FFmpeg no-output stall; retrying them one at a time."
+                  f"{Style.RESET_ALL}")
+            remaining = []
+            for task, _prior in failures:
+                if pause_or_cancel(cancel_pending):
+                    raise InterruptedError("Compile cancelled by user.")
+                try:
+                    merge_one(task)
+                except InterruptedError:
+                    raise
+                except Exception as exc:                          # noqa: BLE001
+                    remaining.append((task, exc))
+            failures = remaining
         if failures:
             # 本层全部收尾后再报错：留下半跑的任务比直接抛出更糟。
             first_index, first_error = failures[0]

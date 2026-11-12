@@ -1766,40 +1766,6 @@ def _retry_audio_cache_detection(upload, audio_cache_paths, cache_store,
     return new_cache
 
 
-def refresh_stale_remote_sources(entries, refresh_func, label="Videos"):
-    """compile 前对过期远程源做一次前瞻刷新（两条 compile 路径共用）。
-
-    检测可能已耗时数小时：materialize 开始前把 resolved_at 超过阈值
-    （30 分钟）的源逐个刷新，保证使用的 video_url/audio_url 是新鲜的。
-    刚 resolve 的源跳过刷新（纯省时间）；单个源刷新失败不中断批次，
-    沿用现有 URL 由后续重试兜底。日志不回显签名 URL。
-    """
-    sources = [e.get('filename') for e in entries
-               if isinstance(e.get('filename'), MediaSource)]
-    stale_sources = []
-    for source in sources:
-        resolved_at = getattr(source, "resolved_at", None)
-        if resolved_at is None or time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD:
-            stale_sources.append(source)
-    if not stale_sources:
-        print(f"{Fore.GREEN}All remote sources freshly resolved; skipping refresh, "
-              f"continuing to compile...")
-        return
-    print(f"{Fore.CYAN}Refreshing {len(stale_sources)} {label} "
-          f"source(s), please be patient...")
-    for source in stale_sources:
-        # 任务边界（每个源刷新之前）：暂停在这里等待，取消优先；此刻没有子进程在跑。
-        if pause_or_cancel(cancel_pending):
-            raise InterruptedError("Source refresh cancelled by user.")
-        try:
-            updated = refresh_func(source)
-            if isinstance(updated, MediaSource) and updated is not source:
-                source.__dict__.update(updated.__dict__)
-        except Exception as exc:
-            print(f"{Fore.YELLOW}  Source refresh failed ({exc}); using existing URL.")
-    print(f"{Fore.GREEN}Source refresh complete, continuing to compile...")
-
-
 def refresh_remote_source(source, browser_cookies=None, probe_candidates=True):
     """Resolve fresh stream URLs without logging signed URL or cookie details.
 
@@ -1983,6 +1949,15 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
         1 for entry in entries if isinstance(entry.get('filename'), MediaSource)
     )
     refresh_lock = threading.Lock()
+    # 每个源的签名 URL 只在该源的**第一个 clip 即将开始下载时**刷新一次。
+    # 以前是 compile 开始前把整批源一次性刷一遍（refresh_stale_remote_sources）：
+    # 检测/复查可能跑了几小时，排到后面的源在轮到自己时 URL 又过期了（YouTube
+    # 签名只有 6 小时），第一个 clip 必然 403，白跑一轮再补刷新（用户日志里
+    # 那个 VRChat 视频就是这样）。解析次数没有变（每个源仍是一次），只是把
+    # "提前 6 小时刷"改成"用到之前刷"，并且完全不改变下载顺序。
+    refresh_events: dict[str, threading.Event] = {}
+    refresh_guard = threading.Lock()
+    refresh_stats = {"ok": 0, "failed": 0, "streak": 0, "fresh": 0, "warned": False}
     state = {"total": 0, "completed": 0}
     completed_lock = threading.Lock()
     in_flight = {}
@@ -1991,6 +1966,69 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     def emit(event):
         if progress_callback is not None:
             progress_callback(event)
+
+    def source_url_is_stale(source):
+        """该源的签名 URL 是否该重新解析（与编译前统一刷新同一阈值）。"""
+        resolved_at = getattr(source, "resolved_at", None)
+        return (resolved_at is None
+                or time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD)
+
+    def ensure_source_fresh(source):
+        """在下载这个源的第一个 clip 之前，把它的签名 URL 刷新一次（每源一次）。
+
+        同一个源的其它 clip 会等这一次刷新结束再开始，避免抢在旧 URL 上打出
+        必失败的请求；等待有界且响应取消。刷新失败时只警告一次并沿用旧 URL——
+        一次瞬时限流不该静默丢掉整支 VOD，后面每个 clip 的失败重试里还有一次
+        刷新机会。
+        """
+        if refresh_func is None:
+            return
+        gid = stable_source_id(source)
+        with refresh_guard:
+            event = refresh_events.get(gid)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                refresh_events[gid] = event
+        if not owner:
+            while not event.wait(0.5):
+                if cancel_pending():
+                    return
+            return
+        try:
+            if not source_url_is_stale(source):
+                with refresh_guard:
+                    refresh_stats["fresh"] += 1
+                return
+            print(f"{Fore.CYAN}Refreshing {get_source_display_name(source)} "
+                  f"(its signed URL is older than "
+                  f"{REMOTE_REFRESH_THRESHOLD / 60:.0f} min)...")
+            with refresh_lock:
+                updated = refresh_func(source)
+            if isinstance(updated, MediaSource) and updated is not source:
+                source.__dict__.update(updated.__dict__)
+            with refresh_guard:
+                refresh_stats["ok"] += 1
+                refresh_stats["streak"] = 0
+        except Exception as exc:                                  # noqa: BLE001
+            with refresh_guard:
+                refresh_stats["failed"] += 1
+                refresh_stats["streak"] += 1
+                streak = refresh_stats["streak"]
+                warn = streak >= 3 and not refresh_stats["warned"]
+                if warn:
+                    refresh_stats["warned"] = True
+            print(f"{Fore.YELLOW}  Source refresh failed for "
+                  f"{get_source_display_name(source)} "
+                  f"({type(exc).__name__}: {exc}); continuing with the URL resolved "
+                  f"earlier - each failed clip gets another refresh attempt."
+                  f"{Style.RESET_ALL}")
+            if warn:
+                print(f"{Fore.YELLOW}  Three sources in a row could not be refreshed. "
+                      f"Check Remote Browser Cookies and the network: the batch keeps "
+                      f"going with the earlier URLs.{Style.RESET_ALL}")
+        finally:
+            event.set()
 
     def fail_task(task, exc):
         (entry_index, interval_index, source, start, end, output,
@@ -2008,6 +2046,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
         if failures is None:
             raise RuntimeError(message) from exc
         failures.append(message)
+        if not isinstance(exc, InterruptedError):
+            # 一个 clip 彻底放弃时立刻打**一次**，不再等 120s 卡顿报告重放最后 10 条
+            # （那样同一个失败会被刷几十遍）。取消不是失败，不打印。
+            print(f"{Fore.YELLOW}  {message}{Style.RESET_ALL}")
         if failure_records is not None:
             failure_records.append({
                 "name": get_source_display_name(source),
@@ -2045,6 +2087,9 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             # 取消后不要再为排队中的任务启动 ffmpeg：让线程池的队列瞬间排空，
             # 否则每个任务都要"启动进程→被 kill"走一遍，旧线程迟迟不退出。
             return fail_task(task, InterruptedError("Operation cancelled by user."))
+        # 这个源的签名 URL 只刷一次，且就刷在它第一个 clip 开始下载之前
+        # （见 ensure_source_fresh 上方的说明）。
+        ensure_source_fresh(source)
 
         def fetch_progress(current, total_value, elapsed):
             with in_flight_lock:
@@ -2312,32 +2357,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
         # 在提前返回之前打印，否则这些情况永远看不到提示。
         return [item for kind, item in result_plan]
 
-    # 按 source 分组，下载前对过期源统一做一次前瞻刷新（限流器控制节奏）。
-    # 过期 URL 是批量化 materialize 失败的主因；一次刷新后该 source 的
-    # 所有 clips 共享新 URL，比"每个 clip 失败才 refresh"更稳、刷新次数更少。
-    # 刷新失败（如被 Bilibili 限流）时整组跳过，避免逐 clip 重试制造噪音。
-    grouped = {}
-    for task in tasks:
-        gid = stable_source_id(task[2])
-        grouped.setdefault(gid, {"source": task[2], "tasks": []})["tasks"].append(task)
-
-    submit_tasks = []
-    for group in grouped.values():
-        source = group["source"]
-        resolved_at = getattr(source, "resolved_at", None)
-        stale = (resolved_at is not None
-                 and time.monotonic() - resolved_at > REMOTE_REFRESH_THRESHOLD)
-        if refresh_func is not None and stale:
-            try:
-                with refresh_lock:
-                    updated = refresh_func(source)
-                if isinstance(updated, MediaSource) and updated is not source:
-                    source.__dict__.update(updated.__dict__)
-            except Exception as exc:
-                for task in group["tasks"]:
-                    fail_task(task, exc)
-                continue
-        submit_tasks.extend(group["tasks"])
+    # 任务按列表顺序提交：下载顺序仍然是"一个源接一个源"，刷新发生在
+    # fetch_task 里该源的第一个 clip 之前（ensure_source_fresh），所以顺序、
+    # 日志里的 video N/clip M 编号都没有变化。
+    submit_tasks = list(tasks)
 
     results_by_task = {}
     if submit_tasks:
@@ -2346,50 +2369,20 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                 executor.submit(fetch_task, task): (task[0], task[1])
                 for task in submit_tasks
             }
-            # 停滞检测：某些远程片段反复下载失败且 refresh 探测耗时较长时，
-            # completed 长时间不增长。每 120s 检查一次，若无进展则打印一次
-            # 已收集的失败摘要（Could not fetch ... interval X-Y: <error>），
-            # 让用户能看到卡在哪、为什么失败，而不刷屏（仅停滞时打印一次）。
+            # 停滞提示：completed 长时间不增长时打**一行**，让用户知道 FFmpeg 还活着、
+            # 不是程序卡死。策略集中在 _StallNotice 里（那里有为什么改的说明）。
+            # 单个 clip 的失败信息由 fail_task 立即打一次，不再在这里重放。
             # 必须用带 timeout 的 wait 轮询，而不是无 timeout 的 as_completed：
             # 所有 worker 同时卡住时 as_completed 永远不返回，Cancel 和这条
-            # 120s 提示都永远不会执行（用户实测 Preparing clips 卡一小时）。
-            _last_stall_check = time.monotonic()
-            _last_completed = 0
-            _stall_notified = False
+            # 提示都永远不会执行（用户实测 Preparing clips 卡一小时）。
+            stall_notice = _StallNotice()
 
             def report_stall(now):
-                nonlocal _last_stall_check, _last_completed, _stall_notified
                 with completed_lock:
                     current = state["completed"]
-                if now - _last_stall_check >= 120.0:
-                    _last_stall_check = now
-                    if current == _last_completed and not _stall_notified:
-                        _stall_notified = True
-                        print(
-                            f"{Fore.YELLOW}No remote clip progress for 120s "
-                            f"({current}/{state['total']} clips finished).")
-                        with in_flight_lock:
-                            in_flight_items = sorted(
-                                in_flight.values(),
-                                key=lambda item: item["order"])
-                        for meta in in_flight_items[:5]:
-                            print(
-                                f"{Fore.YELLOW}  still downloading: video "
-                                f"{meta['video']}/{meta['videos_total']} · clip "
-                                f"{meta['clip']}/{meta['clips_total']} · Range "
-                                f"{meta['start']:g}-{meta['end']:g}s"
-                                f"{Style.RESET_ALL}")
-                        if in_flight_items:
-                            print(
-                                f"{Fore.YELLOW}  (a clip stuck here is abandoned by "
-                                f"its stall watchdog and retried; see the heartbeat "
-                                f"lines above for live progress){Style.RESET_ALL}")
-                        for msg in list(failures)[-10:]:
-                            print(f"{Fore.YELLOW}  {msg}{Style.RESET_ALL}")
-                    _last_completed = current
-                elif current != _last_completed:
-                    _last_completed = current
-                    _stall_notified = False
+                line = stall_notice.update(now, current, state["total"])
+                if line:
+                    print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
 
             pending = set(futures)
             while pending:
@@ -2420,7 +2413,69 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
             result = results_by_task.get(payload)
             if result is not None:
                 materialized.append(result)
+    # 刷新现在按源发生（见 ensure_source_fresh），所以旧版那两行
+    # "Refreshing N source(s) / Source refresh complete" 的汇总改到这里：
+    # 一行说清楚"用了多少新 URL、多少源没刷成功"。
+    refreshed = refresh_stats["ok"]
+    failed = refresh_stats["failed"]
+    if refreshed or failed:
+        print(f"{Fore.GREEN}Refreshed {refreshed} source URL(s) right before their "
+              f"clips"
+              + (f"; {failed} source(s) could not be refreshed and kept the earlier "
+                 f"URL" if failed else "")
+              + f".{Style.RESET_ALL}")
     return materialized
+
+
+class _StallNotice:
+    """One line when no remote clip has finished for a while (and nothing else).
+
+    Two bugs in the old report are fixed here:
+
+    * **It announced "no progress" while progress was happening.** The old code
+      compared the finished-clip counter on a fixed 120 s grid, and only updated
+      its "last seen" value between grid boundaries, so at each boundary it
+      really asked "did a clip finish in the last second?". In the tester's log
+      the counter climbed 201 -> 511 while one "No remote clip progress for 120s"
+      block was printed every 120 s.
+    * **It flooded the log.** Every block reprinted the five slowest clips, a
+      hint line and the last ten failures, so a single failed clip appeared dozens
+      of times (250 log lines were almost one repeated paragraph).
+
+    Now it reports on the time since the last *finished* clip: one line at
+    ``threshold``, at most one more per ``repeat`` while the run stays stuck, and
+    nothing at all while clips keep finishing. The wording tells the user that
+    FFmpeg is still working, not the program frozen.
+    """
+
+    def __init__(self, threshold=120.0, repeat=600.0):
+        self._threshold = float(threshold)
+        self._repeat = float(repeat)
+        self._last_completed = None
+        self._last_completed_at = None
+        self._notice_at = None
+
+    def update(self, now, completed, total):
+        """Return the line to print for this sample, or ``None``."""
+        if self._last_completed is None:
+            self._last_completed = completed
+            self._last_completed_at = now
+            return None
+        if completed != self._last_completed:
+            self._last_completed = completed
+            self._last_completed_at = now
+            self._notice_at = None
+            return None
+        stalled_for = now - self._last_completed_at
+        if stalled_for < self._threshold:
+            return None
+        if self._notice_at is not None and now - self._notice_at < self._repeat:
+            return None
+        self._notice_at = now
+        return (f"No remote clip progress for {stalled_for:.0f}s "
+                f"({completed}/{total} clips finished). FFmpeg is still working on "
+                f"the clips in flight - the program has not frozen; a clip that "
+                f"really hangs is abandoned by its watchdog and retried.")
 
 
 def _summarize_remote_failures(failures, max_examples=3):
@@ -8980,12 +9035,9 @@ class VideoProcessorApp:
                             remote_temp,
                             _total_clip_seconds(dict_list, padding),
                             convert_quality_str_to_int(self.max_quality.get()))
-                    # 检测可能已耗时 1-3 小时：compile 前对过期远程源做一次前瞻刷新，
-                    # 保证 materialize 使用的 video_url/audio_url 是新鲜的（即使 detection 命中了缓存）。
-                    # 与首次全流程 compile 路径共用同一逻辑。
-                    refresh_stale_remote_sources(
-                        dict_list, refresh_func,
-                        label="VODs" if self.is_video else "Videos")
+                    # 刷新由 materialize 负责：每个源的签名 URL 在它第一个 clip
+                    # 开始下载之前刷一次（ensure_source_fresh）。检测可能已耗时
+                    # 数小时，所以"开跑前统一刷一遍"会让排到后面的源又变过期。
                     try:
                         self._set_processing_stage("Preparing clips")
                         self.clear_transfer_progress("Preparing remote clips...")
@@ -9477,12 +9529,9 @@ class VideoProcessorApp:
                         remote_temp,
                         _total_clip_seconds(dict_list, padding),
                         convert_quality_str_to_int(self.max_quality.get()))
-                # 首次全流程的检测可能耗时数小时：compile 前对过期远程源做前瞻
-                # 刷新，并给 materialize 传入 refresh_func 兜底——否则尾部源
-                # URL 过期导致整批 403、片段被跳过（与跳过检测路径共用逻辑）。
-                refresh_stale_remote_sources(
-                    dict_list, refresh_func,
-                    label="VODs" if self.is_video else "Videos")
+                # 刷新由 materialize 负责：每个源的签名 URL 在它第一个 clip
+                # 开始下载之前刷一次（ensure_source_fresh）——检测可能耗时数小时，
+                # "开跑前统一刷"会让尾部源轮到自己时 URL 又过期（403）。
                 try:
                     self._set_processing_stage("Preparing clips")
                     self.clear_transfer_progress("Preparing remote clips...")
