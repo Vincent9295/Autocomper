@@ -129,14 +129,39 @@ def short_delivery_records() -> list[dict[str, Any]]:
         return list(_short_delivery_records)
 
 
-def _log_short_delivery(source, start, end, actual, expected) -> None:
+def _log_short_delivery(source, start, end, actual, expected,
+                        detect_interval=None) -> None:
+    """Record a clip that was accepted although the CDN delivered less than asked.
+
+    The record is what the end-of-phase report persists, so it carries everything
+    the user needs later: the source label *and* URL (to find the VOD again), the
+    exact interval that was requested, the detected interval it belongs to (that
+    is what the importable short-delivery timestamps file lists, so re-running
+    does not apply padding twice), and the delivered/expected seconds. Only the
+    accepted branch calls this (after the re-fetch ladder), so ``accepted`` is
+    always true here; it is kept explicit because the report separates these
+    clips from the ones that never made it into the film.
+    """
     shortfall = max(0.0, float(expected) - float(actual))
     platform = getattr(source, "platform", None) or "remote"
     source_id = getattr(source, "source_id", None) or "?"
     label = f"{platform}:{source_id}"
+    detect_start, detect_end = float(start), float(end)
+    if detect_interval is not None:
+        try:
+            candidate_start, candidate_end = (float(detect_interval[0]),
+                                              float(detect_interval[1]))
+        except (TypeError, ValueError, IndexError):
+            candidate_start = candidate_end = None
+        if (candidate_start is not None and candidate_end is not None
+                and 0 <= candidate_start < candidate_end):
+            detect_start, detect_end = candidate_start, candidate_end
     record = {"name": label, "start": float(start), "end": float(end),
               "actual": float(actual), "expected": float(expected),
-              "shortfall": shortfall}
+              "shortfall": shortfall, "accepted": True,
+              "platform": platform, "source_id": source_id,
+              "detect_start": detect_start, "detect_end": detect_end,
+              "url": str(getattr(source, "source_url", "") or "")}
     with _short_delivery_lock:
         _short_delivery_records.append(record)
     print(f"  {label} clip {float(start):g}-{float(end):g}s was delivered "
@@ -3668,6 +3693,7 @@ def fetch_segment(
     verify_placement: bool = True,
     placement_reference: str = "auto",
     local_window_retry: bool = True,
+    record_interval: tuple[float, float] | None = None,
 ) -> Path:
     """Fetch a requested remote interval, optionally reusing covering cache.
 
@@ -3690,6 +3716,11 @@ def fetch_segment(
     on), ``"stream"`` (Remote Stream batches: the live audio-only rendition) or
     ``"auto"`` (prefer the cache). Repair fetches pass ``verify_placement=False``
     so a check never recurses into itself.
+
+    ``record_interval`` is the *detected* interval this fetch belongs to, when
+    the caller knows it (materialize does). A short delivery is recorded with it
+    so the persisted short-delivery list can be re-imported as a timestamps file:
+    its clip lines must be detection intervals, not the padded request window.
     """
     if padding_before < 0 or padding_after < 0:
         raise ValueError("segment padding must not be negative")
@@ -3969,7 +4000,8 @@ def fetch_segment(
                                 f"requested {expected_duration:g}s "
                                 f"({shortfall:g}s short); re-fetching")
                         _log_short_delivery(source, start, end, actual_duration,
-                                            expected_duration)
+                                            expected_duration,
+                                            detect_interval=record_interval)
                         short_delivery = True
             if (verify_placement and run_func is None and not short_delivery
                     and _fetch_has_audio(source, audio_only)

@@ -251,6 +251,21 @@ A compiled video can be shorter than the sum of the clips you selected for two r
 
 The `timestamps.txt` files themselves always keep the detected (unpadded) times, so re-running from a saved file reproduces the same clips.
 
+#### Finding and Fixing Those Short Clips Afterwards
+
+A short delivery used to be a log line only, so after closing the program there was no way to tell which clips ended early. Now the run leaves two records:
+
+- the report next to the output video (`<output>_skipped_clips.txt`) has a second section, `Clips delivered short (they ARE in the film, but they end earlier than requested)`, with the exact interval in milliseconds, the source URL, the source label (`youtube:abc`) and `Delivered: 4.20s of 5.00s (0.80s short)`. The first section still lists the clips that were skipped entirely, and the file is written whenever either section has entries. This covers **fetch** shortfalls only: a clip whose detection window itself was too short is not listed, and **Audio** mode does not report short deliveries at all.
+- the same list is written next to the timestamps file as `timestamps_short_deliveries.txt`. **That file is a normal timestamps file** (one URL header per source, then `HH:MM:SS.mmm - HH:MM:SS.mmm, confidence: 0.00` clip lines, each followed by a `# short_delivery <source> <delivered> <expected>` comment), so you can import or load it like any other timestamps and re-download only those clips with your own settings (**Skip Detection** on, Review as you like). Its clip lines hold the **detected** interval, not the padded request window, so your padding applies once, exactly as in the original run. The file is rewritten each run and removed when a run has no short deliveries (a local-only batch leaves it alone), and it is never picked automatically by the "ask"/"newest" timestamp preference.
+
+There are two ways in: **Add Media → Import URLs from Timestamps .txt** queues the sources of the file (then a normal run detects again), while **Add Media → Fix Short Deliveries (…_short_deliveries.txt)…** queues whatever sources are missing and loads that file's clips on the next Process (no detection, Review only if it is enabled, then compile).
+
+In Review those clips show `Short` in the header count, an orange row, and `Delivered` = `actual/requested` seconds. `Select short` selects exactly those rows and turns on `Short only` (a display filter; checked clips still compile). To fix them:
+
+1. adjust the times: double-click a row for an exact edit, or use **Adjust selected** in the toolbar (`End +`, `End −`, `Start −`, `Start +` with an editable amount, applied to the **highlighted rows only**), or the right-click `Adjust ▸` submenu (`End +1s/+2s/+5s`, `End −…`, `Start −…`, `Start +…`). Every direction stops at the neighbouring clip, at the start/end of the source, and at a 1s minimum length; a batch summary says how many were limited by a neighbour;
+2. optionally right-click `Open Video Clip` to preview the new window. The preview downloads the new window and bypasses the clip cache, so it is the fixed copy you hear;
+3. press Compile. The edited times are saved to `timestamps_selected.txt`, and because a clip's cache entry is keyed by its window, **only the clips you changed are downloaded again**; everything else is reused. The film is still re-encoded from scratch, as always. Edited rows turn blue (`Edited`) so a fixed clip no longer looks short.
+
 #### Clips Whose Content Comes Back Shifted
 
 A clip can have exactly the requested length and still hold the *wrong* moment: the fetched window comes back a fraction of a second to a couple of seconds off, so the start of the moment is missing and the tail runs past it (this reads as "the clip stops too early", and padding cannot fix it). Two causes have been measured on real VODs:

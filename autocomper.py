@@ -1959,6 +1959,9 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
     refresh_guard = threading.Lock()
     refresh_stats = {"ok": 0, "failed": 0, "streak": 0, "fresh": 0, "warned": False}
     state = {"total": 0, "completed": 0}
+    # (entry_index, interval_index) -> 检测区间（未加 padding），供短交付记录写
+    # 可导入的 timestamps 片段行用。
+    clip_intervals: dict[tuple[int, int], tuple[float, float]] = {}
     completed_lock = threading.Lock()
     in_flight = {}
     in_flight_lock = threading.Lock()
@@ -2156,6 +2159,9 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                         return refresh_func(source_arg)
                 fetch_kwargs["refresh_func"] = guarded_refresh
             fetch_kwargs["progress_callback"] = fetch_progress
+            # 这个 clip 的检测区间（未加 padding）：短交付记录用它写可导入的
+            # timestamps 片段行（见 _log_short_delivery / clip_intervals）。
+            fetch_kwargs["record_interval"] = clip_intervals.get(in_flight_key)
             # 落点校验的参照（见 remote_media 的 placement 说明）：Audio Cache
             # 批次检测跑在缓存音频上、compile 从线上流取，两者错位时会按缓存
             # 对齐；Remote Stream 批次检测读的就是线上 audio-only 轨。
@@ -2341,6 +2347,10 @@ def materialize_remote_entries(entries, temp_dir, fetcher=fetch_segment,
                 str(temp_dir), f"remote_{entry_index}_{interval_index}_"
                 f"{stable_source_id(source).replace(':', '_')}.{extension}")
             state["total"] += 1
+            # 这段是检测区间（未加 padding）：短交付记录要用它写"可导入的 timestamps"
+            # 片段行，否则导入后 padding 会被再叠一次。
+            clip_intervals[(entry_index, interval_index)] = (
+                float(ts['start']), float(ts['end']))
             tasks.append((entry_index, interval_index, source, eff_start, eff_end,
                           output, interval_index + 1, clips_total,
                           remote_video_index, duration, ts.get('pred', 0)))
@@ -2605,18 +2615,28 @@ def _total_clip_seconds(dict_list, padding=None):
     return total
 
 
-def _write_skipped_report(records, output_video_path):
-    """Write a per-clip skipped-clips report next to the output video.
+def _write_skipped_report(records, output_video_path, short_records=None):
+    """Write a per-clip report next to the output video.
 
-    The log keeps a compact aggregate summary; this file lists every skipped
-    clip with its full source URL, name, interval, and failure reason so the
-    user can see exactly what was missed without the log flooding.
+    The file has two sections so one place answers both "what is missing?" and
+    "what ends early?":
+
+    * **skipped clips**: failed to fetch, NOT in the film (the original report);
+    * **delivered short**: they ARE in the film, but the CDN delivered less than
+      the requested window and the clip was accepted after the re-fetch ladder.
+      These used to exist only as a log line, so there was no way to act on them
+      later (the log is long gone by the time the user watches the film).
+
+    It is written when *either* section has entries, so a run whose only problem
+    is short deliveries still produces it.
     """
-    if not records:
+    records = list(records or [])
+    short_records = list(short_records or [])
+    if not records and not short_records:
         return None
     report_path = os.path.splitext(str(output_video_path))[0] + "_skipped_clips.txt"
     lines = [
-        "Skipped clips (clips that failed to fetch and were left out of the compile):",
+        f"Skipped clips (failed to fetch, NOT in the film): {len(records)}",
         "",
     ]
     for record in records:
@@ -2634,12 +2654,252 @@ def _write_skipped_report(records, output_video_path):
         lines.append(f"  URL: {url}")
         lines.append(f"  Reason: {record.get('reason')}")
         lines.append("")
+    if short_records:
+        lines.append(
+            f"Clips delivered short (they ARE in the film, but they end earlier than "
+            f"requested): {len(short_records)}")
+        lines.append("")
+        for record in short_records:
+            name = record.get("name") or "unknown"
+            url = record.get("url") or "unknown URL"
+            start = record.get("start")
+            end = record.get("end")
+            if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                # 这里用毫秒精度：用户要拿着这几个数去 Review/改时间戳。
+                interval = (f"({convert_seconds_to_timestamp_ms(start)} - "
+                            f"{convert_seconds_to_timestamp_ms(end)})")
+            else:
+                interval = "?"
+            try:
+                actual = float(record.get("actual"))
+                expected = float(record.get("expected"))
+                detail = (f"{actual:.2f}s of {expected:.2f}s "
+                          f"({max(0.0, expected - actual):.2f}s short)")
+            except (TypeError, ValueError):
+                detail = "shorter than the requested window"
+            lines.append(f"{interval} {name}")
+            lines.append(f"  URL: {url}")
+            lines.append(f"  Delivered: {detail}")
+            lines.append("")
     try:
         with open(report_path, 'w', encoding='utf-8') as fh:
             fh.write("\n".join(lines))
     except OSError:
         return None
     return report_path
+
+
+def _parse_time_token(token):
+    """Parse ``H:MM:SS.mmm`` or plain seconds; ``None`` when unusable."""
+    text = str(token or "").strip()
+    match = re.match(r"^(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$", text)
+    if match:
+        value = (int(match.group(1)) * 3600 + int(match.group(2)) * 60
+                 + int(match.group(3)))
+        if match.group(4):
+            value += int(match.group(4)) / (10 ** len(match.group(4)))
+        return float(value)
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clock_seconds(hours, minutes, seconds, frac=None):
+    """``H:MM:SS[.mmm]`` field groups (strings) → float seconds."""
+    value = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    if frac:
+        value += int(frac) / (10 ** len(frac))
+    return float(value)
+
+
+def _short_deliveries_path(txt_path):
+    """短交付清单的路径：``<timestamps>_short_deliveries.txt``。
+
+    如果传进来的本身就是这个文件（用户直接加载/导入它），原样返回，避免拼成
+    ``..._short_deliveries_short_deliveries.txt``。
+    """
+    if not txt_path or txt_path == "No file selected!":
+        return None
+    name = os.path.basename(str(txt_path)).lower()
+    if name.endswith("_short_deliveries.txt"):
+        return str(txt_path)
+    return _txt_suffixed_path(txt_path, "_short_deliveries")
+
+
+def _write_short_deliveries_txt(short_records, base_txt, remove_when_empty=False):
+    """Write the short-delivery list next to the timestamps file.
+
+    The file **is** a normal timestamps file (one URL header per source, then
+    ``H:MM:SS.mmm - H:MM:SS.mmm, confidence: 0.00`` clip lines), so the user can
+    import or load it like any other timestamps and re-download exactly those
+    clips. The clip lines carry the **detected** interval (not the padded request
+    window) so re-running applies the current padding settings once, as the
+    original run did. Each clip is followed by a ``# short_delivery`` comment with
+    the source key and the delivered/expected seconds, which is what Review reads
+    to mark the rows (both parsers ignore ``#`` lines).
+    """
+    path = _short_deliveries_path(base_txt)
+    if path is None:
+        return None
+    records = list(short_records or [])
+    if not records:
+        # 一轮完全没有短交付：把上一轮的旧清单删掉，否则 Review 会继续按旧数据标记。
+        if remove_when_empty and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                return None
+        return None
+    groups = {}                      # url -> [record, ...]，保持首次出现顺序
+    order = []
+    for record in records:
+        name = str(record.get("name") or "unknown").strip()
+        url = str(record.get("url") or "").strip() or f"unknown:{name}"
+        if url not in groups:
+            groups[url] = []
+            order.append(url)
+        groups[url].append(record)
+    lines = [
+        f"# AutoComper short deliveries, written "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "# These clips are in the film but ended earlier than requested. This file",
+        "# is a normal timestamps file: import or load it to re-fetch only these",
+        "# clips (the times are the detected intervals, so your padding applies).",
+    ]
+    for url in order:
+        lines.append(url)
+        for record in groups[url]:
+            try:
+                start = float(record.get("detect_start", record.get("start")))
+                end = float(record.get("detect_end", record.get("end")))
+                actual = float(record.get("actual"))
+                expected = float(record.get("expected"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= start < end):
+                continue
+            name = str(record.get("name") or "unknown").strip()
+            lines.append(f"{convert_seconds_to_timestamp_ms(start)} - "
+                         f"{convert_seconds_to_timestamp_ms(end)}, confidence: 0.00")
+            lines.append(f"# short_delivery {name} {actual:.2f} {expected:.2f}")
+        lines.append("")
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError:
+        return None
+    return path
+
+
+def _load_short_deliveries(txt_path):
+    """Read the short-delivery list that belongs to ``txt_path`` (may be absent).
+
+    Understands the current format (timestamps + ``# short_delivery`` comments)
+    and the first release's five-column lines, so a file written by the previous
+    build still marks its clips in Review.
+    """
+    path = _short_deliveries_path(txt_path)
+    if path is None:
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            raw_lines = fh.readlines()
+    except OSError:
+        return []
+    records = []
+    current_url = None
+    pending = None                       # 上一行 clip 的 (start, end)
+    comment_re = re.compile(
+        r'^#\s*short_delivery\s+(\S+)\s+([\d.]+)\s+([\d.]+)\s*$')
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line:
+            pending = None
+            continue
+        if line.startswith("#"):
+            match = comment_re.match(line)
+            if match and pending is not None:
+                name, actual_text, expected_text = match.groups()
+                try:
+                    actual = float(actual_text)
+                    expected = float(expected_text)
+                except ValueError:
+                    continue
+                records.append({
+                    "name": name, "start": pending[0], "end": pending[1],
+                    "actual": actual, "expected": expected,
+                    "shortfall": max(0.0, expected - actual), "accepted": True,
+                    "url": current_url or "",
+                })
+                pending = None
+            continue
+        clip = _TIMESTAMPS_CLIP_LINE_RE.match(line)
+        if clip:
+            h1, m1, s1, frac1, h2, m2, s2, frac2, _conf = clip.groups()
+            pending = (_clock_seconds(h1, m1, s1, frac1),
+                       _clock_seconds(h2, m2, s2, frac2))
+            continue
+        current_url = line
+        pending = None
+    if records:
+        return records
+    # 旧格式（第一个版本写的 5 列）：只能用于标记，没有 URL 不能导入。
+    legacy = []
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.rsplit(None, 4)
+        if len(parts) != 5:
+            continue
+        name, start_text, end_text, actual_text, expected_text = parts
+        start = _parse_time_token(start_text)
+        end = _parse_time_token(end_text)
+        try:
+            actual = float(actual_text)
+            expected = float(expected_text)
+        except (TypeError, ValueError):
+            continue
+        if start is None or end is None or end <= start:
+            continue
+        legacy.append({
+            "name": name, "start": start, "end": end,
+            "actual": actual, "expected": expected,
+            "shortfall": max(0.0, expected - actual), "accepted": True,
+        })
+    return legacy
+
+
+def _short_delivery_match(short_records, source_key, start, end,
+                          before=0.0, after=0.0, tolerance=0.3):
+    """Return the short-delivery record that belongs to this clip, or ``None``.
+
+    The recorded interval is the window that was actually requested (padding
+    applied, clamped by its neighbours), while Review shows the detection
+    interval, so the two are matched by overlap inside the clip's padded span and
+    for the same source. Clips of one source no longer overlap after
+    materialize's clamping, so the best overlap is unambiguous.
+    """
+    if not short_records or not source_key:
+        return None
+    span_start = max(0.0, float(start) - float(before)) - float(tolerance)
+    span_end = float(end) + float(after) + float(tolerance)
+    best = None
+    best_overlap = 0.0
+    for record in short_records:
+        if str(record.get("name") or "") != str(source_key):
+            continue
+        try:
+            record_start = float(record["start"])
+            record_end = float(record["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        overlap = min(record_end, span_end) - max(record_start, span_start)
+        if overlap > best_overlap:
+            best = record
+            best_overlap = overlap
+    return best
 
 def convert_seconds_to_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -2846,12 +3106,20 @@ _TIMESTAMPS_FILE_KINDS = (
      "detection + re-verify after your Review selection"),
     ("_reverified_selected", "re-verify + last selection",
      "re-verify extras AND your Review selection (the two-pass workflow file)"),
+    # 短交付清单本身就是一个合法 timestamps 文件（检测区间 + URL 头），所以
+    # 它在这里等价于"只处理这些片段"。注意它**不参与 ask/newest 的自动选择**
+    # （见 pick_timestamps_candidate）：否则每次跑完它都是最新文件、会被自动
+    # 选中，普通一轮就只会处理短交付片段了。
+    ("_short_deliveries", "short deliveries only",
+     "just the clips whose last delivery was short (from the short-delivery report)"),
 )
 _TIMESTAMPS_PREFERENCE_VALUES = ("ask", "newest", "detection only",
                                  "detection + re-verify", "last compiled selection",
-                                 "re-verify + last selection")
+                                 "re-verify + last selection", "short deliveries only")
 _TIMESTAMPS_KIND_INFO = {suffix: (suffix, label, description)
                          for suffix, label, description in _TIMESTAMPS_FILE_KINDS}
+# 不参与 "newest"/"ask" 自动选择的 kind（必须由用户显式挑选）
+_TIMESTAMPS_NO_AUTO_PICK_KINDS = ("_short_deliveries",)
 
 # 同文件夹扫描的限制：只认 timestamps 家族的名字，且只在给定文件夹里找
 # （不做全盘/递归搜索——多项目共用目录时那必然串味）。
@@ -3074,7 +3342,12 @@ def pick_timestamps_candidate(candidates, preference="ask", summaries=None):
 
     ``preference`` is either "ask"/"newest" (newest mtime wins) or a file kind
     label from the chooser ("detection only" / "detection + re-verify" /
-    "last compiled selection").
+    "last compiled selection" / "short deliveries only").
+
+    A short-delivery list is rewritten on every run, so it is always the newest
+    file: it is therefore **excluded from the automatic (ask/newest) choice** and
+    only loads when the user picks it explicitly. Otherwise an ordinary run would
+    silently process only the clips that were short last time.
     """
     if not candidates:
         return None
@@ -3083,11 +3356,16 @@ def pick_timestamps_candidate(candidates, preference="ask", summaries=None):
         for candidate in candidates:
             if candidate.get("label") == preference:
                 return candidate
+    auto = [candidate for candidate in candidates
+            if candidate.get("kind") not in _TIMESTAMPS_NO_AUTO_PICK_KINDS]
+    if not auto:
+        return None
+
     def sort_key(candidate):
         info = summaries.get(candidate["path"]) or {}
         return (info.get("mtime") or 0.0,
                 _timestamps_kind_priority(candidate.get("kind", "")))
-    return max(candidates, key=sort_key)
+    return max(auto, key=sort_key)
 
 
 def _save_selected_txt(dict_list, txt_path):
@@ -4310,7 +4588,23 @@ def install_modal_grab(window):
 
 
 class ReviewDialog:
-    """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消。"""
+    """片段审核对话框 —— Treeview + 音频/视频预览 + 勾选/取消 + 改时长。
+
+    时长编辑一直是双击行（``_edit_times``），这个提示以前没写出来。现在还有：
+
+    * 读取上一轮写在 timestamps 旁边的 ``*_short_deliveries.txt``，把这些"进了成片
+      但比请求短"的片段标成 Short（Delivered 列显示 实际/请求 秒数），并可用
+      ``Short only`` / ``Select short`` 只看/只选它们；
+    * **Adjust selected**：End ± / Start ∓（数值可改），只作用于**手选中的行**，
+      不会动其它勾选的片段；右键的 ``Adjust ▸`` 子菜单给单行快捷值；
+    * 改完可直接右键预览（预览走 ``allow_covering_cache=False``，会把**新窗口**
+      重新下载并写进缓存，下一次 Process 只有这些改过的片段需要下载）。
+    """
+
+    # 单行/批量的最小片段长度（与 materialize 丢弃 <1s 的规则一致）
+    MIN_CLIP_SECONDS = 1.0
+    # 批量调整时给用户的保护上限（超过就要求分批，避免误选整批）
+    BULK_SOFT_LIMIT = 200
 
     def __init__(self, parent, dict_list, padding, output_path,
                  use_verify=False, txt_path=None, cache_store=None):
@@ -4323,8 +4617,17 @@ class ReviewDialog:
         self.result = None
         self.checks = []
         self._preview_paths = []
+        # 上一轮落盘的短交付清单（可能不存在，也可能与这次加载的文件不配套）。
+        self.short_deliveries = _load_short_deliveries(txt_path)
+        self.short_hits = {}
+        self._edited = set()
+        # Short only 过滤时被 detach 的行（Tk 的 detach 不提供"是否已隐藏"查询）
+        self._detached = set()
 
         self.flat = []
+        # 每一行都直接指向 dict_list 里那段 timestamp：批量/单行改时间时按对象
+        # 写回，不再用 (start, end) 模糊匹配（同源重复区间会改错行）。
+        self.ts_objects = []
         for entry in dict_list:
             fn = entry['filename']
             for ts in entry.get('timestamps', []):
@@ -4335,12 +4638,13 @@ class ReviewDialog:
                     'source': ts.get('source', 'original'),
                     'suspect': ts.get('suspect', False),
                 })
+                self.ts_objects.append(ts)
 
         self.win = tk.Toplevel(parent)
         self.win.title("Review Clips")
-        # 窗口加宽到能容纳全部列（sel+time+file+conf+status ≈ 720px），
+        # 窗口加宽到能容纳全部列（sel+time+file+conf+deliv+status），
         # 避免每次打开 status 栏被截断、需要手动拉宽才能看到。
-        self.win.geometry("1000x620")
+        self.win.geometry("1080x620")
         self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
         self.win.transient(parent)
         self.win.lift()
@@ -4361,34 +4665,46 @@ class ReviewDialog:
         total = len(self.flat)
         new_count = sum(1 for f in self.flat if f.get('source') == 'new')
         suspect_count = sum(1 for f in self.flat if f.get('suspect'))
+        # 先把短交付匹配出来，标题栏才能报数量（行里也要用）。
+        for i, f in enumerate(self.flat):
+            match = _short_delivery_match(
+                self.short_deliveries, self._source_key(f['filename']),
+                f['start'], f['end'], self.padding[0], self.padding[1])
+            if match is not None:
+                self.short_hits[i] = match
         t = f"Total: {total} segments"
         if use_verify and new_count > 0:
             t += f"  |  New: {new_count}"
         if suspect_count > 0:
             t += f"  |  Suspect: {suspect_count}"
+        if self.short_hits:
+            t += f"  |  Short: {len(self.short_hits)}"
         ttk.Label(info_frame, text=t).pack(side=tk.LEFT)
         self._preview_status = ttk.Label(info_frame, text="", foreground='#4caf50')
         self._preview_status.pack(side=tk.LEFT, padx=12)
         ttk.Label(info_frame,
-                  text="Right-click for preview  |  Click row to toggle",
+                  text="Double-click: edit times  |  Right-click: preview / extend  |  "
+                       "Click row to toggle",
                   foreground='gray').pack(side=tk.RIGHT)
 
         tree_frame = ttk.Frame(self.win)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.tree = ttk.Treeview(tree_frame,
-                                  columns=('sel', 'time', 'file', 'conf', 'status'),
+                                  columns=('sel', 'time', 'file', 'conf', 'deliv', 'status'),
                                   show='headings', selectmode='extended')
         self.tree.heading('sel', text='\u2611')
         self.tree.heading('time', text='Time')
         self.tree.heading('file', text='Source File')
         self.tree.heading('conf', text='Confidence')
+        self.tree.heading('deliv', text='Delivered')
         self.tree.heading('status', text='Status')
         self.tree.column('sel', width=40, anchor='center')
-        self.tree.column('time', width=140)
-        self.tree.column('file', width=340)
+        self.tree.column('time', width=150)
+        self.tree.column('file', width=320)
         self.tree.column('conf', width=80)
-        self.tree.column('status', width=120)
+        self.tree.column('deliv', width=110)
+        self.tree.column('status', width=140)
 
         sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -4402,19 +4718,15 @@ class ReviewDialog:
             s_str = self._fmt(f['start'])
             e_str = self._fmt(f['end'])
             bn = get_source_display_name(f['filename'])
-            if suspect:
-                st = 'Suspect'
-            else:
-                st = 'New' if f.get('source') == 'new' else 'Original'
-            tag = 'checked'
             self.tree.insert('', tk.END, iid=str(i),
                              values=('☑' if cv.get() else '☐',
                                      f"{s_str} - {e_str}", bn,
-                                     f"{f['pred']:.2f}", st), tags=(tag,))
+                                     f"{f['pred']:.2f}",
+                                     self._delivered_text(i), self._status_text(i)),
+                             tags=('checked',))
             self._style(str(i), cv.get())
             if suspect:
                 self.tree.set(str(i), 0, '☐')
-                self.tree.item(str(i), tags=('unchecked',))
 
         # Auto-deselect originals that overlap with new reverify clips
         for i, f in enumerate(self.flat):
@@ -4428,19 +4740,49 @@ class ReviewDialog:
                 # deselect original only if new fully covers it
                 if g['start'] <= f['start'] and g['end'] >= f['end']:
                     self.checks[i].set(False)
-                    self._style(str(i), False)
                     self.tree.set(str(i), 0, '\u2610')
-                    self.tree.item(str(i), tags=('unchecked',))
+                    self._style(str(i), False)
                     break
 
         self.tree.tag_configure('checked', foreground='#4caf50')
         self.tree.tag_configure('unchecked', foreground='#888888')
+        # 短交付的行用橙色，和"勾选状态"的绿/灰分开：一眼能看出哪些片段偏短。
+        self.tree.tag_configure('short', foreground='#e0a33a')
+        self.tree.tag_configure('short_unchecked', foreground='#8a6b3a')
+        # 改过的行用蓝色：否则"改完还是橙色"会让人以为没改。
+        self.tree.tag_configure('edited', foreground='#5aa9e6')
+        self.tree.tag_configure('edited_unchecked', foreground='#3f6f8f')
 
         self.ctx_menu = tk.Menu(self.win, tearoff=0)
         self.ctx_menu.add_command(label="Play Audio",
                                    command=self._play_audio)
         self.ctx_menu.add_command(label="Open Video Clip",
                                    command=self._play_video)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_command(label="Edit Times...",
+                                   command=self._edit_selected_times)
+        # 单层的 Adjust 子菜单：12 个快捷值都收在这里，主菜单不再随方向增多而变长。
+        # 子菜单必须挂在 ctx_menu 下并保存引用，否则会被 Python GC 掉（Tk 经典坑）。
+        self.adjust_menu = tk.Menu(self.ctx_menu, tearoff=0)
+        self.ctx_menu.add_cascade(label="Adjust", menu=self.adjust_menu)
+        for seconds in (1.0, 2.0, 5.0):
+            self.adjust_menu.add_command(
+                label=f"End +{seconds:g}s",
+                command=lambda s=seconds: self._adjust_single("end+", s))
+        for seconds in (1.0, 2.0, 5.0):
+            self.adjust_menu.add_command(
+                label=f"End \u2212{seconds:g}s",
+                command=lambda s=seconds: self._adjust_single("end-", s))
+        self.adjust_menu.add_separator()
+        # 起点对称为"往前延"：Start −N 把起点提早，Start +N 把起点推后。
+        for seconds in (1.0, 2.0, 5.0):
+            self.adjust_menu.add_command(
+                label=f"Start \u2212{seconds:g}s",
+                command=lambda s=seconds: self._adjust_single("start-", s))
+        for seconds in (1.0, 2.0, 5.0):
+            self.adjust_menu.add_command(
+                label=f"Start +{seconds:g}s",
+                command=lambda s=seconds: self._adjust_single("start+", s))
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Double-1>", self._on_double_click)
@@ -4448,9 +4790,14 @@ class ReviewDialog:
         # 因此会有短暂停顿，属正常现象。
         CustomHovertip(
             self.tree,
-            "Right-click: Play Audio / Open Video Clip\n"
+            "Double-click a row: edit its start/end times.\n"
+            "Right-click: Play Audio / Open Video Clip / Edit Times / Adjust.\n"
+            "Adjust acts on the row(s) you selected; the toolbar amount applies to "
+            "every highlighted row at once.\n"
+            "Short rows were delivered shorter than requested last run.\n"
+            "After editing, Open Video Clip downloads the NEW window (bypasses the "
+            "clip cache), so the next Process reuses it instead of the short copy.\n"
             "Audio Cache: audio preview is instant (reads cached audio).\n"
-            "Remote Stream: audio preview re-downloads each time.\n"
             "Video preview always downloads from the source.",
         )
 
@@ -4459,6 +4806,41 @@ class ReviewDialog:
         ttk.Button(bf, text="Select All", command=self._sel_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(bf, text="Deselect All", command=self._desel_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(bf, text="Invert", command=self._invert).pack(side=tk.LEFT, padx=2)
+        self.select_short_button = ttk.Button(
+            bf, text="Select short", command=self._select_short)
+        self.select_short_button.pack(side=tk.LEFT, padx=(10, 2))
+        self.short_only_var = tk.BooleanVar(value=False)
+        self.short_only_check = ttk.Checkbutton(
+            bf, text="Short only", variable=self.short_only_var,
+            command=self._apply_short_filter)
+        self.short_only_check.pack(side=tk.LEFT, padx=2)
+        if not self.short_hits:
+            self.select_short_button.state(["disabled"])
+            self.short_only_check.state(["disabled"])
+
+        # 批量调整：数值可改，只作用于树里高亮选中的行（不碰其它勾选片段）。
+        self._adjust_amount = tk.StringVar(value="1.0")
+        adj = ttk.Frame(self.win)
+        adj.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Label(adj, text="Adjust selected:").pack(side=tk.LEFT)
+        self.adjust_amount_spin = ttk.Spinbox(
+            adj, from_=0.1, to=60.0, increment=0.1, width=6,
+            textvariable=self._adjust_amount)
+        self.adjust_amount_spin.pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(adj, text="s").pack(side=tk.LEFT, padx=(0, 8))
+        for label, direction, tip in (
+                ("End +", "end+", "end: later (longer clip)"),
+                ("End \u2212", "end-", "end: earlier (shorter clip)"),
+                ("Start \u2212", "start-", "start: earlier (longer clip)"),
+                ("Start +", "start+", "start: later (shorter clip)")):
+            button = ttk.Button(
+                adj, text=label, width=8,
+                command=lambda d=direction: self._adjust_highlighted(d))
+            button.pack(side=tk.LEFT, padx=2)
+            CustomHovertip(button, f"Apply to the highlighted rows: {tip}.")
+        self.adjust_hint = ttk.Label(adj, text="", foreground='#4caf50')
+        self.adjust_hint.pack(side=tk.LEFT, padx=10)
+
         ttk.Button(bf, text="Compile", command=self._on_compile).pack(side=tk.RIGHT, padx=2)
         ttk.Button(bf, text="Cancel", command=self._on_cancel).pack(side=tk.RIGHT, padx=2)
 
@@ -4468,8 +4850,53 @@ class ReviewDialog:
         # 与 timestamps txt 一致的毫秒精度：Review 显示/编辑的值 == 文件里的值
         return convert_seconds_to_timestamp_ms(sec)
 
+    @staticmethod
+    def _source_key(filename):
+        """与短交付清单里的 ``platform:id`` 同一个键；本地文件永远匹配不上。"""
+        if isinstance(filename, MediaSource):
+            return stable_source_id(filename)
+        return None
+
+    def _delivered_text(self, idx):
+        """Delivered 列：``4.20/5.00``（实际/请求秒数），非短交付留空。"""
+        match = self.short_hits.get(idx)
+        if not match:
+            return ""
+        try:
+            return f"{float(match['actual']):.2f}/{float(match['expected']):.2f}"
+        except (KeyError, TypeError, ValueError):
+            return "short"
+
+    def _status_text(self, idx):
+        f = self.flat[idx]
+        if idx in self._edited:
+            base = "Edited"
+        elif f.get('suspect'):
+            base = "Suspect"
+        else:
+            base = "New" if f.get('source') == 'new' else "Original"
+        if idx in self.short_hits and idx not in self._edited:
+            base += " (short)"
+        return base
+
+    def _refresh_row(self, idx):
+        self.tree.set(str(idx), 'time',
+                      f"{self._fmt(self.flat[idx]['start'])} - "
+                      f"{self._fmt(self.flat[idx]['end'])}")
+        self.tree.set(str(idx), 'deliv', self._delivered_text(idx))
+        self.tree.set(str(idx), 'status', self._status_text(idx))
+        self._style(str(idx), self.checks[idx].get())
+
     def _style(self, iid, checked):
-        self.tree.item(iid, tags=('checked',) if checked else ('unchecked',))
+        """行颜色：改过=蓝，短交付=橙，其余按勾选状态绿/灰。"""
+        idx = int(iid)
+        if idx in self._edited:
+            tag = 'edited' if checked else 'edited_unchecked'
+        elif idx in self.short_hits:
+            tag = 'short' if checked else 'short_unchecked'
+        else:
+            tag = 'checked' if checked else 'unchecked'
+        self.tree.item(iid, tags=(tag,))
 
     def _on_click(self, event):
         iid = self.tree.identify_row(event.y)
@@ -4492,6 +4919,219 @@ class ReviewDialog:
         iid = self.tree.identify_row(event.y)
         if iid and iid.isdigit():
             self._edit_times(int(iid))
+
+    def _edit_selected_times(self):
+        idx = self._sel_idx()
+        if idx is not None:
+            self._edit_times(idx)
+
+    # ── 时长调整（End ± / Start ∓）──────────────────────────────────────
+    # direction 的语义（都按"用户直觉"命名，减号=变短/提早）：
+    #   end+   结尾往后延（clip 变长）
+    #   end-   结尾往前收（clip 变短）
+    #   start- 开头往前延（clip 变长）
+    #   start+ 开头往后收（clip 变短）
+
+    def _adjust_row(self, idx, direction, seconds):
+        """改一行，返回 ``"ok"`` / ``"limited"`` / ``"unchanged"``（不弹窗、不打日志）。
+
+        边界用**当前实时值**重算（批量时先改的行会影响后一行的邻居边界），
+        所以"同时 End + 和 Start −"相邻两行也不会改出重叠。
+        """
+        f = self.flat[idx]
+        start = float(f['start'])
+        end = float(f['end'])
+        amount = float(seconds)
+        minimum = float(self.MIN_CLIP_SECONDS)
+        epsilon = 1e-6
+        if direction == "end+":
+            limit = self._extension_limit(idx)
+            new_end = end + amount if limit is None else min(end + amount, limit)
+            if new_end <= end + epsilon:
+                return "unchanged"
+            self._apply_times(idx, start, new_end)
+            return "ok" if new_end >= end + amount - epsilon else "limited"
+        if direction == "end-":
+            new_end = max(start + minimum, end - amount)
+            if new_end >= end - epsilon:
+                return "unchanged"
+            self._apply_times(idx, start, new_end)
+            return "ok" if new_end <= end - amount + epsilon else "limited"
+        if direction == "start-":
+            limit = self._start_limit(idx)
+            new_start = max(limit, 0.0, start - amount)
+            if new_start >= start - epsilon:
+                return "unchanged"
+            self._apply_times(idx, new_start, end)
+            return "ok" if new_start <= start - amount + epsilon else "limited"
+        if direction == "start+":
+            new_start = min(end - minimum, start + amount)
+            if new_start <= start + epsilon:
+                return "unchanged"
+            self._apply_times(idx, new_start, end)
+            return "ok" if new_start >= start + amount - epsilon else "limited"
+        raise ValueError(f"unknown adjust direction: {direction!r}")
+
+    @staticmethod
+    def _adjust_label(direction):
+        return {"end+": "End +", "end-": "End \u2212",
+                "start-": "Start \u2212", "start+": "Start +"}[direction]
+
+    def _adjust_seconds(self):
+        """工具条数值框 → 秒；非法值弹一次提示并返回 None。"""
+        raw = (self._adjust_amount.get() or "").strip().replace(",", ".")
+        try:
+            seconds = float(raw)
+        except ValueError:
+            seconds = None
+        if seconds is None or not (0.0 < seconds <= 60.0):
+            messagebox.showerror(
+                "Adjust value",
+                "Enter a number of seconds between 0.1 and 60 (for example 1.0).")
+            return None
+        return seconds
+
+    def _no_room_message(self, direction):
+        if direction == "end+":
+            return ("There is no room to move this clip's end later (the next clip "
+                    "starts right after it, or the source ends here). Edit the times "
+                    "manually if the neighbouring clip also has to move.")
+        if direction == "end-":
+            return ("This clip is already at the minimum length "
+                    f"({self.MIN_CLIP_SECONDS:g}s); move its start instead.")
+        if direction == "start-":
+            return ("There is no room to move this clip's start earlier (the previous "
+                    "clip ends right before it, or the source starts here). Edit the "
+                    "times manually if the neighbouring clip also has to move.")
+        return ("This clip is already at the minimum length "
+                f"({self.MIN_CLIP_SECONDS:g}s); move its end instead.")
+
+    def _adjust_single(self, direction, seconds):
+        """右键子菜单：只改当前（右键点中的）那一行；无空间时明确告知。"""
+        idx = self._sel_idx()
+        if idx is None:
+            return
+        before = (float(self.flat[idx]['start']), float(self.flat[idx]['end']))
+        outcome = self._adjust_row(idx, direction, seconds)
+        if outcome == "unchanged":
+            messagebox.showwarning("Cannot adjust", self._no_room_message(direction))
+            return
+        after = (float(self.flat[idx]['start']), float(self.flat[idx]['end']))
+        if outcome == "limited":
+            print(f"{Fore.YELLOW}Clip at {self._fmt(before[0])} adjusted to "
+                  f"{self._fmt(after[0])} - {self._fmt(after[1])} only "
+                  f"(neighbour/source limit).{Style.RESET_ALL}")
+        self._set_adjust_hint(
+            f"{self._adjust_label(direction)} {float(seconds):g}s: "
+            f"{self._fmt(before[0])} - {self._fmt(before[1])}  \u2192  "
+            f"{self._fmt(after[0])} - {self._fmt(after[1])}")
+
+    def _adjust_highlighted(self, direction):
+        """工具条：只作用于**高亮选中的行**，不碰其它勾选片段。"""
+        seconds = self._adjust_seconds()
+        if seconds is None:
+            return
+        selection = [int(iid) for iid in self.tree.selection() if iid.isdigit()]
+        if not selection:
+            messagebox.showinfo(
+                "Adjust selected",
+                "Select the rows to adjust first (click a row, or drag/Ctrl-click for "
+                "several). Nothing was changed.")
+            return
+        if len(selection) > self.BULK_SOFT_LIMIT:
+            if not messagebox.askyesno(
+                    "Adjust many clips",
+                    f"Adjust {len(selection)} clip(s) by "
+                    f"{self._adjust_label(direction)} {seconds:g}s?\n\n"
+                    "This edits every highlighted row and can take a few seconds."):
+                return
+        counts = {"ok": 0, "limited": 0, "unchanged": 0}
+        for idx in selection:
+            counts[self._adjust_row(idx, direction, seconds)] += 1
+        changed = counts["ok"] + counts["limited"]
+        parts = [f"{changed} clip(s) adjusted ({self._adjust_label(direction)} "
+                 f"{seconds:g}s)"]
+        if counts["limited"]:
+            parts.append(f"{counts['limited']} limited by a neighbour/source")
+        if counts["unchanged"]:
+            parts.append(f"{counts['unchanged']} unchanged (no room)")
+        text = ", ".join(parts)
+        self._set_adjust_hint(text)
+        print(f"{Fore.GREEN}{text}{Style.RESET_ALL}")
+
+    def _set_adjust_hint(self, text):
+        hint = getattr(self, "adjust_hint", None)
+        if hint is None:
+            return
+        try:
+            hint.config(text=text)
+            self.win.update_idletasks()
+        except Exception:
+            pass
+
+    def _extend_selected_end(self, seconds):
+        """兼容旧入口：右键/测试用的"结尾延长"→ ``_adjust_single``。"""
+        self._adjust_single("end+", seconds)
+
+    def _extend_selected_start(self, seconds):
+        """兼容旧入口：右键/测试用的"起点提早"→ ``_adjust_single``。"""
+        self._adjust_single("start-", seconds)
+
+    def _extension_limit(self, idx):
+        """延长该片段时不能越过的终点：下一个片段起点 / 源时长 - 0.25s。"""
+        f = self.flat[idx]
+        limit = None
+        for other in self.flat:
+            if other is f or other['filename'] != f['filename']:
+                continue
+            if other['start'] >= f['end'] - 1e-6:
+                limit = other['start'] if limit is None else min(limit, other['start'])
+        duration = getattr(f['filename'], 'duration', None)
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            duration = None
+        if duration and duration > 0:
+            source_end = duration - 0.25
+            limit = source_end if limit is None else min(limit, source_end)
+        return limit
+
+    def _start_limit(self, idx):
+        """把起点往前延时的下界：上一个片段的终点，最早到 0。"""
+        f = self.flat[idx]
+        limit = 0.0
+        for other in self.flat:
+            if other is f or other['filename'] != f['filename']:
+                continue
+            if other['end'] <= f['start'] + 1e-6:
+                limit = max(limit, float(other['end']))
+        return limit
+
+    def _apply_times(self, idx, new_start, new_end):
+        """把新的 start/end 同时写回列表和 dict_list 的那段 timestamp。
+
+        按**对象**写回（``self.ts_objects[idx]``），不再用 (start, end) 模糊匹配：
+        同一源里两条完全相同的区间时，模糊匹配会改到第一条（批量调整尤其危险）。
+        """
+        f = self.flat[idx]
+        f['start'] = float(new_start)
+        f['end'] = float(new_end)
+        ts = self.ts_objects[idx] if 0 <= idx < len(self.ts_objects) else None
+        if ts is not None:
+            ts['start'] = float(new_start)
+            ts['end'] = float(new_end)
+        else:                                         # 兜底（理论上不会发生）
+            for entry in self.dict_list:
+                if entry['filename'] != f['filename']:
+                    continue
+                for candidate in entry.get('timestamps', []):
+                    if (abs(candidate['start'] - f['start']) < 0.01
+                            and abs(candidate['end'] - f['end']) < 0.01):
+                        candidate['start'] = float(new_start)
+                        candidate['end'] = float(new_end)
+                        break
+        self._edited.add(idx)
+        self._refresh_row(idx)
 
     def _edit_times(self, idx):
         f = self.flat[idx]
@@ -4529,20 +5169,7 @@ class ReviewDialog:
             if ns is None or ne is None or ns < 0 or ne < 0 or ns >= ne:
                 messagebox.showwarning("Invalid", "Invalid time values (start must be < end).")
                 return
-            old_s, old_e = f['start'], f['end']
-            f['start'] = ns
-            f['end'] = ne
-            s_str = self._fmt(ns)
-            e_str = self._fmt(ne)
-            self.tree.set(str(idx), 'time', f"{s_str} - {e_str}")
-            for entry in self.dict_list:
-                if entry['filename'] != f['filename']:
-                    continue
-                for ts in entry.get('timestamps', []):
-                    if abs(ts['start'] - old_s) < 0.01 and abs(ts['end'] - old_e) < 0.01:
-                        ts['start'] = ns
-                        ts['end'] = ne
-                        break
+            self._apply_times(idx, ns, ne)
             dlg.destroy()
 
         bf = ttk.Frame(dlg)
@@ -4715,11 +5342,44 @@ class ReviewDialog:
                 pass
         self._preview_paths = []
 
+    def _visible_ids(self):
+        return [iid for iid in self.tree.get_children() if iid.isdigit()]
+
+    def _select_short(self):
+        """选中所有短交付行，并自动打开 Short only（避免顺手改到别的行）。"""
+        if not self.short_hits:
+            return
+        self.short_only_var.set(True)
+        self._apply_short_filter()
+        ids = [str(idx) for idx in sorted(self.short_hits)]
+        if ids:
+            self.tree.selection_set(ids)
+            self.tree.see(ids[0])
+        self._set_adjust_hint(f"{len(ids)} short clip(s) selected")
+
+    def _apply_short_filter(self):
+        """Short only：只影响**显示**，勾选状态和编译内容都不变。"""
+        only = bool(self.short_only_var.get())
+        if only:
+            for idx in range(len(self.flat)):
+                iid = str(idx)
+                if idx in self.short_hits or iid in self._detached:
+                    continue
+                self.tree.detach(iid)
+                self._detached.add(iid)
+            return
+        for idx in range(len(self.flat)):
+            iid = str(idx)
+            self.tree.move(iid, '', idx)
+            self._detached.discard(iid)
+
     def _sel_all(self):
-        for i, cv in enumerate(self.checks):
-            cv.set(True)
-            self._style(str(i), True)
-            self.tree.set(str(i), 'sel', '\u2611')
+        # 只勾当前可见的行（Short only 打开时不要顺手勾上被隐藏的片段）
+        for iid in self._visible_ids():
+            idx = int(iid)
+            self.checks[idx].set(True)
+            self._style(iid, True)
+            self.tree.set(iid, 'sel', '\u2611')
 
     def _desel_all(self):
         for i, cv in enumerate(self.checks):
@@ -4728,11 +5388,13 @@ class ReviewDialog:
             self.tree.set(str(i), 'sel', '\u2610')
 
     def _invert(self):
-        for i, cv in enumerate(self.checks):
+        for iid in self._visible_ids():
+            idx = int(iid)
+            cv = self.checks[idx]
             nv = not cv.get()
             cv.set(nv)
-            self._style(str(i), nv)
-            self.tree.set(str(i), 'sel', '\u2611' if nv else '\u2610')
+            self._style(iid, nv)
+            self.tree.set(iid, 'sel', '\u2611' if nv else '\u2610')
 
     def _on_compile(self):
         result = []
@@ -5038,6 +5700,8 @@ class VideoProcessorApp:
         # 跳过检测时优先读哪个 timestamps 文件（ask = 每次让用户选）。
         # 存在多个（base / _reverified / _selected）时才用得上。
         self.timestamps_load_preference = tk.StringVar(value="ask")
+        # "Fix Short Deliveries…" 选定的清单（只作用于下一轮，消费后清空）
+        self._forced_short_timestamps = None
         # 输出帧率（见 OUTPUT_FPS_OPTIONS）；老配置里没有这个键 → Auto。
         self.output_frame_rate = tk.StringVar(value=OUTPUT_FPS_AUTO)
         # disable_objects() 时记录控件原 state，reenable 时原样恢复（见那里）。
@@ -6049,6 +6713,9 @@ class VideoProcessorApp:
             label=" Import URLs from Timestamps .txt ",
             command=self.import_urls_from_timestamps)
         self.media_menu.add_command(
+            label=" Fix Short Deliveries (…_short_deliveries.txt)… ",
+            command=self.fix_short_deliveries)
+        self.media_menu.add_command(
             label=" Timestamps File Preference… ",
             command=self.choose_timestamps_preference)
         self.media_menu.add_separator()
@@ -6526,23 +7193,19 @@ class VideoProcessorApp:
         if result["value"]:
             self._persist_timestamps_preference(result["value"])
 
-    def import_urls_from_timestamps(self):
-        """Queue every URL listed in a timestamps .txt (one per section header).
+    def _queue_sources_from_txt(self, path):
+        """Queue every source listed in a timestamps .txt; returns ``stats``.
 
-        一个频道的 timestamps.txt 里每个 section 头就是那期视频的 URL，所以重编
-        一批老素材时不用再一条条手动粘贴 URL。
+        Shared by "Import URLs from Timestamps .txt" and "Fix Short Deliveries…":
+        both need the URLs of that file in the list before their clips can be
+        loaded (the load path matches timestamps entries to queued uploads).
         """
-        path = filedialog.askopenfilename(
-            title="Select a timestamps .txt",
-            filetypes=[("Timestamps", "*.txt"), ("All Files", "*.*")],
-        )
-        if not path:
-            return
         try:
-            headers = timestamps_txt_headers(path)
+            all_headers = timestamps_txt_headers(path)
         except OSError as exc:
             messagebox.showerror("Import URLs", f"Could not read that file:\n{exc}")
-            return
+            return None
+        headers = all_headers
 
         media_type = "video" if self.is_video else "audio"
         base_dir = os.path.dirname(os.path.abspath(path))
@@ -6561,9 +7224,34 @@ class VideoProcessorApp:
 
         uploads, stats = uploads_from_timestamps_headers(
             headers, media_type, base_dir=base_dir)
+        stats = dict(stats)
+        stats["added"] = len(uploads)
+        stats["already_queued"] = sum(
+            1 for header in all_headers
+            if media_identity_key(header["value"], base_dir) in queued)
+        if uploads:
+            self.uploaded_videos.extend(uploads)
+            self.update_listbox_add_video(scroll_to_bottom=True)
+        return stats
+
+    def import_urls_from_timestamps(self):
+        """Queue every URL listed in a timestamps .txt (one per section header).
+
+        一个频道的 timestamps.txt 里每个 section 头就是那期视频的 URL，所以重编
+        一批老素材时不用再一条条手动粘贴 URL。
+        """
+        path = filedialog.askopenfilename(
+            title="Select a timestamps .txt",
+            filetypes=[("Timestamps", "*.txt"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        stats = self._queue_sources_from_txt(path)
+        if stats is None:
+            return
         empty_note = (f"\nLeft out {stats['empty']} entry(ies) that had no timestamps "
                       f"in that file." if stats["empty"] else "")
-        if not uploads:
+        if not stats["added"]:
             messagebox.showinfo(
                 "Import URLs",
                 f"No new usable entries were found in {os.path.basename(path)}."
@@ -6571,8 +7259,6 @@ class VideoProcessorApp:
                 + empty_note,
             )
             return
-        self.uploaded_videos.extend(uploads)
-        self.update_listbox_add_video(scroll_to_bottom=True)
         summary = (f"Imported {stats['url']} URL(s) and {stats['local']} local file(s) "
                    f"from {os.path.basename(path)}")
         if stats["skipped"]:
@@ -6585,6 +7271,63 @@ class VideoProcessorApp:
                   f"{os.path.basename(path)} that had no timestamps "
                   f"({_TIMESTAMPS_EMPTY_MARKER}); add them by URL if you want them "
                   f"detected again.{Style.RESET_ALL}")
+
+    def fix_short_deliveries(self):
+        """Pick a short-delivery file: queue its sources and load its clips next run.
+
+        The file is a normal timestamps file, so the load path (Skip Detection)
+        can re-download exactly those clips; Review stays optional and is honoured
+        from its own checkbox.
+        """
+        base_txt = None
+        try:
+            candidate_base = _resolve_txt_paths(
+                self.output_video_path.get(), self.output_text_path.get())
+            candidate = _short_deliveries_path(candidate_base)
+            if candidate and os.path.isfile(candidate):
+                base_txt = candidate
+        except Exception:
+            base_txt = None
+        path = filedialog.askopenfilename(
+            title="Select the short-delivery timestamps (…_short_deliveries.txt)",
+            initialdir=os.path.dirname(base_txt) if base_txt else None,
+            initialfile=os.path.basename(base_txt) if base_txt else None,
+            filetypes=[("Short deliveries", "*_short_deliveries.txt"),
+                       ("Timestamps", "*.txt"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with_videos, _without = _parse_timestamps_txt(path)
+            clip_count = sum(len(entry.get("timestamps") or []) for entry in with_videos)
+        except Exception as exc:                                     # noqa: BLE001
+            messagebox.showerror(
+                "Fix Short Deliveries", f"Could not read that file:\n{exc}")
+            return
+        if clip_count == 0:
+            messagebox.showwarning(
+                "Fix Short Deliveries",
+                f"{os.path.basename(path)} has no clips (no usable intervals found).\n\n"
+                "Pick the file this run wrote next to your timestamps "
+                "(…_short_deliveries.txt), or the report next to the output video "
+                "to see what was short.")
+            return
+        stats = self._queue_sources_from_txt(path)
+        if stats is None:
+            return
+        self._forced_short_timestamps = path
+        print(f"{Fore.GREEN}Short-delivery file selected: {path}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  {clip_count} clip(s) will be loaded instead of running "
+              f"detection; queued {stats['added']} new source(s) "
+              f"({stats['already_queued']} already in the list). Press Process when "
+              f"ready - Review opens only if it is enabled.{Style.RESET_ALL}")
+        messagebox.showinfo(
+            "Fix Short Deliveries",
+            f"{clip_count} clip(s) from {os.path.basename(path)} will be loaded on the "
+            f"next run instead of running detection.\n\n"
+            f"Queued {stats['added']} new source(s) "
+            f"({stats['already_queued']} already in the list).\n\n"
+            "Press Process when ready.")
 
     def export_queue_to_txt(self):
         """Save the queued sources to a .txt so the list survives closing the program.
@@ -8860,24 +9603,43 @@ class VideoProcessorApp:
             summaries = {c["path"]: timestamps_file_summary(c["path"])
                          for c in candidates}
             preference = self.timestamps_load_preference.get() or "ask"
-            default_choice = pick_timestamps_candidate(candidates, preference,
-                                                       summaries)
-            txt_path = default_choice["path"] if default_choice else None
+            # "Fix Short Deliveries…" 选定的清单：这一轮直接加载它的片段，不再走
+            # 候选/偏好逻辑，也不问 "Skip Detection"（用户已经明确选了它）。
+            # 用完即清，避免下一轮悄悄复用上一轮的旧清单。
+            forced = getattr(self, "_forced_short_timestamps", None)
+            forced_used = False
+            if forced:
+                self._forced_short_timestamps = None
+                if os.path.isfile(forced):
+                    forced_used = True
+                    print(f"{Fore.CYAN}Loading the short-delivery list: "
+                          f"{forced}{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.YELLOW}The selected short-delivery file is gone; "
+                          f"choosing a timestamps file normally: {forced}"
+                          f"{Style.RESET_ALL}")
+            if forced_used:
+                txt_path = forced
+            else:
+                default_choice = pick_timestamps_candidate(candidates, preference,
+                                                           summaries)
+                txt_path = default_choice["path"] if default_choice else None
             if txt_path:
-                auto_use = self.skip_detection_auto.get()
+                auto_use = True if forced_used else self.skip_detection_auto.get()
                 extra = ""
-                if len(candidates) > 1:
+                if len(candidates) > 1 and not forced_used:
                     extra = (f"\n\n{len(candidates)} timestamp files were found "
                              f"in that folder; you can pick which one to load.")
                 if auto_use or messagebox.askyesno(
                     "Skip Detection",
                     f"Found existing timestamps file:\n{txt_path}\n\nSkip AI detection and use saved timestamps directly?{extra}"
                 ):
-                    if len(candidates) > 1 and preference in ("ask", "newest"):
+                    if (len(candidates) > 1 and not forced_used
+                            and preference in ("ask", "newest")):
                         chosen = self._choose_timestamps_source(candidates, summaries)
                         if chosen:
                             txt_path = chosen
-                    if len(candidates) > 1:
+                    if len(candidates) > 1 and not forced_used:
                         _others = ", ".join(
                             os.path.basename(c["path"])
                             for c in candidates if c["path"] != txt_path)
@@ -9071,9 +9833,20 @@ class VideoProcessorApp:
                                   f"{_names}{_more}{Style.RESET_ALL}")
                         for line in _summarize_placement(placement_records()):
                             print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
-                        skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
+                        skipped_report = _write_skipped_report(
+                            remote_failure_records, output_video_path, _short)
                         if skipped_report:
                             print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
+                        # 一轮完全没有短交付（且这一轮没有失败）时删掉上一轮的旧清单，
+                        # 否则 Review 会继续按旧数据把这些片段标成 Short。纯本地批次不动它。
+                        _has_remote = any(isinstance(entry.get("filename"), MediaSource)
+                                           for entry in dict_list)
+                        short_list = _write_short_deliveries_txt(
+                            _short, base_txt,
+                            remove_when_empty=(_has_remote and not remote_failure_records))
+                        if short_list:
+                            print(f"{Fore.CYAN}Short-delivery timestamps (importable): "
+                                  f"{short_list}{Style.RESET_ALL}")
                         if not compile_entries:
                             raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
                         self.clear_transfer_progress("Starting compile...")
@@ -9564,9 +10337,20 @@ class VideoProcessorApp:
                               f"{_names}{_more}{Style.RESET_ALL}")
                     for line in _summarize_placement(placement_records()):
                         print(f"{Fore.YELLOW}{line}{Style.RESET_ALL}")
-                    skipped_report = _write_skipped_report(remote_failure_records, output_video_path)
+                    skipped_report = _write_skipped_report(
+                        remote_failure_records, output_video_path, _short)
                     if skipped_report:
                         print(f"{Fore.CYAN}Skipped-clips report: {skipped_report}{Style.RESET_ALL}")
+                    # 一轮完全没有短交付（且这一轮没有失败）时删掉上一轮的旧清单，
+                    # 否则 Review 会继续按旧数据把这些片段标成 Short。纯本地批次不动它。
+                    _has_remote = any(isinstance(entry.get("filename"), MediaSource)
+                                       for entry in dict_list)
+                    short_list = _write_short_deliveries_txt(
+                        _short, base_txt,
+                        remove_when_empty=(_has_remote and not remote_failure_records))
+                    if short_list:
+                        print(f"{Fore.CYAN}Short-delivery timestamps (importable): "
+                              f"{short_list}{Style.RESET_ALL}")
                     if not compile_entries:
                         raise RuntimeError("No compile-ready VOD results remain after remote fetch failures.")
                     self.clear_transfer_progress("Starting compile...")
